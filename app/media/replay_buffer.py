@@ -26,7 +26,8 @@ class ReplayBuffer:
     """Stores a rolling, timestamp-addressable history of recent frames.
 
     Frames are kept in memory for now and JPEG-compressed as a temporary
-    implementation detail to reduce memory pressure. Later this module should be
+    implementation detail to reduce memory pressure. The replay branch of the
+    current GStreamer tee feeds this buffer today. Later this module should be
     replaced by a GStreamer-friendly or disk-backed segmented replay buffer.
     """
 

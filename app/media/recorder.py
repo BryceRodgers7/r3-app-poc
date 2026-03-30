@@ -15,9 +15,10 @@ from app.core.models import MediaFrame, SessionPaths
 class Recorder:
     """Tracks full-session recording state independently of playback.
 
-    The current implementation writes a single local video file through OpenCV.
-    TODO: Replace this writer with a dedicated GStreamer recording branch once
-    tee/fan-out is introduced in the production media pipeline.
+    The current implementation still writes a single local video file through
+    OpenCV, but it is now fed from the recording branch of the GStreamer tee.
+    TODO: Replace this writer with a dedicated GStreamer encoder/filesink branch
+    once the production media pipeline is introduced.
     """
 
     def __init__(self, settings: AppSettings) -> None:

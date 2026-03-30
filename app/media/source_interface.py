@@ -33,7 +33,7 @@ class SourceInterface(ABC):
 
     @abstractmethod
     def create_pipeline_fragment(self) -> str:
-        """Return a placeholder pipeline fragment for future GStreamer wiring."""
+        """Describe how this source will later plug into a native GStreamer graph."""
 
     @abstractmethod
     def read_frame(self) -> MediaFrame | None:

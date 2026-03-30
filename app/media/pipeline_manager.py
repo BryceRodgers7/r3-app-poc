@@ -1,9 +1,17 @@
-"""Placeholder home for the future GStreamer pipeline graph."""
+"""GStreamer-centered media graph orchestration for the replay application."""
 
 from __future__ import annotations
 
-import threading
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
+from fractions import Fraction
+import importlib
+import threading
+import time
+from typing import Any
+
+import numpy as np
 
 from app.core.models import MediaFrame, SessionPaths
 from app.media.preview_output import PreviewOutput
@@ -12,8 +20,22 @@ from app.media.replay_buffer import ReplayBuffer
 from app.media.source_interface import SourceInterface
 
 
+@dataclass(slots=True)
+class _FrameMetadata:
+    """Tracks source-side metadata while buffers fan out through GStreamer."""
+
+    timestamp: float
+    source_name: str
+
+
 class PipelineManager:
-    """Coordinates future media pipeline startup and shutdown."""
+    """Owns the transitional GStreamer media graph for the PoC.
+
+    The current source still comes from Python via `SourceInterface.read_frame()`,
+    but frames now enter a real `appsrc -> tee -> branches` pipeline. This keeps
+    tee/fan-out explicit today and makes it straightforward to swap in an NDI or
+    other native GStreamer source bin later.
+    """
 
     def __init__(
         self,
@@ -30,22 +52,36 @@ class PipelineManager:
         self._recording_running = False
         self._replay_running = False
         self._frame_callback: Callable[[MediaFrame], None] | None = None
-        self._capture_thread: threading.Thread | None = None
+
+        self._Gst: Any | None = None
+        self._pipeline: Any | None = None
+        self._appsrc: Any | None = None
+        self._bus: Any | None = None
+        self._tee_request_pads: list[Any] = []
+        self._branch_valves: dict[str, Any] = {}
+
+        self._frame_feed_thread: threading.Thread | None = None
+        self._bus_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._capture_lock = threading.Lock()
+        self._pipeline_lock = threading.Lock()
+
+        self._frame_duration_ns = 0
+        self._stream_start_timestamp: float | None = None
+        self._frame_metadata: OrderedDict[int, _FrameMetadata] = OrderedDict()
+        self._metadata_lock = threading.Lock()
 
     def describe_architecture(self) -> str:
-        """Describe the intended tee/fan-out architecture for later implementation."""
+        """Describe the current transitional tee/fan-out architecture."""
         return (
-            "source -> decode/normalize -> tee -> "
-            "[preview branch, recorder branch, rolling replay branch]"
+            "SourceInterface.read_frame -> appsrc -> videoconvert -> tee -> "
+            "[preview appsink, recording appsink, replay appsink]"
         )
 
     def start_preview(self) -> None:
         """Start the preview branch without affecting recording or replay buffering."""
         self._preview_running = True
         self._preview_output.show_placeholder_message("Starting live preview...")
-        self._ensure_capture_loop()
+        self._set_branch_enabled("preview", True)
 
     def start_recording(self, session_paths: SessionPaths) -> None:
         """Start the full-session recording branch."""
@@ -55,37 +91,58 @@ class PipelineManager:
             fps_hint=self._source.get_nominal_fps(),
         )
         self._recording_running = True
-        self._ensure_capture_loop()
+        self._set_branch_enabled("record", True)
 
     def start_replay_buffer(self, session_paths: SessionPaths) -> None:
-        """Start the rolling buffer branch."""
+        """Start the rolling replay buffer branch."""
         self._replay_buffer.start(session_paths)
         self._replay_running = True
-        self._ensure_capture_loop()
+        self._set_branch_enabled("replay", True)
 
     def stop_preview(self) -> None:
         """Stop only the preview branch."""
         self._preview_running = False
+        self._set_branch_enabled("preview", False)
 
     def stop_recording(self) -> None:
         """Stop only the recording branch."""
         self._recording_running = False
+        self._set_branch_enabled("record", False)
         self._recorder.stop()
 
     def stop_replay_buffer(self) -> None:
         """Stop only the rolling replay buffer branch."""
         self._replay_running = False
+        self._set_branch_enabled("replay", False)
         self._replay_buffer.stop()
 
     def stop_all(self) -> None:
-        """Stop all branches and disconnect the source."""
+        """Stop all branches, tear down the pipeline, and disconnect the source."""
+        self._preview_running = False
+        self._recording_running = False
+        self._replay_running = False
         self._stop_event.set()
-        if self._capture_thread is not None:
-            self._capture_thread.join(timeout=2.0)
-            self._capture_thread = None
-        self.stop_preview()
-        self.stop_recording()
-        self.stop_replay_buffer()
+
+        for branch_name in ("preview", "record", "replay"):
+            self._set_branch_enabled(branch_name, False)
+
+        if self._appsrc is not None:
+            try:
+                self._appsrc.emit("end-of-stream")
+            except Exception:
+                pass
+
+        if self._frame_feed_thread is not None:
+            self._frame_feed_thread.join(timeout=2.0)
+            self._frame_feed_thread = None
+
+        if self._bus_thread is not None:
+            self._bus_thread.join(timeout=2.0)
+            self._bus_thread = None
+
+        self._teardown_pipeline()
+        self._recorder.stop()
+        self._replay_buffer.stop()
         self._source.disconnect_source()
 
     def is_source_connected(self) -> bool:
@@ -93,43 +150,333 @@ class PipelineManager:
         return self._source.is_connected()
 
     def connect_source(self) -> bool:
-        """Connect the source and return the result."""
-        # TODO: Replace the temporary capture loop with a GStreamer root pipeline and tee.
-        return self._source.connect_source()
+        """Connect the source and build the GStreamer pipeline."""
+        if not self._source.connect_source():
+            return False
+
+        try:
+            self._ensure_gstreamer_loaded()
+            self._build_pipeline()
+            self._start_pipeline_threads()
+        except Exception:
+            self._teardown_pipeline()
+            self._source.disconnect_source()
+            raise
+        return True
 
     def set_frame_callback(self, callback: Callable[[MediaFrame], None]) -> None:
-        """Register the controller callback for incoming live frames."""
+        """Register the controller callback for preview-branch frames."""
         self._frame_callback = callback
 
     def get_source_name(self) -> str:
         """Return the current source display name."""
         return self._source.get_display_name()
 
-    def _ensure_capture_loop(self) -> None:
-        with self._capture_lock:
-            if self._capture_thread is not None and self._capture_thread.is_alive():
+    def _ensure_gstreamer_loaded(self) -> None:
+        if self._Gst is not None:
+            return
+
+        try:
+            gi = importlib.import_module("gi")
+            gi.require_version("Gst", "1.0")
+            gst_module = importlib.import_module("gi.repository.Gst")
+        except Exception as exc:
+            raise RuntimeError(
+                "GStreamer via PyGObject is required for the current PipelineManager implementation."
+            ) from exc
+
+        gst_module.init(None)
+        self._Gst = gst_module
+
+    def _build_pipeline(self) -> None:
+        with self._pipeline_lock:
+            if self._pipeline is not None:
                 return
+
+            Gst = self._Gst
+            assert Gst is not None
+
+            width, height = self._source.get_frame_size()
+            fps_fraction = Fraction(str(self._source.get_nominal_fps())).limit_denominator(1000)
+            self._frame_duration_ns = max(1, int(Gst.SECOND * fps_fraction.denominator / fps_fraction.numerator))
+
+            pipeline = Gst.Pipeline.new("sports-replay-pipeline")
+            appsrc = self._make_element("appsrc", "source_appsrc")
+            source_convert = self._make_element("videoconvert", "source_convert")
+            tee = self._make_element("tee", "source_tee")
+
+            appsrc.set_property("is-live", True)
+            appsrc.set_property("format", Gst.Format.TIME)
+            appsrc.set_property("block", True)
+            appsrc.set_property("do-timestamp", False)
+            appsrc.set_property(
+                "caps",
+                Gst.Caps.from_string(
+                    "video/x-raw,format=BGR,"
+                    f"width={width},height={height},"
+                    f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
+                ),
+            )
+
+            pipeline.add(appsrc)
+            pipeline.add(source_convert)
+            pipeline.add(tee)
+            if not appsrc.link(source_convert) or not source_convert.link(tee):
+                raise RuntimeError("Failed to link the GStreamer source path.")
+
+            self._pipeline = pipeline
+            self._appsrc = appsrc
+            self._bus = pipeline.get_bus()
+            self._tee_request_pads.clear()
+            self._branch_valves.clear()
+
+            self._add_branch("preview", self._on_preview_sample)
+            self._add_branch("record", self._on_record_sample)
+            self._add_branch("replay", self._on_replay_sample)
+
+            state_change = pipeline.set_state(Gst.State.PLAYING)
+            if state_change == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("Failed to move the GStreamer pipeline to PLAYING.")
+
+    def _add_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", f"{branch_name}_queue")
+        valve = self._make_element("valve", f"{branch_name}_valve")
+        convert = self._make_element("videoconvert", f"{branch_name}_convert")
+        sink = self._make_element("appsink", f"{branch_name}_sink")
+
+        valve.set_property("drop", True)
+        sink.set_property("emit-signals", True)
+        sink.set_property("sync", False)
+        sink.set_property("max-buffers", 1 if branch_name == "preview" else 8)
+        if branch_name == "preview":
+            sink.set_property("drop", True)
+        sink.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
+        sink.connect("new-sample", sample_handler)
+
+        self._pipeline.add(queue)
+        self._pipeline.add(valve)
+        self._pipeline.add(convert)
+        self._pipeline.add(sink)
+
+        if not queue.link(valve) or not valve.link(convert) or not convert.link(sink):
+            raise RuntimeError(f"Failed to link the {branch_name} branch.")
+
+        tee_src_pad = self._request_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"Failed to link tee output to the {branch_name} branch.")
+
+        queue.sync_state_with_parent()
+        valve.sync_state_with_parent()
+        convert.sync_state_with_parent()
+        sink.sync_state_with_parent()
+
+        self._branch_valves[branch_name] = valve
+
+    def _request_tee_pad(self) -> Any:
+        assert self._pipeline is not None
+        tee = self._pipeline.get_by_name("source_tee")
+        assert tee is not None
+
+        request_pad = tee.request_pad_simple("src_%u")
+        if request_pad is None:
+            request_pad = tee.get_request_pad("src_%u")
+        if request_pad is None:
+            raise RuntimeError("Failed to request a tee source pad.")
+
+        self._tee_request_pads.append(request_pad)
+        return request_pad
+
+    def _make_element(self, factory_name: str, element_name: str) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        element = Gst.ElementFactory.make(factory_name, element_name)
+        if element is None:
+            raise RuntimeError(f"Failed to create GStreamer element '{factory_name}'.")
+        return element
+
+    def _start_pipeline_threads(self) -> None:
+        with self._pipeline_lock:
+            if self._frame_feed_thread is not None and self._frame_feed_thread.is_alive():
+                return
+
             self._stop_event.clear()
-            self._capture_thread = threading.Thread(
-                target=self._capture_loop,
-                name="capture-loop",
+            self._frame_feed_thread = threading.Thread(
+                target=self._feed_appsrc_loop,
+                name="gst-appsrc-feed",
                 daemon=True,
             )
-            self._capture_thread.start()
+            self._frame_feed_thread.start()
 
-    def _capture_loop(self) -> None:
+            self._bus_thread = threading.Thread(
+                target=self._monitor_bus_loop,
+                name="gst-bus-watch",
+                daemon=True,
+            )
+            self._bus_thread.start()
+
+    def _feed_appsrc_loop(self) -> None:
+        Gst = self._Gst
+        assert Gst is not None
+
         while not self._stop_event.is_set():
             frame = self._source.read_frame()
             if frame is None:
                 continue
 
-            # TODO: Replace this temporary Python-level fan-out with a GStreamer
-            # tee once preview, recording, and replay all hang off one pipeline.
-            if self._replay_running:
-                self._replay_buffer.append_frame(frame)
+            if self._appsrc is None:
+                break
 
-            if self._recording_running:
-                self._recorder.write_frame(frame)
+            frame_array = np.ascontiguousarray(frame.image_bgr)
+            gst_buffer = Gst.Buffer.new_allocate(None, frame_array.nbytes, None)
+            gst_buffer.fill(0, frame_array.tobytes())
+            gst_buffer.offset = frame.frame_id
+            if self._stream_start_timestamp is None:
+                self._stream_start_timestamp = frame.timestamp
+            running_timestamp = max(0.0, frame.timestamp - self._stream_start_timestamp)
+            gst_buffer.pts = int(running_timestamp * Gst.SECOND)
+            gst_buffer.dts = gst_buffer.pts
+            gst_buffer.duration = self._frame_duration_ns
 
-            if self._preview_running and self._frame_callback is not None:
-                self._frame_callback(frame)
+            with self._metadata_lock:
+                self._frame_metadata[frame.frame_id] = _FrameMetadata(
+                    timestamp=frame.timestamp,
+                    source_name=frame.source_name,
+                )
+                while len(self._frame_metadata) > 4096:
+                    self._frame_metadata.popitem(last=False)
+
+            flow_return = self._appsrc.emit("push-buffer", gst_buffer)
+            if flow_return != Gst.FlowReturn.OK and not self._stop_event.is_set():
+                self._preview_output.show_placeholder_message(
+                    f"GStreamer source push failed: {flow_return}"
+                )
+                break
+
+    def _monitor_bus_loop(self) -> None:
+        Gst = self._Gst
+        assert Gst is not None
+
+        if self._bus is None:
+            return
+
+        interesting_messages = Gst.MessageType.ERROR | Gst.MessageType.EOS
+        while not self._stop_event.is_set():
+            message = self._bus.timed_pop_filtered(int(Gst.SECOND / 10), interesting_messages)
+            if message is None:
+                continue
+
+            if message.type == Gst.MessageType.ERROR:
+                error, debug = message.parse_error()
+                details = debug or str(error)
+                self._preview_output.show_placeholder_message(f"GStreamer error: {details}")
+                self._stop_event.set()
+                break
+
+            if message.type == Gst.MessageType.EOS:
+                self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
+                self._stop_event.set()
+                break
+
+    def _set_branch_enabled(self, branch_name: str, enabled: bool) -> None:
+        valve = self._branch_valves.get(branch_name)
+        if valve is not None:
+            valve.set_property("drop", not enabled)
+
+    def _on_preview_sample(self, sink: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        sample = sink.emit("pull-sample")
+        frame = self._sample_to_media_frame(sample)
+        if frame is not None and self._preview_running and self._frame_callback is not None:
+            self._frame_callback(frame)
+        return Gst.FlowReturn.OK
+
+    def _on_record_sample(self, sink: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        sample = sink.emit("pull-sample")
+        frame = self._sample_to_media_frame(sample)
+        if frame is not None and self._recording_running:
+            self._recorder.write_frame(frame)
+        return Gst.FlowReturn.OK
+
+    def _on_replay_sample(self, sink: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        sample = sink.emit("pull-sample")
+        frame = self._sample_to_media_frame(sample)
+        if frame is not None and self._replay_running:
+            self._replay_buffer.append_frame(frame)
+        return Gst.FlowReturn.OK
+
+    def _sample_to_media_frame(self, sample: Any) -> MediaFrame | None:
+        if sample is None:
+            return None
+
+        Gst = self._Gst
+        assert Gst is not None
+
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+        if buffer is None or caps is None or caps.get_size() == 0:
+            return None
+
+        structure = caps.get_structure(0)
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return None
+
+        try:
+            frame_array = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
+        finally:
+            buffer.unmap(map_info)
+
+        frame_id = int(buffer.offset) if buffer.offset != Gst.BUFFER_OFFSET_NONE else 0
+        with self._metadata_lock:
+            metadata = self._frame_metadata.get(frame_id)
+
+        timestamp = metadata.timestamp if metadata is not None else time.time()
+        source_name = metadata.source_name if metadata is not None else self._source.get_display_name()
+
+        return MediaFrame(
+            frame_id=frame_id,
+            timestamp=timestamp,
+            image=frame_array,
+            source_name=source_name,
+        )
+
+    def _teardown_pipeline(self) -> None:
+        with self._pipeline_lock:
+            if self._pipeline is None:
+                return
+
+            Gst = self._Gst
+            assert Gst is not None
+
+            tee = self._pipeline.get_by_name("source_tee")
+            self._pipeline.set_state(Gst.State.NULL)
+
+            if tee is not None:
+                for request_pad in self._tee_request_pads:
+                    tee.release_request_pad(request_pad)
+
+            self._tee_request_pads.clear()
+            self._branch_valves.clear()
+            self._pipeline = None
+            self._appsrc = None
+            self._bus = None
+            self._stream_start_timestamp = None
+            with self._metadata_lock:
+                self._frame_metadata.clear()

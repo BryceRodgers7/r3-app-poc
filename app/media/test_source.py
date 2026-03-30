@@ -78,7 +78,7 @@ class TestSource(SourceInterface):
         return self._display_name
 
     def create_pipeline_fragment(self) -> str:
-        """Describe the future source fragment once GStreamer replaces this path."""
+        """Describe the future source-side replacement for the current appsrc bridge."""
         return "opencv-test-source-placeholder"
 
     def read_frame(self) -> MediaFrame | None:
