@@ -13,7 +13,12 @@ from app.core.models import MediaFrame, SessionPaths
 
 
 class Recorder:
-    """Tracks full-session recording state independently of playback."""
+    """Tracks full-session recording state independently of playback.
+
+    The current implementation writes a single local video file through OpenCV.
+    TODO: Replace this writer with a dedicated GStreamer recording branch once
+    tee/fan-out is introduced in the production media pipeline.
+    """
 
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
@@ -29,7 +34,6 @@ class Recorder:
 
     def start(self, session_paths: SessionPaths, source_name: str, fps_hint: float) -> None:
         """Prepare the recorder for a new session."""
-        # TODO: Replace the temporary OpenCV writer with a GStreamer recording branch.
         with self._lock:
             self._session_paths = session_paths
             self._source_name = source_name
@@ -57,7 +61,9 @@ class Recorder:
             if self._writer is None:
                 self._open_writer(frame)
 
-            assert self._writer is not None
+            if self._writer is None:
+                return
+
             self._writer.write(frame.image_bgr)
             self._frame_count += 1
 

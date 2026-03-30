@@ -13,7 +13,11 @@ from app.media.source_interface import SourceInterface
 
 
 class TestSource(SourceInterface):
-    """Provides a continuous frame stream for the first working vertical slice."""
+    """Provides a continuous frame stream for the first working vertical slice.
+
+    This temporary source keeps NDI out of scope while exercising the same
+    frame-delivery path that later production sources will use.
+    """
 
     def __init__(
         self,
@@ -78,7 +82,7 @@ class TestSource(SourceInterface):
         return "opencv-test-source-placeholder"
 
     def read_frame(self) -> MediaFrame | None:
-        """Read a frame from the camera or generate a synthetic fallback frame."""
+        """Read the next delivered frame from the camera or synthetic fallback."""
         if not self._connected:
             return None
 
@@ -138,7 +142,7 @@ class TestSource(SourceInterface):
         return MediaFrame(
             frame_id=self._frame_counter,
             timestamp=timestamp,
-            image_bgr=canvas,
+            image=canvas,
             source_name=self._display_name,
         )
 
@@ -153,6 +157,6 @@ class TestSource(SourceInterface):
         return MediaFrame(
             frame_id=self._frame_counter,
             timestamp=timestamp,
-            image_bgr=frame,
+            image=frame,
             source_name=self._display_name,
         )

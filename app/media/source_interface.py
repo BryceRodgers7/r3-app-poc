@@ -8,7 +8,12 @@ from app.core.models import MediaFrame
 
 
 class SourceInterface(ABC):
-    """Abstract interface for a pluggable live video source."""
+    """Abstract interface for a pluggable live video source.
+
+    `read_frame()` is the temporary frame-delivery contract for the current
+    vertical slice. Later NDI and GStreamer-backed sources should plug in here
+    without changing how replay, recording, or UI playback consume frames.
+    """
 
     @abstractmethod
     def connect_source(self) -> bool:
@@ -32,7 +37,7 @@ class SourceInterface(ABC):
 
     @abstractmethod
     def read_frame(self) -> MediaFrame | None:
-        """Read the next frame from the source."""
+        """Return the next delivered frame or `None` if no frame is available."""
 
     @abstractmethod
     def get_frame_size(self) -> tuple[int, int]:

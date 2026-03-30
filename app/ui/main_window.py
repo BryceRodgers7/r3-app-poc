@@ -59,6 +59,10 @@ class MainWindow(QMainWindow):
 
     def _render_state(self, state: AppState) -> None:
         self.status_widget.update_state(state)
+        display_frame = self._controller.get_display_frame()
+        if display_frame is not None:
+            # The UI renders whichever frame the controller has selected.
+            self._preview_output.show_frame(display_frame)
 
         if state.current_playback_mode.value == "LIVE":
             overlay = "LIVE VIEW"

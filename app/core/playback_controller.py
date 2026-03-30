@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from app.core.app_state import AppState
 from app.core.models import MediaFrame, PlaybackMode
 from app.core.signals import AppSignals
@@ -24,23 +26,26 @@ class PlaybackController:
         replay_buffer: ReplayBuffer,
         default_source_name: str,
     ) -> None:
+        del preview_output
         self._session_manager = session_manager
         self._pipeline_manager = pipeline_manager
-        self._preview_output = preview_output
         self._recorder = recorder
         self._replay_buffer = replay_buffer
         self._default_source_name = default_source_name
         self.signals = AppSignals()
         self._state = AppState(current_source_name=default_source_name)
         self._latest_live_frame: MediaFrame | None = None
-        self._presented_frame: MediaFrame | None = None
+        self._display_frame: MediaFrame | None = None
+        self._latest_live_timestamp: float | None = None
+        self._playback_timestamp: float | None = None
+        self._lock = threading.RLock()
 
     def initialize(self) -> None:
         """Create a session and start placeholder background services."""
         connected = self._pipeline_manager.connect_source()
         source_name = self._pipeline_manager.get_source_name()
         session_paths = self._session_manager.start_new_session(source_name)
-        self._pipeline_manager.set_frame_callback(self.handle_incoming_frame)
+        self._pipeline_manager.set_frame_callback(self.on_new_live_frame)
         self._pipeline_manager.start_replay_buffer(session_paths)
         self._pipeline_manager.start_recording(session_paths)
         self._pipeline_manager.start_preview()
@@ -57,68 +62,102 @@ class PlaybackController:
 
     def pause_playback(self) -> None:
         """Pause only the viewed playback state."""
-        if self._presented_frame is None:
-            self._state.error_message = "Cannot pause while the source is unavailable."
-            self._emit_state()
-            return
+        with self._lock:
+            if self._display_frame is None:
+                self._state.error_message = "Cannot pause while the source is unavailable."
+                self._emit_state()
+                return
 
-        self._state.current_playback_mode = PlaybackMode.PAUSED
-        self._state.error_message = None
+            self._playback_timestamp = self._display_frame.timestamp
+            self._display_frame = self._replay_buffer.get_frame_at_or_before(self._playback_timestamp) or self._display_frame
+            self._state.current_playback_mode = PlaybackMode.PAUSED
+            self._state.error_message = None
+            self._update_state_timestamps_locked()
         self._emit_state("Playback paused")
 
     def rewind_10_seconds(self) -> None:
         """Move the viewed output back by ten seconds without stopping ingest."""
-        if not self._replay_buffer.is_running():
-            self._state.error_message = "Replay buffer is not active."
-            self._emit_state()
-            return
+        with self._lock:
+            if not self._replay_buffer.is_running():
+                self._state.error_message = "Replay buffer is not active."
+                self._emit_state()
+                return
 
-        current_offset = self._replay_buffer.get_seconds_behind_live()
-        self._state.seconds_behind_live = self._replay_buffer.seek_seconds_behind_live(
-            current_offset + 10.0
-        )
-        replay_frame = self._replay_buffer.get_frame_seconds_behind_live(self._state.seconds_behind_live)
-        if replay_frame is None:
-            self._state.error_message = "Replay frame is not available yet."
-            self._emit_state()
-            return
+            oldest_timestamp, _ = self._replay_buffer.get_buffer_range()
+            if oldest_timestamp is None:
+                self._state.error_message = "Replay frame is not available yet."
+                self._emit_state()
+                return
 
-        self._state.current_playback_mode = PlaybackMode.REPLAY
-        self._state.error_message = None
-        self._present_frame(replay_frame)
+            if self._state.current_playback_mode == PlaybackMode.LIVE:
+                base_timestamp = self._latest_live_timestamp
+            else:
+                if self._playback_timestamp is not None:
+                    base_timestamp = self._playback_timestamp
+                elif self._display_frame is not None:
+                    base_timestamp = self._display_frame.timestamp
+                else:
+                    base_timestamp = None
+
+            if base_timestamp is None:
+                self._state.error_message = "Replay frame is not available yet."
+                self._emit_state()
+                return
+
+            target_timestamp = max(oldest_timestamp, base_timestamp - 10.0)
+            replay_frame = self._replay_buffer.get_frame_at_or_before(target_timestamp)
+            if replay_frame is None:
+                self._state.error_message = "Replay frame is not available yet."
+                self._emit_state()
+                return
+
+            self._playback_timestamp = replay_frame.timestamp
+            self._display_frame = replay_frame
+            self._state.current_playback_mode = PlaybackMode.REPLAY
+            self._state.error_message = None
+            self._update_state_timestamps_locked()
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def jump_to_live(self) -> None:
         """Return the viewed output to the live edge."""
-        self._replay_buffer.jump_to_live()
-        self._state.seconds_behind_live = 0.0
-        self._state.current_playback_mode = (
-            PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
-        )
-        self._state.error_message = None
-        if self._latest_live_frame is not None:
-            self._present_frame(self._latest_live_frame)
+        with self._lock:
+            self._playback_timestamp = self._latest_live_timestamp
+            self._state.current_playback_mode = (
+                PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
+            )
+            self._state.error_message = None
+            if self._latest_live_frame is not None:
+                self._display_frame = self._latest_live_frame
+            self._update_state_timestamps_locked()
         self._emit_state("Returned to live")
 
     def set_source_lost(self, message: str = "Source signal lost.") -> None:
         """Reflect that the live source is no longer available."""
-        self._state.source_connected = False
-        self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
-        self._state.error_message = message
+        with self._lock:
+            self._state.source_connected = False
+            self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
+            self._state.error_message = message
         self._emit_state(message)
 
     def set_source_connected(self) -> None:
         """Reflect that the live source is available again."""
-        self._state.source_connected = True
-        if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
-            self._state.current_playback_mode = PlaybackMode.LIVE
-        self._state.current_source_name = self._pipeline_manager.get_source_name()
-        self._state.error_message = None
+        with self._lock:
+            self._state.source_connected = True
+            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
+                self._state.current_playback_mode = PlaybackMode.LIVE
+            self._state.current_source_name = self._pipeline_manager.get_source_name()
+            self._state.error_message = None
         self._emit_state("Source connected")
 
     def get_state(self) -> AppState:
         """Return the current application state."""
-        return self._state
+        with self._lock:
+            return self._state
+
+    def get_display_frame(self) -> MediaFrame | None:
+        """Return the frame the UI should currently display."""
+        with self._lock:
+            return self._display_frame
 
     def shutdown(self) -> None:
         """Stop placeholder services and release storage resources."""
@@ -127,33 +166,28 @@ class PlaybackController:
         self._replay_buffer.stop()
         self._session_manager.close()
 
-    def handle_incoming_frame(self, frame: MediaFrame) -> None:
-        """Handle the newest live frame while respecting the selected playback mode."""
-        self._latest_live_frame = frame
-        self._state.source_connected = True
-        self._state.current_source_name = frame.source_name
-        self._state.is_recording = self._recorder.is_recording()
-        self._state.last_frame_timestamp = frame.timestamp
-        self._state.replay_buffer_span_seconds = self._replay_buffer.get_available_duration()
+    def on_new_live_frame(self, frame: MediaFrame) -> None:
+        """Update controller-owned playback state for a newly ingested live frame."""
+        with self._lock:
+            self._latest_live_frame = frame
+            self._latest_live_timestamp = frame.timestamp
+            self._state.source_connected = True
+            self._state.current_source_name = frame.source_name
+            self._state.is_recording = self._recorder.is_recording()
 
-        if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
-            self._state.current_playback_mode = PlaybackMode.LIVE
+            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
+                self._state.current_playback_mode = PlaybackMode.LIVE
 
-        if self._state.current_playback_mode == PlaybackMode.PAUSED:
-            self._emit_state()
-            return
+            if self._state.current_playback_mode == PlaybackMode.LIVE:
+                self._playback_timestamp = frame.timestamp
+                self._display_frame = frame
+            elif self._state.current_playback_mode == PlaybackMode.REPLAY:
+                if self._playback_timestamp is not None and self._display_frame is None:
+                    self._display_frame = self._replay_buffer.get_frame_at_or_before(
+                        self._playback_timestamp
+                    )
 
-        if self._state.current_playback_mode == PlaybackMode.REPLAY:
-            replay_frame = self._replay_buffer.get_frame_seconds_behind_live(
-                self._state.seconds_behind_live
-            )
-            if replay_frame is not None:
-                self._present_frame(replay_frame)
-            self._emit_state()
-            return
-
-        self._state.seconds_behind_live = 0.0
-        self._present_frame(frame)
+            self._update_state_timestamps_locked()
         self._emit_state()
 
     def _emit_state(self, status_message: str | None = None) -> None:
@@ -161,6 +195,18 @@ class PlaybackController:
         if status_message:
             self.signals.status_message.emit(status_message)
 
-    def _present_frame(self, frame: MediaFrame) -> None:
-        self._presented_frame = frame
-        self._preview_output.show_frame(frame)
+    def _update_state_timestamps_locked(self) -> None:
+        self._state.last_frame_timestamp = self._latest_live_timestamp
+        self._state.replay_buffer_span_seconds = self._replay_buffer.get_available_duration()
+
+        if (
+            self._state.current_playback_mode == PlaybackMode.LIVE
+            or self._playback_timestamp is None
+            or self._latest_live_timestamp is None
+        ):
+            self._state.seconds_behind_live = 0.0
+            return
+
+        self._state.seconds_behind_live = self._replay_buffer.get_seconds_behind_live(
+            self._playback_timestamp
+        )

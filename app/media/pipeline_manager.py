@@ -98,7 +98,7 @@ class PipelineManager:
         return self._source.connect_source()
 
     def set_frame_callback(self, callback: Callable[[MediaFrame], None]) -> None:
-        """Register the consumer for incoming live frames."""
+        """Register the controller callback for incoming live frames."""
         self._frame_callback = callback
 
     def get_source_name(self) -> str:
@@ -123,6 +123,8 @@ class PipelineManager:
             if frame is None:
                 continue
 
+            # TODO: Replace this temporary Python-level fan-out with a GStreamer
+            # tee once preview, recording, and replay all hang off one pipeline.
             if self._replay_running:
                 self._replay_buffer.append_frame(frame)
 

@@ -25,12 +25,22 @@ FrameArray: TypeAlias = npt.NDArray[np.uint8]
 
 @dataclass(slots=True)
 class MediaFrame:
-    """A timestamped video frame passed through the temporary media pipeline."""
+    """A single timestamped frame delivered through the temporary media layer.
+
+    The OpenCV-backed `image` payload is temporary for this milestone. Later
+    GStreamer tee/fan-out and NDI integration can plug in behind the same
+    lightweight frame contract.
+    """
 
     frame_id: int
     timestamp: float
-    image_bgr: FrameArray
+    image: FrameArray
     source_name: str
+
+    @property
+    def image_bgr(self) -> FrameArray:
+        """Return the current OpenCV BGR payload."""
+        return self.image
 
 
 @dataclass(slots=True)

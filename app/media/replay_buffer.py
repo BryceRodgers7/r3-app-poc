@@ -23,14 +23,18 @@ class BufferedFrame:
 
 
 class ReplayBuffer:
-    """Tracks replay buffer state independently of recording and preview."""
+    """Stores a rolling, timestamp-addressable history of recent frames.
+
+    Frames are kept in memory for now and JPEG-compressed as a temporary
+    implementation detail to reduce memory pressure. Later this module should be
+    replaced by a GStreamer-friendly or disk-backed segmented replay buffer.
+    """
 
     def __init__(self, buffer_duration_seconds: int = 120, jpeg_quality: int = 80) -> None:
         self._buffer_duration_seconds = buffer_duration_seconds
         self._jpeg_quality = jpeg_quality
         self._session_paths: SessionPaths | None = None
         self._is_running = False
-        self._seconds_behind_live = 0.0
         self._frames: deque[BufferedFrame] = deque()
         self._lock = threading.Lock()
 
@@ -45,7 +49,6 @@ class ReplayBuffer:
         with self._lock:
             self._session_paths = session_paths
             self._is_running = True
-            self._seconds_behind_live = 0.0
             self._frames.clear()
 
     def stop(self) -> None:
@@ -82,24 +85,6 @@ class ReplayBuffer:
             )
             self._prune_frames_locked()
 
-    def seek_seconds_behind_live(self, seconds: float) -> float:
-        """Clamp and store the current replay offset from live."""
-        with self._lock:
-            available_seconds = min(self._buffer_duration_seconds, self.get_available_duration_locked())
-            clamped_seconds = max(0.0, min(seconds, float(available_seconds)))
-            self._seconds_behind_live = clamped_seconds
-            return self._seconds_behind_live
-
-    def jump_to_live(self) -> None:
-        """Reset replay playback back to the live edge."""
-        with self._lock:
-            self._seconds_behind_live = 0.0
-
-    def get_seconds_behind_live(self) -> float:
-        """Return the currently selected replay offset."""
-        with self._lock:
-            return self._seconds_behind_live
-
     def get_latest_frame(self) -> MediaFrame | None:
         """Return the newest buffered frame."""
         with self._lock:
@@ -107,14 +92,27 @@ class ReplayBuffer:
                 return None
             return self._decode_buffered_frame(self._frames[-1])
 
-    def get_frame_seconds_behind_live(self, seconds: float) -> MediaFrame | None:
-        """Return the frame nearest to the requested live offset."""
+    def get_frame_at_or_before(self, timestamp: float) -> MediaFrame | None:
+        """Return the newest frame at or before the requested timestamp."""
         with self._lock:
             if not self._frames:
                 return None
+            return self._frame_at_or_before_locked(timestamp)
+
+    def get_seconds_behind_live(self, timestamp: float) -> float:
+        """Return how far a timestamp sits behind the current live edge."""
+        with self._lock:
+            if not self._frames:
+                return 0.0
             latest_timestamp = self._frames[-1].timestamp
-            target_timestamp = latest_timestamp - max(seconds, 0.0)
-            return self._frame_nearest_to_timestamp_locked(target_timestamp)
+            return max(0.0, latest_timestamp - timestamp)
+
+    def get_buffer_range(self) -> tuple[float | None, float | None]:
+        """Return the oldest and newest buffered timestamps."""
+        with self._lock:
+            if not self._frames:
+                return None, None
+            return self._frames[0].timestamp, self._frames[-1].timestamp
 
     def get_earliest_timestamp(self) -> float | None:
         """Return the earliest buffered timestamp."""
@@ -133,9 +131,9 @@ class ReplayBuffer:
     def get_available_duration(self) -> float:
         """Return the total buffered timeline in seconds."""
         with self._lock:
-            return self.get_available_duration_locked()
+            return self._get_available_duration_locked()
 
-    def get_available_duration_locked(self) -> float:
+    def _get_available_duration_locked(self) -> float:
         if len(self._frames) < 2:
             return 0.0
         return max(0.0, self._frames[-1].timestamp - self._frames[0].timestamp)
@@ -148,12 +146,15 @@ class ReplayBuffer:
         while self._frames and latest_timestamp - self._frames[0].timestamp > self._buffer_duration_seconds:
             self._frames.popleft()
 
-    def _frame_nearest_to_timestamp_locked(self, target_timestamp: float) -> MediaFrame | None:
+    def _frame_at_or_before_locked(self, target_timestamp: float) -> MediaFrame | None:
         if not self._frames:
             return None
 
-        nearest = min(self._frames, key=lambda item: abs(item.timestamp - target_timestamp))
-        return self._decode_buffered_frame(nearest)
+        for buffered_frame in reversed(self._frames):
+            if buffered_frame.timestamp <= target_timestamp:
+                return self._decode_buffered_frame(buffered_frame)
+
+        return self._decode_buffered_frame(self._frames[0])
 
     def _decode_buffered_frame(self, buffered_frame: BufferedFrame) -> MediaFrame | None:
         encoded_array = np.frombuffer(buffered_frame.encoded_image, dtype=np.uint8)
@@ -163,6 +164,6 @@ class ReplayBuffer:
         return MediaFrame(
             frame_id=buffered_frame.frame_id,
             timestamp=buffered_frame.timestamp,
-            image_bgr=decoded_image,
+            image=decoded_image,
             source_name=buffered_frame.source_name,
         )
