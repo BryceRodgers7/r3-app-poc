@@ -6,6 +6,7 @@ from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer
 from app.media.source_interface import SourceInterface
+from app.media.test_source import TestSource
 
 __all__ = [
     "NDIReceiver",
@@ -14,4 +15,5 @@ __all__ = [
     "Recorder",
     "ReplayBuffer",
     "SourceInterface",
+    "TestSource",
 ]

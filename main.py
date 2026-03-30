@@ -8,11 +8,11 @@ from PySide6.QtWidgets import QApplication
 
 from app.config.settings import AppSettings
 from app.core.playback_controller import PlaybackController
-from app.media.ndi_receiver import NDIReceiver
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer
+from app.media.test_source import TestSource
 from app.storage.file_manager import FileManager
 from app.storage.metadata_db import MetadataDb
 from app.storage.session_manager import SessionManager
@@ -29,10 +29,19 @@ def build_application() -> tuple[QApplication, MainWindow]:
     file_manager = FileManager(settings)
     metadata_db = MetadataDb(settings.metadata_db_path)
     session_manager = SessionManager(file_manager, metadata_db)
-    source = NDIReceiver(settings.default_source_name)
+    source = TestSource(
+        source_name=settings.default_source_name,
+        camera_index=settings.test_camera_index,
+        frame_width=settings.target_frame_width,
+        frame_height=settings.target_frame_height,
+        target_fps=settings.target_fps,
+    )
     preview_output = PreviewOutput()
-    recorder = Recorder()
-    replay_buffer = ReplayBuffer(buffer_duration_seconds=settings.replay_buffer_seconds)
+    recorder = Recorder(settings=settings)
+    replay_buffer = ReplayBuffer(
+        buffer_duration_seconds=settings.replay_buffer_seconds,
+        jpeg_quality=settings.replay_buffer_jpeg_quality,
+    )
     pipeline_manager = PipelineManager(
         source=source,
         preview_output=preview_output,
@@ -42,6 +51,7 @@ def build_application() -> tuple[QApplication, MainWindow]:
     controller = PlaybackController(
         session_manager=session_manager,
         pipeline_manager=pipeline_manager,
+        preview_output=preview_output,
         recorder=recorder,
         replay_buffer=replay_buffer,
         default_source_name=settings.default_source_name,

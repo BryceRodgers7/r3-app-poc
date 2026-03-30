@@ -17,4 +17,6 @@ class AppState:
     seconds_behind_live: float = 0.0
     current_session_id: str | None = None
     current_source_name: str | None = None
+    last_frame_timestamp: float | None = None
+    replay_buffer_span_seconds: float = 0.0
     error_message: str | None = None

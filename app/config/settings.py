@@ -15,7 +15,14 @@ class AppSettings:
     base_data_dir: Path = Path(r"C:\SportsReplay")
     replay_buffer_seconds: int = 120
     touch_button_height: int = 72
-    default_source_name: str = "NDI Source (Stub)"
+    default_source_name: str = "Test Source"
+    test_camera_index: int = 0
+    target_frame_width: int = 640
+    target_frame_height: int = 360
+    target_fps: float = 15.0
+    replay_buffer_jpeg_quality: int = 80
+    recording_filename: str = "session_recording.mp4"
+    recording_manifest_filename: str = "recording_manifest.json"
 
     @property
     def sessions_root(self) -> Path:

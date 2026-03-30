@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from app.core.models import MediaFrame
+
 
 class SourceInterface(ABC):
     """Abstract interface for a pluggable live video source."""
@@ -27,3 +29,15 @@ class SourceInterface(ABC):
     @abstractmethod
     def create_pipeline_fragment(self) -> str:
         """Return a placeholder pipeline fragment for future GStreamer wiring."""
+
+    @abstractmethod
+    def read_frame(self) -> MediaFrame | None:
+        """Read the next frame from the source."""
+
+    @abstractmethod
+    def get_frame_size(self) -> tuple[int, int]:
+        """Return the source frame size as width and height."""
+
+    @abstractmethod
+    def get_nominal_fps(self) -> float:
+        """Return the target frame rate used by the temporary source."""

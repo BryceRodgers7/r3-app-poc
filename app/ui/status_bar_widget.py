@@ -8,7 +8,7 @@ from app.core.app_state import AppState
 
 
 class StatusBarWidget(QFrame):
-    """Displays current mode, recording, source, session, and error status."""
+    """Displays current mode, recording, source, session, and detail status."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -16,7 +16,7 @@ class StatusBarWidget(QFrame):
         self.recording_value = QLabel("-")
         self.source_value = QLabel("-")
         self.session_value = QLabel("-")
-        self.error_value = QLabel("-")
+        self.detail_value = QLabel("-")
 
         layout = QGridLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -28,7 +28,7 @@ class StatusBarWidget(QFrame):
             ("Recording", self.recording_value),
             ("Source", self.source_value),
             ("Session", self.session_value),
-            ("Error", self.error_value),
+            ("Detail", self.detail_value),
         )
         for row, (title, value_label) in enumerate(labels):
             layout.addWidget(QLabel(f"{title}:"), row, 0)
@@ -49,7 +49,11 @@ class StatusBarWidget(QFrame):
 
     def update_state(self, state: AppState) -> None:
         """Refresh all labels from the latest application state."""
-        self.mode_value.setText(state.current_playback_mode.value.replace("_", " "))
+        if state.current_playback_mode.value == "REPLAY":
+            self.mode_value.setText(f"REPLAY -{state.seconds_behind_live:.0f}s")
+        else:
+            self.mode_value.setText(state.current_playback_mode.value.replace("_", " "))
+
         self.recording_value.setText("RECORDING" if state.is_recording else "IDLE")
         self.source_value.setText(
             f"{state.current_source_name or 'Unknown'} ({'CONNECTED' if state.source_connected else 'DISCONNECTED'})"
@@ -57,8 +61,12 @@ class StatusBarWidget(QFrame):
         self.session_value.setText(state.current_session_id or "No session")
 
         if state.error_message:
-            self.error_value.setText(state.error_message)
-        elif state.seconds_behind_live > 0:
-            self.error_value.setText(f"{state.seconds_behind_live:.0f}s behind live")
+            self.detail_value.setText(state.error_message)
+        elif state.current_playback_mode.value == "PAUSED":
+            self.detail_value.setText("Playback frozen while ingest and recording continue")
+        elif state.current_playback_mode.value == "REPLAY":
+            self.detail_value.setText(
+                f"Rolling buffer contains about {state.replay_buffer_span_seconds:.0f}s"
+            )
         else:
-            self.error_value.setText("None")
+            self.detail_value.setText("Showing newest live frame")

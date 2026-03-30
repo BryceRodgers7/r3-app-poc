@@ -61,13 +61,13 @@ class MainWindow(QMainWindow):
         self.status_widget.update_state(state)
 
         if state.current_playback_mode.value == "LIVE":
-            overlay = "Live preview placeholder"
+            overlay = "LIVE VIEW"
         elif state.current_playback_mode.value == "PAUSED":
-            overlay = "Playback paused\nPreview and recording continue in the background"
+            overlay = "PAUSED\nCapture, recording, and replay buffering continue"
         elif state.current_playback_mode.value == "REPLAY":
-            overlay = f"Replay placeholder\n{state.seconds_behind_live:.0f}s behind live"
+            overlay = f"REPLAY\nViewing approximately {state.seconds_behind_live:.0f}s behind live"
         else:
-            overlay = "Source lost placeholder\nCapture pipeline should continue trying to ingest"
+            overlay = "SOURCE LOST\nWaiting for the selected source"
 
         self.video_widget.set_overlay_text(overlay)
 

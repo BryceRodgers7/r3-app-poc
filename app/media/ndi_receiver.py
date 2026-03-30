@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.core.models import MediaFrame
 from app.media.source_interface import SourceInterface
 
 
@@ -33,3 +34,15 @@ class NDIReceiver(SourceInterface):
     def create_pipeline_fragment(self) -> str:
         """Describe the future media source fragment."""
         return "ndi-source-placeholder"
+
+    def read_frame(self) -> MediaFrame | None:
+        """NDI frame reading is not implemented in this milestone."""
+        return None
+
+    def get_frame_size(self) -> tuple[int, int]:
+        """Return a placeholder size until NDI integration is implemented."""
+        return 1920, 1080
+
+    def get_nominal_fps(self) -> float:
+        """Return a placeholder frame rate until NDI integration is implemented."""
+        return 30.0
