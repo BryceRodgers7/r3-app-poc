@@ -53,6 +53,7 @@ class PlaybackController:
         self._pipeline_manager.start_replay_buffer(session_paths)
         self._pipeline_manager.start_recording(session_paths)
         self._pipeline_manager.start_preview()
+        self._pipeline_manager.activate_live_output()
 
         self._state.current_session_id = session_paths.session_id
         self._state.current_source_name = source_name
@@ -66,6 +67,7 @@ class PlaybackController:
 
     def pause_playback(self) -> None:
         """Pause only the viewed playback state."""
+        pause_frame: MediaFrame | None = None
         with self._lock:
             if self._display_frame is not None:
                 base_timestamp = self._display_frame.timestamp
@@ -88,10 +90,13 @@ class PlaybackController:
             self._state.current_playback_mode = PlaybackMode.PAUSED
             self._state.error_message = None
             self._update_state_timestamps_locked()
+            selected_pause_frame = pause_frame
+        self._pipeline_manager.show_replay_frame(selected_pause_frame)
         self._emit_state("Playback paused")
 
     def rewind_10_seconds(self) -> None:
         """Move the viewed output back by ten seconds without stopping ingest."""
+        replay_frame: MediaFrame | None = None
         with self._lock:
             if not self._replay_buffer.is_running():
                 self._state.error_message = "Replay buffer is not active."
@@ -131,6 +136,8 @@ class PlaybackController:
             self._state.current_playback_mode = PlaybackMode.REPLAY
             self._state.error_message = None
             self._update_state_timestamps_locked()
+            selected_replay_frame = replay_frame
+        self._pipeline_manager.show_replay_frame(selected_replay_frame)
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def jump_to_live(self) -> None:
@@ -143,12 +150,13 @@ class PlaybackController:
             self._state.error_message = None
             self._display_frame = None
             self._update_state_timestamps_locked()
+        self._pipeline_manager.activate_live_output()
         self._emit_state("Returned to live")
 
     def attach_preview_widget(self, video_widget: VideoWidget) -> None:
-        """Bind the live preview sink to the widget's native child surface."""
-        self._pipeline_manager.set_preview_window_handle(video_widget.get_live_video_handle())
-        video_widget.live_surface_resized.connect(self._pipeline_manager.refresh_preview_overlay)
+        """Bind the shared embedded video surface to the media pipelines."""
+        self._pipeline_manager.set_video_window_handle(video_widget.get_video_surface_handle())
+        video_widget.video_surface_resized.connect(self._pipeline_manager.refresh_active_video_output)
 
     def set_source_lost(self, message: str = "Source signal lost.") -> None:
         """Reflect that the live source is no longer available."""
@@ -160,12 +168,16 @@ class PlaybackController:
 
     def set_source_connected(self) -> None:
         """Reflect that the live source is available again."""
+        activate_live_output = False
         with self._lock:
             self._state.source_connected = True
             if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
                 self._state.current_playback_mode = PlaybackMode.LIVE
+                activate_live_output = True
             self._state.current_source_name = self._pipeline_manager.get_source_name()
             self._state.error_message = None
+        if activate_live_output:
+            self._pipeline_manager.activate_live_output()
         self._emit_state("Source connected")
 
     def get_state(self) -> AppState:

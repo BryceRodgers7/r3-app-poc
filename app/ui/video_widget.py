@@ -13,7 +13,7 @@ from app.core.models import MediaFrame
 class VideoWidget(QWidget):
     """Displays the selected frame and an informational overlay."""
 
-    live_surface_resized = Signal()
+    video_surface_resized = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -31,7 +31,7 @@ class VideoWidget(QWidget):
         self._overlay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._overlay_label.setWordWrap(True)
         self._current_image: QImage | None = None
-        self._showing_live_sink = False
+        self._showing_video_surface = False
 
         surface_stack_host = QWidget(self)
         self._surface_stack = QStackedLayout(surface_stack_host)
@@ -66,19 +66,19 @@ class VideoWidget(QWidget):
         """Update the status text shown with the video surface."""
         self._overlay_label.setText(text)
 
-    def get_live_video_handle(self) -> int:
-        """Return the native child-window handle used by the embedded preview sink."""
+    def get_video_surface_handle(self) -> int:
+        """Return the native child-window handle used by embedded video output."""
         return int(self._live_surface.winId())
 
-    def set_live_mode(self, enabled: bool) -> None:
-        """Switch between the embedded live sink and manual frame rendering."""
-        if enabled == self._showing_live_sink:
+    def set_video_surface_visible(self, enabled: bool) -> None:
+        """Switch between embedded video output and the fallback placeholder label."""
+        if enabled == self._showing_video_surface:
             return
-        self._showing_live_sink = enabled
+        self._showing_video_surface = enabled
         current_widget = self._live_surface if enabled else self._frame_label
         self._surface_stack.setCurrentWidget(current_widget)
         if enabled:
-            self.live_surface_resized.emit()
+            self.video_surface_resized.emit()
 
     def display_frame(self, frame: MediaFrame) -> None:
         """Render a new frame inside the preview area."""
@@ -98,8 +98,8 @@ class VideoWidget(QWidget):
         """Keep the rendered frame scaled to the current widget size."""
         super().resizeEvent(event)
         self._refresh_pixmap()
-        if self._showing_live_sink:
-            self.live_surface_resized.emit()
+        if self._showing_video_surface:
+            self.video_surface_resized.emit()
 
     def _refresh_pixmap(self) -> None:
         if self._current_image is None:

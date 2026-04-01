@@ -58,13 +58,20 @@ class PipelineManager:
         self._pipeline: Any | None = None
         self._appsrc: Any | None = None
         self._bus: Any | None = None
+        self._replay_pipeline: Any | None = None
+        self._replay_appsrc: Any | None = None
+        self._replay_bus: Any | None = None
         self._tee_request_pads: list[Any] = []
         self._branch_valves: dict[str, Any] = {}
         self._preview_sink: Any | None = None
         self._preview_sink_factory_name: str | None = None
+        self._replay_sink: Any | None = None
+        self._replay_sink_factory_name: str | None = None
         self._preview_probe_pad: Any | None = None
         self._preview_probe_id: int | None = None
-        self._preview_window_handle: int | None = None
+        self._video_window_handle: int | None = None
+        self._replay_push_count = 0
+        self._active_video_output = "live"
 
         self._frame_feed_thread: threading.Thread | None = None
         self._bus_thread: threading.Thread | None = None
@@ -81,14 +88,16 @@ class PipelineManager:
         """Describe the current transitional tee/fan-out architecture."""
         return (
             "SourceInterface.read_frame -> appsrc -> videoconvert -> tee -> "
-            "[preview embedded video sink, recording appsink, replay appsink]"
+            "[preview embedded video sink, recording appsink, replay appsink] + "
+            "replay buffer -> replay appsrc -> embedded replay sink"
         )
 
     def start_preview(self) -> None:
         """Start the preview branch without affecting recording or replay buffering."""
         self._preview_running = True
         self._preview_output.show_placeholder_message("Starting live preview...")
-        self._set_branch_enabled("preview", True)
+        if self._active_video_output == "live":
+            self._set_branch_enabled("preview", True)
 
     def start_recording(self, session_paths: SessionPaths) -> None:
         """Start the full-session recording branch."""
@@ -139,6 +148,12 @@ class PipelineManager:
             except Exception:
                 pass
 
+        if self._replay_appsrc is not None:
+            try:
+                self._replay_appsrc.emit("end-of-stream")
+            except Exception:
+                pass
+
         if self._frame_feed_thread is not None:
             self._frame_feed_thread.join(timeout=2.0)
             self._frame_feed_thread = None
@@ -179,20 +194,53 @@ class PipelineManager:
         """Register the controller callback for live-preview timestamps."""
         self._live_sample_callback = callback
 
-    def set_preview_window_handle(self, window_handle: int) -> None:
-        """Attach the embedded preview sink to a Qt-owned native child window."""
-        self._preview_window_handle = int(window_handle)
+    def set_video_window_handle(self, window_handle: int) -> None:
+        """Attach the active embedded video sink to a Qt-owned native child window."""
+        self._video_window_handle = int(window_handle)
         with self._pipeline_lock:
-            self._bind_preview_sink_locked()
+            self._bind_active_video_sink_locked()
+
+    def set_preview_window_handle(self, window_handle: int) -> None:
+        """Backward-compatible wrapper for the shared video surface handle."""
+        self.set_video_window_handle(window_handle)
+
+    def refresh_active_video_output(self) -> None:
+        """Ask the active embedded video sink to redraw into the current window."""
+        with self._pipeline_lock:
+            self._bind_active_video_sink_locked(expose=True)
 
     def refresh_preview_overlay(self) -> None:
-        """Ask the embedded preview sink to redraw into the current window."""
-        with self._pipeline_lock:
-            self._bind_preview_sink_locked(expose=True)
+        """Backward-compatible wrapper for refreshing the active video sink."""
+        self.refresh_active_video_output()
 
     def get_preview_sink_name(self) -> str | None:
         """Return the selected preview sink factory name."""
         return self._preview_sink_factory_name
+
+    def get_replay_sink_name(self) -> str | None:
+        """Return the selected replay sink factory name."""
+        return self._replay_sink_factory_name
+
+    def activate_live_output(self) -> None:
+        """Route the shared video surface back to the live preview sink."""
+        with self._pipeline_lock:
+            self._active_video_output = "live"
+            self._set_branch_enabled("preview", self._preview_running)
+            if self._replay_pipeline is not None:
+                self._replay_pipeline.set_state(self._Gst.State.PAUSED)
+            self._bind_active_video_sink_locked()
+
+    def show_replay_frame(self, frame: MediaFrame) -> None:
+        """Display a replay frame through the dedicated replay playback pipeline."""
+        with self._pipeline_lock:
+            if self._replay_pipeline is None or self._replay_appsrc is None:
+                raise RuntimeError("Replay playback pipeline is not available.")
+
+            self._active_video_output = "replay"
+            self._set_branch_enabled("preview", False)
+            self._replay_pipeline.set_state(self._Gst.State.PLAYING)
+            self._bind_active_video_sink_locked()
+            self._push_replay_frame_locked(frame)
 
     def get_source_name(self) -> str:
         """Return the current source display name."""
@@ -263,16 +311,25 @@ class PipelineManager:
             self._branch_valves.clear()
             self._preview_sink = None
             self._preview_sink_factory_name = None
+            self._replay_sink = None
+            self._replay_sink_factory_name = None
             self._preview_probe_pad = None
             self._preview_probe_id = None
+            self._replay_push_count = 0
+            self._active_video_output = "live"
 
             self._add_branch("preview", self._on_preview_sample)
             self._add_branch("record", self._on_record_sample)
             self._add_branch("replay", self._on_replay_sample)
+            self._build_replay_pipeline(width=width, height=height, fps_fraction=fps_fraction)
 
             state_change = pipeline.set_state(Gst.State.PLAYING)
             if state_change == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("Failed to move the GStreamer pipeline to PLAYING.")
+            if self._replay_pipeline is not None:
+                replay_state_change = self._replay_pipeline.set_state(Gst.State.PAUSED)
+                if replay_state_change == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("Failed to move the replay playback pipeline to PAUSED.")
 
     def _add_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
         assert self._pipeline is not None
@@ -325,7 +382,7 @@ class PipelineManager:
         queue = self._make_element("queue", f"{branch_name}_queue")
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
-        sink, sink_factory_name = self._make_preview_sink(f"{branch_name}_sink")
+        sink, sink_factory_name = self._make_video_sink(f"{branch_name}_sink")
 
         valve.set_property("drop", True)
         self._set_property_if_supported(sink, "sync", False)
@@ -345,7 +402,7 @@ class PipelineManager:
         if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"Failed to link tee output to the {branch_name} branch.")
 
-        preview_probe_pad = convert.get_static_pad("src")
+        preview_probe_pad = queue.get_static_pad("src")
         if preview_probe_pad is None:
             raise RuntimeError("Failed to access the preview branch source pad.")
         self._preview_probe_id = preview_probe_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_preview_buffer)
@@ -359,7 +416,47 @@ class PipelineManager:
         self._branch_valves[branch_name] = valve
         self._preview_sink = sink
         self._preview_sink_factory_name = sink_factory_name
-        self._bind_preview_sink_locked()
+        self._bind_active_video_sink_locked()
+
+    def _build_replay_pipeline(self, width: int, height: int, fps_fraction: Fraction) -> None:
+        assert self._Gst is not None
+
+        replay_pipeline = self._Gst.Pipeline.new("sports-replay-display-pipeline")
+        replay_appsrc = self._make_element("appsrc", "replay_appsrc")
+        replay_convert = self._make_element("videoconvert", "replay_convert")
+        replay_sink, replay_sink_factory_name = self._make_video_sink("replay_sink")
+
+        replay_appsrc.set_property("is-live", False)
+        replay_appsrc.set_property("format", self._Gst.Format.TIME)
+        replay_appsrc.set_property("block", True)
+        replay_appsrc.set_property("do-timestamp", False)
+        replay_appsrc.set_property(
+            "caps",
+            self._Gst.Caps.from_string(
+                "video/x-raw,format=BGR,"
+                f"width={width},height={height},"
+                f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
+            ),
+        )
+        self._set_property_if_supported(replay_sink, "sync", False)
+        self._set_property_if_supported(replay_sink, "qos", True)
+        self._set_property_if_supported(replay_sink, "force-aspect-ratio", True)
+
+        replay_pipeline.add(replay_appsrc)
+        replay_pipeline.add(replay_convert)
+        replay_pipeline.add(replay_sink)
+        if not replay_appsrc.link(replay_convert) or not replay_convert.link(replay_sink):
+            raise RuntimeError("Failed to link the replay playback pipeline.")
+
+        self._replay_pipeline = replay_pipeline
+        self._replay_appsrc = replay_appsrc
+        self._replay_bus = replay_pipeline.get_bus()
+        if self._replay_bus is not None:
+            self._replay_bus.enable_sync_message_emission()
+            self._replay_bus.connect("sync-message::element", self._on_bus_sync_message)
+        self._replay_sink = replay_sink
+        self._replay_sink_factory_name = replay_sink_factory_name
+        self._bind_active_video_sink_locked()
 
     def _request_tee_pad(self) -> Any:
         assert self._pipeline is not None
@@ -384,7 +481,7 @@ class PipelineManager:
             raise RuntimeError(f"Failed to create GStreamer element '{factory_name}'.")
         return element
 
-    def _make_preview_sink(self, element_name: str) -> tuple[Any, str]:
+    def _make_video_sink(self, element_name: str) -> tuple[Any, str]:
         Gst = self._Gst
         assert Gst is not None
 
@@ -468,69 +565,106 @@ class PipelineManager:
         Gst = self._Gst
         assert Gst is not None
 
-        if self._bus is None:
-            return
-
         interesting_messages = Gst.MessageType.ERROR | Gst.MessageType.EOS
         while not self._stop_event.is_set():
-            message = self._bus.timed_pop_filtered(int(Gst.SECOND / 10), interesting_messages)
-            if message is None:
-                continue
-
-            if message.type == Gst.MessageType.ERROR:
-                error, debug = message.parse_error()
-                details = debug or str(error)
-                self._preview_output.show_placeholder_message(f"GStreamer error: {details}")
-                self._stop_event.set()
+            if self._poll_bus_for_messages(self._bus, interesting_messages, int(Gst.SECOND / 20)):
+                break
+            if self._poll_bus_for_messages(self._replay_bus, interesting_messages, 0):
                 break
 
-            if message.type == Gst.MessageType.EOS:
-                self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
-                self._stop_event.set()
-                break
+    def _poll_bus_for_messages(self, bus: Any, interesting_messages: Any, timeout_ns: int) -> bool:
+        if bus is None:
+            return False
+
+        message = bus.timed_pop_filtered(timeout_ns, interesting_messages)
+        if message is None:
+            return False
+
+        if message.type == self._Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            details = debug or str(error)
+            self._preview_output.show_placeholder_message(f"GStreamer error: {details}")
+            self._stop_event.set()
+            return True
+
+        if message.type == self._Gst.MessageType.EOS:
+            self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
+            self._stop_event.set()
+            return True
+
+        return False
 
     def _on_bus_sync_message(self, _bus: Any, message: Any) -> None:
         structure = message.get_structure()
         if structure is None or structure.get_name() != "prepare-window-handle":
             return
-        if self._preview_sink is None or message.src != self._preview_sink:
+        if message.src == self._preview_sink and self._active_video_output == "live":
+            with self._pipeline_lock:
+                self._bind_video_sink_locked(message.src)
             return
-
-        with self._pipeline_lock:
-            self._bind_preview_sink_locked(sink=message.src)
+        if message.src == self._replay_sink and self._active_video_output == "replay":
+            with self._pipeline_lock:
+                self._bind_video_sink_locked(message.src)
+            return
 
     def _set_branch_enabled(self, branch_name: str, enabled: bool) -> None:
         valve = self._branch_valves.get(branch_name)
         if valve is not None:
             valve.set_property("drop", not enabled)
 
-    def _bind_preview_sink_locked(self, sink: Any | None = None, expose: bool = True) -> None:
-        target_sink = sink if sink is not None else self._preview_sink
-        if target_sink is None or self._preview_window_handle is None:
+    def _bind_active_video_sink_locked(self, expose: bool = True) -> None:
+        self._bind_video_sink_locked(self._get_active_video_sink_locked(), expose=expose)
+
+    def _get_active_video_sink_locked(self) -> Any | None:
+        if self._active_video_output == "replay":
+            return self._replay_sink
+        return self._preview_sink
+
+    def _bind_video_sink_locked(self, sink: Any | None, expose: bool = True) -> None:
+        if sink is None or self._video_window_handle is None:
             return
 
         try:
-            target_sink.set_window_handle(self._preview_window_handle)
+            sink.set_window_handle(self._video_window_handle)
         except Exception:
             GstVideo = self._GstVideo
             if GstVideo is None:
                 return
             try:
-                GstVideo.VideoOverlay.set_window_handle(target_sink, self._preview_window_handle)
+                GstVideo.VideoOverlay.set_window_handle(sink, self._video_window_handle)
             except Exception:
                 return
 
-        if expose and hasattr(target_sink, "expose"):
+        if expose and hasattr(sink, "expose"):
             try:
-                target_sink.expose()
+                sink.expose()
             except Exception:
                 GstVideo = self._GstVideo
                 if GstVideo is None:
                     return
                 try:
-                    GstVideo.VideoOverlay.expose(target_sink)
+                    GstVideo.VideoOverlay.expose(sink)
                 except Exception:
                     pass
+
+    def _push_replay_frame_locked(self, frame: MediaFrame) -> None:
+        assert self._Gst is not None
+        assert self._replay_appsrc is not None
+
+        frame_array = np.ascontiguousarray(frame.image_bgr)
+        gst_buffer = self._Gst.Buffer.new_allocate(None, frame_array.nbytes, None)
+        gst_buffer.fill(0, frame_array.tobytes())
+        gst_buffer.offset = frame.frame_id
+        gst_buffer.pts = self._replay_push_count * self._frame_duration_ns
+        gst_buffer.dts = gst_buffer.pts
+        gst_buffer.duration = self._frame_duration_ns
+        self._replay_push_count += 1
+
+        flow_return = self._replay_appsrc.emit("push-buffer", gst_buffer)
+        if flow_return != self._Gst.FlowReturn.OK and not self._stop_event.is_set():
+            self._preview_output.show_placeholder_message(
+                f"Replay playback push failed: {flow_return}"
+            )
 
     def _on_preview_buffer(self, _pad: Any, info: Any) -> Any:
         Gst = self._Gst
@@ -625,6 +759,8 @@ class PipelineManager:
     def _teardown_pipeline(self) -> None:
         with self._pipeline_lock:
             if self._pipeline is None:
+                if self._replay_pipeline is not None:
+                    self._teardown_replay_pipeline_locked()
                 return
 
             Gst = self._Gst
@@ -635,6 +771,8 @@ class PipelineManager:
 
             if self._preview_probe_pad is not None and self._preview_probe_id is not None:
                 self._preview_probe_pad.remove_probe(self._preview_probe_id)
+
+            self._teardown_replay_pipeline_locked()
 
             if tee is not None:
                 for request_pad in self._tee_request_pads:
@@ -652,3 +790,15 @@ class PipelineManager:
             self._stream_start_timestamp = None
             with self._metadata_lock:
                 self._frame_metadata.clear()
+
+    def _teardown_replay_pipeline_locked(self) -> None:
+        if self._replay_pipeline is None:
+            return
+
+        self._replay_pipeline.set_state(self._Gst.State.NULL)
+        self._replay_pipeline = None
+        self._replay_appsrc = None
+        self._replay_bus = None
+        self._replay_sink = None
+        self._replay_sink_factory_name = None
+        self._replay_push_count = 0

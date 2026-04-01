@@ -61,13 +61,12 @@ class MainWindow(QMainWindow):
 
     def _render_state(self, state: AppState) -> None:
         self.status_widget.update_state(state)
-        is_live_mode = state.current_playback_mode == PlaybackMode.LIVE
-        self.video_widget.set_live_mode(is_live_mode)
-        if not is_live_mode:
-            display_frame = self._controller.get_display_frame()
-            if display_frame is not None:
-                # Replay and paused views still render the controller-selected frame in Qt.
-                self._preview_output.show_frame(display_frame)
+        show_embedded_video = state.current_playback_mode in {
+            PlaybackMode.LIVE,
+            PlaybackMode.PAUSED,
+            PlaybackMode.REPLAY,
+        }
+        self.video_widget.set_video_surface_visible(show_embedded_video)
 
         if state.current_playback_mode.value == "LIVE":
             overlay = "LIVE VIEW"
