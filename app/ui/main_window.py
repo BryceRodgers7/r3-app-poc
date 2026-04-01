@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QMainWindow, QStatusBar, QVBoxLayout, QWidget
 
 from app.config.settings import AppSettings
 from app.core.app_state import AppState
+from app.core.models import PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.preview_output import PreviewOutput
 from app.ui.controls_widget import ControlsWidget
@@ -47,6 +48,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         self._preview_output.bind_widget(self.video_widget)
+        self._controller.attach_preview_widget(self.video_widget)
         self._wire_events()
         self._render_state(self._controller.get_state())
 
@@ -59,10 +61,13 @@ class MainWindow(QMainWindow):
 
     def _render_state(self, state: AppState) -> None:
         self.status_widget.update_state(state)
-        display_frame = self._controller.get_display_frame()
-        if display_frame is not None:
-            # The UI renders whichever frame the controller has selected.
-            self._preview_output.show_frame(display_frame)
+        is_live_mode = state.current_playback_mode == PlaybackMode.LIVE
+        self.video_widget.set_live_mode(is_live_mode)
+        if not is_live_mode:
+            display_frame = self._controller.get_display_frame()
+            if display_frame is not None:
+                # Replay and paused views still render the controller-selected frame in Qt.
+                self._preview_output.show_frame(display_frame)
 
         if state.current_playback_mode.value == "LIVE":
             overlay = "LIVE VIEW"

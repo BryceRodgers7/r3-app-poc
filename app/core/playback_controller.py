@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING
 
 from app.core.app_state import AppState
 from app.core.models import MediaFrame, PlaybackMode
@@ -12,6 +13,9 @@ from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer
 from app.storage.session_manager import SessionManager
+
+if TYPE_CHECKING:
+    from app.ui.video_widget import VideoWidget
 
 
 class PlaybackController:
@@ -45,7 +49,7 @@ class PlaybackController:
         connected = self._pipeline_manager.connect_source()
         source_name = self._pipeline_manager.get_source_name()
         session_paths = self._session_manager.start_new_session(source_name)
-        self._pipeline_manager.set_frame_callback(self.on_new_live_frame)
+        self._pipeline_manager.set_live_sample_callback(self.on_live_sample)
         self._pipeline_manager.start_replay_buffer(session_paths)
         self._pipeline_manager.start_recording(session_paths)
         self._pipeline_manager.start_preview()
@@ -63,13 +67,24 @@ class PlaybackController:
     def pause_playback(self) -> None:
         """Pause only the viewed playback state."""
         with self._lock:
-            if self._display_frame is None:
+            if self._display_frame is not None:
+                base_timestamp = self._display_frame.timestamp
+            else:
+                base_timestamp = self._latest_live_timestamp
+
+            if base_timestamp is None:
                 self._state.error_message = "Cannot pause while the source is unavailable."
                 self._emit_state()
                 return
 
-            self._playback_timestamp = self._display_frame.timestamp
-            self._display_frame = self._replay_buffer.get_frame_at_or_before(self._playback_timestamp) or self._display_frame
+            pause_frame = self._replay_buffer.get_frame_at_or_before(base_timestamp) or self._display_frame
+            if pause_frame is None:
+                self._state.error_message = "Replay frame is not available yet."
+                self._emit_state()
+                return
+
+            self._playback_timestamp = pause_frame.timestamp
+            self._display_frame = pause_frame
             self._state.current_playback_mode = PlaybackMode.PAUSED
             self._state.error_message = None
             self._update_state_timestamps_locked()
@@ -126,10 +141,14 @@ class PlaybackController:
                 PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
             )
             self._state.error_message = None
-            if self._latest_live_frame is not None:
-                self._display_frame = self._latest_live_frame
+            self._display_frame = None
             self._update_state_timestamps_locked()
         self._emit_state("Returned to live")
+
+    def attach_preview_widget(self, video_widget: VideoWidget) -> None:
+        """Bind the live preview sink to the widget's native child surface."""
+        self._pipeline_manager.set_preview_window_handle(video_widget.get_live_video_handle())
+        video_widget.live_surface_resized.connect(self._pipeline_manager.refresh_preview_overlay)
 
     def set_source_lost(self, message: str = "Source signal lost.") -> None:
         """Reflect that the live source is no longer available."""
@@ -181,6 +200,29 @@ class PlaybackController:
             if self._state.current_playback_mode == PlaybackMode.LIVE:
                 self._playback_timestamp = frame.timestamp
                 self._display_frame = frame
+            elif self._state.current_playback_mode == PlaybackMode.REPLAY:
+                if self._playback_timestamp is not None and self._display_frame is None:
+                    self._display_frame = self._replay_buffer.get_frame_at_or_before(
+                        self._playback_timestamp
+                    )
+
+            self._update_state_timestamps_locked()
+        self._emit_state()
+
+    def on_live_sample(self, timestamp: float, source_name: str) -> None:
+        """Update controller-owned playback state from the live preview branch."""
+        with self._lock:
+            self._latest_live_timestamp = timestamp
+            self._state.source_connected = True
+            self._state.current_source_name = source_name
+            self._state.is_recording = self._recorder.is_recording()
+
+            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
+                self._state.current_playback_mode = PlaybackMode.LIVE
+
+            if self._state.current_playback_mode == PlaybackMode.LIVE:
+                self._playback_timestamp = timestamp
+                self._display_frame = None
             elif self._state.current_playback_mode == PlaybackMode.REPLAY:
                 if self._playback_timestamp is not None and self._display_frame is None:
                     self._display_frame = self._replay_buffer.get_frame_at_or_before(

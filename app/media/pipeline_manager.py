@@ -54,11 +54,17 @@ class PipelineManager:
         self._frame_callback: Callable[[MediaFrame], None] | None = None
 
         self._Gst: Any | None = None
+        self._GstVideo: Any | None = None
         self._pipeline: Any | None = None
         self._appsrc: Any | None = None
         self._bus: Any | None = None
         self._tee_request_pads: list[Any] = []
         self._branch_valves: dict[str, Any] = {}
+        self._preview_sink: Any | None = None
+        self._preview_sink_factory_name: str | None = None
+        self._preview_probe_pad: Any | None = None
+        self._preview_probe_id: int | None = None
+        self._preview_window_handle: int | None = None
 
         self._frame_feed_thread: threading.Thread | None = None
         self._bus_thread: threading.Thread | None = None
@@ -69,12 +75,13 @@ class PipelineManager:
         self._stream_start_timestamp: float | None = None
         self._frame_metadata: OrderedDict[int, _FrameMetadata] = OrderedDict()
         self._metadata_lock = threading.Lock()
+        self._live_sample_callback: Callable[[float, str], None] | None = None
 
     def describe_architecture(self) -> str:
         """Describe the current transitional tee/fan-out architecture."""
         return (
             "SourceInterface.read_frame -> appsrc -> videoconvert -> tee -> "
-            "[preview appsink, recording appsink, replay appsink]"
+            "[preview embedded video sink, recording appsink, replay appsink]"
         )
 
     def start_preview(self) -> None:
@@ -165,8 +172,27 @@ class PipelineManager:
         return True
 
     def set_frame_callback(self, callback: Callable[[MediaFrame], None]) -> None:
-        """Register the controller callback for preview-branch frames."""
+        """Register the legacy preview-frame callback."""
         self._frame_callback = callback
+
+    def set_live_sample_callback(self, callback: Callable[[float, str], None]) -> None:
+        """Register the controller callback for live-preview timestamps."""
+        self._live_sample_callback = callback
+
+    def set_preview_window_handle(self, window_handle: int) -> None:
+        """Attach the embedded preview sink to a Qt-owned native child window."""
+        self._preview_window_handle = int(window_handle)
+        with self._pipeline_lock:
+            self._bind_preview_sink_locked()
+
+    def refresh_preview_overlay(self) -> None:
+        """Ask the embedded preview sink to redraw into the current window."""
+        with self._pipeline_lock:
+            self._bind_preview_sink_locked(expose=True)
+
+    def get_preview_sink_name(self) -> str | None:
+        """Return the selected preview sink factory name."""
+        return self._preview_sink_factory_name
 
     def get_source_name(self) -> str:
         """Return the current source display name."""
@@ -179,7 +205,9 @@ class PipelineManager:
         try:
             gi = importlib.import_module("gi")
             gi.require_version("Gst", "1.0")
+            gi.require_version("GstVideo", "1.0")
             gst_module = importlib.import_module("gi.repository.Gst")
+            gst_video_module = importlib.import_module("gi.repository.GstVideo")
         except Exception as exc:
             raise RuntimeError(
                 "GStreamer via PyGObject is required for the current PipelineManager implementation."
@@ -187,6 +215,7 @@ class PipelineManager:
 
         gst_module.init(None)
         self._Gst = gst_module
+        self._GstVideo = gst_video_module
 
     def _build_pipeline(self) -> None:
         with self._pipeline_lock:
@@ -227,8 +256,15 @@ class PipelineManager:
             self._pipeline = pipeline
             self._appsrc = appsrc
             self._bus = pipeline.get_bus()
+            if self._bus is not None:
+                self._bus.enable_sync_message_emission()
+                self._bus.connect("sync-message::element", self._on_bus_sync_message)
             self._tee_request_pads.clear()
             self._branch_valves.clear()
+            self._preview_sink = None
+            self._preview_sink_factory_name = None
+            self._preview_probe_pad = None
+            self._preview_probe_id = None
 
             self._add_branch("preview", self._on_preview_sample)
             self._add_branch("record", self._on_record_sample)
@@ -242,6 +278,10 @@ class PipelineManager:
         assert self._pipeline is not None
         Gst = self._Gst
         assert Gst is not None
+
+        if branch_name == "preview":
+            self._add_preview_branch(branch_name)
+            return
 
         queue = self._make_element("queue", f"{branch_name}_queue")
         valve = self._make_element("valve", f"{branch_name}_valve")
@@ -277,6 +317,50 @@ class PipelineManager:
 
         self._branch_valves[branch_name] = valve
 
+    def _add_preview_branch(self, branch_name: str) -> None:
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", f"{branch_name}_queue")
+        valve = self._make_element("valve", f"{branch_name}_valve")
+        convert = self._make_element("videoconvert", f"{branch_name}_convert")
+        sink, sink_factory_name = self._make_preview_sink(f"{branch_name}_sink")
+
+        valve.set_property("drop", True)
+        self._set_property_if_supported(sink, "sync", False)
+        self._set_property_if_supported(sink, "qos", True)
+        self._set_property_if_supported(sink, "force-aspect-ratio", True)
+
+        self._pipeline.add(queue)
+        self._pipeline.add(valve)
+        self._pipeline.add(convert)
+        self._pipeline.add(sink)
+
+        if not queue.link(valve) or not valve.link(convert) or not convert.link(sink):
+            raise RuntimeError(f"Failed to link the {branch_name} branch.")
+
+        tee_src_pad = self._request_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"Failed to link tee output to the {branch_name} branch.")
+
+        preview_probe_pad = convert.get_static_pad("src")
+        if preview_probe_pad is None:
+            raise RuntimeError("Failed to access the preview branch source pad.")
+        self._preview_probe_id = preview_probe_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_preview_buffer)
+        self._preview_probe_pad = preview_probe_pad
+
+        queue.sync_state_with_parent()
+        valve.sync_state_with_parent()
+        convert.sync_state_with_parent()
+        sink.sync_state_with_parent()
+
+        self._branch_valves[branch_name] = valve
+        self._preview_sink = sink
+        self._preview_sink_factory_name = sink_factory_name
+        self._bind_preview_sink_locked()
+
     def _request_tee_pad(self) -> Any:
         assert self._pipeline is not None
         tee = self._pipeline.get_by_name("source_tee")
@@ -299,6 +383,28 @@ class PipelineManager:
         if element is None:
             raise RuntimeError(f"Failed to create GStreamer element '{factory_name}'.")
         return element
+
+    def _make_preview_sink(self, element_name: str) -> tuple[Any, str]:
+        Gst = self._Gst
+        assert Gst is not None
+
+        for factory_name in ("d3d11videosink", "glimagesink", "d3dvideosink"):
+            if Gst.ElementFactory.find(factory_name) is None:
+                continue
+            sink = Gst.ElementFactory.make(factory_name, element_name)
+            if sink is not None:
+                return sink, factory_name
+
+        raise RuntimeError(
+            "Failed to create an embedded preview video sink. "
+            "Tried d3d11videosink, glimagesink, and d3dvideosink."
+        )
+
+    def _set_property_if_supported(self, element: Any, property_name: str, value: Any) -> None:
+        try:
+            element.set_property(property_name, value)
+        except Exception:
+            pass
 
     def _start_pipeline_threads(self) -> None:
         with self._pipeline_lock:
@@ -383,10 +489,69 @@ class PipelineManager:
                 self._stop_event.set()
                 break
 
+    def _on_bus_sync_message(self, _bus: Any, message: Any) -> None:
+        structure = message.get_structure()
+        if structure is None or structure.get_name() != "prepare-window-handle":
+            return
+        if self._preview_sink is None or message.src != self._preview_sink:
+            return
+
+        with self._pipeline_lock:
+            self._bind_preview_sink_locked(sink=message.src)
+
     def _set_branch_enabled(self, branch_name: str, enabled: bool) -> None:
         valve = self._branch_valves.get(branch_name)
         if valve is not None:
             valve.set_property("drop", not enabled)
+
+    def _bind_preview_sink_locked(self, sink: Any | None = None, expose: bool = True) -> None:
+        target_sink = sink if sink is not None else self._preview_sink
+        if target_sink is None or self._preview_window_handle is None:
+            return
+
+        try:
+            target_sink.set_window_handle(self._preview_window_handle)
+        except Exception:
+            GstVideo = self._GstVideo
+            if GstVideo is None:
+                return
+            try:
+                GstVideo.VideoOverlay.set_window_handle(target_sink, self._preview_window_handle)
+            except Exception:
+                return
+
+        if expose and hasattr(target_sink, "expose"):
+            try:
+                target_sink.expose()
+            except Exception:
+                GstVideo = self._GstVideo
+                if GstVideo is None:
+                    return
+                try:
+                    GstVideo.VideoOverlay.expose(target_sink)
+                except Exception:
+                    pass
+
+    def _on_preview_buffer(self, _pad: Any, info: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        frame_id = int(buffer.offset) if buffer.offset != Gst.BUFFER_OFFSET_NONE else None
+        metadata: _FrameMetadata | None
+        with self._metadata_lock:
+            metadata = self._frame_metadata.get(frame_id) if frame_id is not None else None
+
+        timestamp = metadata.timestamp if metadata is not None else time.time()
+        source_name = metadata.source_name if metadata is not None else self._source.get_display_name()
+
+        if self._preview_running and self._live_sample_callback is not None:
+            self._live_sample_callback(timestamp, source_name)
+
+        return Gst.PadProbeReturn.OK
 
     def _on_preview_sample(self, sink: Any) -> Any:
         Gst = self._Gst
@@ -468,12 +633,19 @@ class PipelineManager:
             tee = self._pipeline.get_by_name("source_tee")
             self._pipeline.set_state(Gst.State.NULL)
 
+            if self._preview_probe_pad is not None and self._preview_probe_id is not None:
+                self._preview_probe_pad.remove_probe(self._preview_probe_id)
+
             if tee is not None:
                 for request_pad in self._tee_request_pads:
                     tee.release_request_pad(request_pad)
 
             self._tee_request_pads.clear()
             self._branch_valves.clear()
+            self._preview_sink = None
+            self._preview_sink_factory_name = None
+            self._preview_probe_pad = None
+            self._preview_probe_id = None
             self._pipeline = None
             self._appsrc = None
             self._bus = None
