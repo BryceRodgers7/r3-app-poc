@@ -224,6 +224,11 @@ class PipelineManager:
     def activate_live_output(self) -> None:
         """Route the shared video surface back to the live preview sink."""
         with self._pipeline_lock:
+            if self._active_video_output == "live":
+                self._set_branch_enabled("preview", self._preview_running)
+                self._bind_active_video_sink_locked()
+                return
+
             self._active_video_output = "live"
             self._set_branch_enabled("preview", self._preview_running)
             if self._replay_pipeline is not None:
@@ -236,10 +241,11 @@ class PipelineManager:
             if self._replay_pipeline is None or self._replay_appsrc is None:
                 raise RuntimeError("Replay playback pipeline is not available.")
 
-            self._active_video_output = "replay"
-            self._set_branch_enabled("preview", False)
-            self._replay_pipeline.set_state(self._Gst.State.PLAYING)
-            self._bind_active_video_sink_locked()
+            if self._active_video_output != "replay":
+                self._active_video_output = "replay"
+                self._set_branch_enabled("preview", False)
+                self._replay_pipeline.set_state(self._Gst.State.PLAYING)
+                self._bind_active_video_sink_locked()
             self._push_replay_frame_locked(frame)
 
     def get_source_name(self) -> str:
