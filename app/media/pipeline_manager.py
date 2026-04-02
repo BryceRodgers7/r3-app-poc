@@ -262,6 +262,10 @@ class PipelineManager:
         """Return the current source display name."""
         return self._source.get_display_name()
 
+    def get_source_status_message(self) -> str | None:
+        """Return the current non-fatal source status message."""
+        return self._source.get_status_message()
+
     def _configure_replay_source(self) -> None:
         with self._pipeline_lock:
             location_pattern = self._replay_buffer.get_multifile_location_pattern()

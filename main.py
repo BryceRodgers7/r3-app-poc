@@ -13,7 +13,7 @@ from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer
-from app.media.test_source import TestSource
+from app.media.source_factory import build_default_source
 from app.storage.file_manager import FileManager
 from app.storage.metadata_db import MetadataDb
 from app.storage.session_manager import SessionManager
@@ -34,13 +34,7 @@ def build_application() -> tuple[QApplication, MainWindow]:
     file_manager = FileManager(settings)
     metadata_db = MetadataDb(settings.metadata_db_path)
     session_manager = SessionManager(file_manager, metadata_db)
-    source = TestSource(
-        source_name=settings.default_source_name,
-        camera_index=settings.test_camera_index,
-        frame_width=settings.target_frame_width,
-        frame_height=settings.target_frame_height,
-        target_fps=settings.target_fps,
-    )
+    source = build_default_source(settings)
     preview_output = PreviewOutput()
     recorder = Recorder(settings=settings)
     replay_buffer = ReplayBuffer(

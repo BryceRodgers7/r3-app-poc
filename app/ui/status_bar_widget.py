@@ -62,6 +62,8 @@ class StatusBarWidget(QFrame):
 
         if state.error_message:
             self.detail_value.setText(state.error_message)
+        elif state.warning_message:
+            self.detail_value.setText(state.warning_message)
         elif state.current_playback_mode.value == "PAUSED":
             self.detail_value.setText("Playback frozen while ingest and recording continue")
         elif state.current_playback_mode.value == "REPLAY":

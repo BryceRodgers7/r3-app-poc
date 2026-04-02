@@ -200,11 +200,13 @@ class PlaybackController:
             self._state.source_connected = False
             self._set_playback_state_locked(_PlaybackState.SOURCE_LOST)
             self._state.error_message = message
+            self._state.warning_message = None
         self._emit_state(message)
 
     def set_source_connected(self) -> None:
         """Reflect that the live source is available again."""
         activate_live_output = False
+        status_message = "Source connected"
         with self._lock:
             self._state.source_connected = True
             if self._playback_state == _PlaybackState.SOURCE_LOST:
@@ -212,9 +214,12 @@ class PlaybackController:
                 activate_live_output = True
             self._state.current_source_name = self._pipeline_manager.get_source_name()
             self._state.error_message = None
+            self._sync_source_status_locked()
+            if self._state.warning_message:
+                status_message = self._state.warning_message
         if activate_live_output:
             self._pipeline_manager.activate_live_output()
-        self._emit_state("Source connected")
+        self._emit_state(status_message)
 
     def get_state(self) -> AppState:
         """Return the current application state."""
@@ -242,6 +247,7 @@ class PlaybackController:
             self._state.source_connected = True
             self._state.current_source_name = frame.source_name
             self._state.is_recording = self._recorder.is_recording()
+            self._sync_source_status_locked()
 
             if self._playback_state == _PlaybackState.SOURCE_LOST:
                 self._set_playback_state_locked(_PlaybackState.LIVE)
@@ -260,6 +266,7 @@ class PlaybackController:
             self._state.source_connected = True
             self._state.current_source_name = source_name
             self._state.is_recording = self._recorder.is_recording()
+            self._sync_source_status_locked()
 
             if self._playback_state == _PlaybackState.SOURCE_LOST:
                 self._set_playback_state_locked(_PlaybackState.LIVE)
@@ -275,6 +282,9 @@ class PlaybackController:
         self.signals.state_changed.emit(self._state)
         if status_message:
             self.signals.status_message.emit(status_message)
+
+    def _sync_source_status_locked(self) -> None:
+        self._state.warning_message = self._pipeline_manager.get_source_status_message()
 
     def _start_replay_clock_locked(self, playback_timestamp: float) -> None:
         self._replay_clock_anchor_timestamp = playback_timestamp

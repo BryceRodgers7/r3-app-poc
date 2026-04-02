@@ -46,3 +46,7 @@ class SourceInterface(ABC):
     @abstractmethod
     def get_nominal_fps(self) -> float:
         """Return the target frame rate used by the temporary source."""
+
+    def get_status_message(self) -> str | None:
+        """Return a non-fatal operator-facing status message, if any."""
+        return None

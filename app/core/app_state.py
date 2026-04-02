@@ -20,3 +20,4 @@ class AppState:
     last_frame_timestamp: float | None = None
     replay_buffer_span_seconds: float = 0.0
     error_message: str | None = None
+    warning_message: str | None = None

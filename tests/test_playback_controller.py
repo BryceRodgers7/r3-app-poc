@@ -17,9 +17,10 @@ from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef
 
 
 class _FakePipelineManager:
-    def __init__(self, replay_store: ReplayBuffer) -> None:
+    def __init__(self, replay_store: ReplayBuffer, source_status_message: str | None = None) -> None:
         self._replay_store = replay_store
         self._live_sample_callback = None
+        self._source_status_message = source_status_message
         self.live_activation_count = 0
         self.replay_activation_calls: list[tuple[int, bool]] = []
 
@@ -28,6 +29,9 @@ class _FakePipelineManager:
 
     def get_source_name(self) -> str:
         return "Fake Source"
+
+    def get_source_status_message(self) -> str | None:
+        return self._source_status_message
 
     def set_live_sample_callback(self, callback) -> None:
         self._live_sample_callback = callback
@@ -172,6 +176,29 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.LIVE)
         self.assertFalse(self.controller._replay_timer.isActive())
         self.assertGreaterEqual(self.pipeline_manager.live_activation_count, 2)
+
+    def test_source_warning_is_persisted_in_state(self) -> None:
+        replay_store = ReplayBuffer(buffer_duration_seconds=30, jpeg_quality=85)
+        warning_pipeline_manager = _FakePipelineManager(
+            replay_store,
+            source_status_message="Camera opened but returned black frames; using synthetic fallback.",
+        )
+        controller = PlaybackController(
+            session_manager=_FakeSessionManager(self.session_paths),
+            pipeline_manager=warning_pipeline_manager,
+            preview_output=PreviewOutput(),
+            recorder=_FakeRecorder(),
+            replay_buffer=replay_store,
+            default_source_name="Fake Source",
+        )
+
+        controller.initialize()
+        self.addCleanup(controller.shutdown)
+
+        self.assertEqual(
+            controller.get_state().warning_message,
+            "Camera opened but returned black frames; using synthetic fallback.",
+        )
 
 
 if __name__ == "__main__":
