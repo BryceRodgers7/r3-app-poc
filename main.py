@@ -61,9 +61,8 @@ def build_application() -> tuple[QApplication, MainWindow]:
         replay_buffer=replay_buffer,
         default_source_name=settings.default_source_name,
     )
-    controller.initialize()
-
     window = MainWindow(settings=settings, controller=controller, preview_output=preview_output)
+    controller.initialize()
     return qt_app, window
 
 

@@ -372,9 +372,9 @@ class PipelineManager:
             if state_change == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("Failed to move the GStreamer pipeline to PLAYING.")
             if self._replay_pipeline is not None:
-                replay_state_change = self._replay_pipeline.set_state(Gst.State.PAUSED)
+                replay_state_change = self._replay_pipeline.set_state(Gst.State.READY)
                 if replay_state_change == Gst.StateChangeReturn.FAILURE:
-                    raise RuntimeError("Failed to move the replay playback pipeline to PAUSED.")
+                    raise RuntimeError("Failed to move the replay playback pipeline to READY.")
 
     def _add_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
         assert self._pipeline is not None
@@ -617,12 +617,32 @@ class PipelineManager:
 
         interesting_messages = Gst.MessageType.ERROR | Gst.MessageType.EOS
         while not self._stop_event.is_set():
-            if self._poll_bus_for_messages(self._bus, interesting_messages, int(Gst.SECOND / 20)):
+            if self._poll_bus_for_messages(
+                self._bus,
+                interesting_messages,
+                int(Gst.SECOND / 20),
+                pipeline_name="live",
+                fatal=True,
+            ):
                 break
-            if self._poll_bus_for_messages(self._replay_bus, interesting_messages, 0):
+            if self._poll_bus_for_messages(
+                self._replay_bus,
+                interesting_messages,
+                0,
+                pipeline_name="replay",
+                fatal=False,
+            ):
                 break
 
-    def _poll_bus_for_messages(self, bus: Any, interesting_messages: Any, timeout_ns: int) -> bool:
+    def _poll_bus_for_messages(
+        self,
+        bus: Any,
+        interesting_messages: Any,
+        timeout_ns: int,
+        *,
+        pipeline_name: str,
+        fatal: bool,
+    ) -> bool:
         if bus is None:
             return False
 
@@ -633,14 +653,20 @@ class PipelineManager:
         if message.type == self._Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             details = debug or str(error)
-            self._preview_output.show_placeholder_message(f"GStreamer error: {details}")
-            self._stop_event.set()
-            return True
+            LOGGER.error("%s GStreamer error: %s", pipeline_name, details)
+            if fatal:
+                self._preview_output.show_placeholder_message(f"GStreamer error: {details}")
+                self._stop_event.set()
+                return True
+            return False
 
         if message.type == self._Gst.MessageType.EOS:
-            self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
-            self._stop_event.set()
-            return True
+            LOGGER.info("%s GStreamer pipeline reached EOS", pipeline_name)
+            if fatal:
+                self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
+                self._stop_event.set()
+                return True
+            return False
 
         return False
 
