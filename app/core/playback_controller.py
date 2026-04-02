@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from enum import Enum, auto
+import logging
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -14,11 +16,28 @@ from app.core.signals import AppSignals
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
-from app.media.replay_buffer import ReplayBuffer
+from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
 from app.storage.session_manager import SessionManager
 
 if TYPE_CHECKING:
     from app.ui.video_widget import VideoWidget
+
+LOGGER = logging.getLogger(__name__)
+
+
+class _PlaybackState(Enum):
+    LIVE = auto()
+    PAUSED = auto()
+    REPLAY = auto()
+    SOURCE_LOST = auto()
+
+
+_ALLOWED_TRANSITIONS: dict[_PlaybackState, set[_PlaybackState]] = {
+    _PlaybackState.LIVE: {_PlaybackState.PAUSED, _PlaybackState.REPLAY, _PlaybackState.SOURCE_LOST},
+    _PlaybackState.PAUSED: {_PlaybackState.LIVE, _PlaybackState.REPLAY, _PlaybackState.SOURCE_LOST},
+    _PlaybackState.REPLAY: {_PlaybackState.LIVE, _PlaybackState.PAUSED, _PlaybackState.SOURCE_LOST},
+    _PlaybackState.SOURCE_LOST: {_PlaybackState.LIVE, _PlaybackState.SOURCE_LOST},
+}
 
 
 class PlaybackController:
@@ -30,7 +49,7 @@ class PlaybackController:
         pipeline_manager: PipelineManager,
         preview_output: PreviewOutput,
         recorder: Recorder,
-        replay_buffer: ReplayBuffer,
+        replay_buffer: ReplayStore,
         default_source_name: str,
     ) -> None:
         del preview_output
@@ -41,15 +60,15 @@ class PlaybackController:
         self._default_source_name = default_source_name
         self.signals = AppSignals()
         self._state = AppState(current_source_name=default_source_name)
+        self._playback_state = _PlaybackState.SOURCE_LOST
         self._latest_live_frame: MediaFrame | None = None
         self._display_frame: MediaFrame | None = None
+        self._display_replay_ref: ReplayFrameRef | None = None
         self._latest_live_timestamp: float | None = None
         self._playback_timestamp: float | None = None
         self._lock = threading.RLock()
         self._replay_clock_anchor_timestamp: float | None = None
         self._replay_clock_anchor_monotonic: float | None = None
-        self._last_replay_frame_id: int | None = None
-        self._last_replay_frame_timestamp: float | None = None
         self._replay_timer = QTimer(self.signals)
         self._replay_timer.setInterval(40)
         self._replay_timer.timeout.connect(self._on_replay_timer_tick)
@@ -77,14 +96,12 @@ class PlaybackController:
 
     def pause_playback(self) -> None:
         """Pause only the viewed playback state."""
-        pause_frame: MediaFrame | None = None
+        pause_ref: ReplayFrameRef | None = None
         with self._lock:
             self._stop_replay_clock_locked()
 
-            if self._state.current_playback_mode == PlaybackMode.REPLAY and self._playback_timestamp is not None:
+            if self._playback_state == _PlaybackState.REPLAY and self._playback_timestamp is not None:
                 base_timestamp = self._playback_timestamp
-            elif self._display_frame is not None:
-                base_timestamp = self._display_frame.timestamp
             else:
                 base_timestamp = self._latest_live_timestamp
 
@@ -93,25 +110,25 @@ class PlaybackController:
                 self._emit_state()
                 return
 
-            pause_frame = self._replay_buffer.get_frame_at_or_before(base_timestamp) or self._display_frame
-            if pause_frame is None:
+            pause_ref = self._replay_buffer.get_frame_ref_at_or_before(base_timestamp)
+            if pause_ref is None:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()
                 return
 
             self._playback_timestamp = base_timestamp
-            self._display_frame = pause_frame
-            self._state.current_playback_mode = PlaybackMode.PAUSED
+            self._display_replay_ref = pause_ref
+            self._display_frame = None
+            self._set_playback_state_locked(_PlaybackState.PAUSED)
             self._state.error_message = None
             self._update_state_timestamps_locked()
-            self._remember_replay_frame_locked(pause_frame)
-            selected_pause_frame = pause_frame
-        self._pipeline_manager.show_replay_frame(selected_pause_frame)
+            selected_pause_ref = pause_ref
+        self._pipeline_manager.activate_replay_output(selected_pause_ref, paused=True)
         self._emit_state("Playback paused")
 
     def rewind_10_seconds(self) -> None:
         """Move the viewed output back by ten seconds without stopping ingest."""
-        replay_frame: MediaFrame | None = None
+        replay_ref: ReplayFrameRef | None = None
         target_timestamp: float | None = None
         with self._lock:
             if not self._replay_buffer.is_running():
@@ -125,13 +142,11 @@ class PlaybackController:
                 self._emit_state()
                 return
 
-            if self._state.current_playback_mode == PlaybackMode.LIVE:
+            if self._playback_state == _PlaybackState.LIVE:
                 base_timestamp = self._latest_live_timestamp
             else:
                 if self._playback_timestamp is not None:
                     base_timestamp = self._playback_timestamp
-                elif self._display_frame is not None:
-                    base_timestamp = self._display_frame.timestamp
                 else:
                     base_timestamp = None
 
@@ -141,21 +156,21 @@ class PlaybackController:
                 return
 
             target_timestamp = max(oldest_timestamp, base_timestamp - 10.0)
-            replay_frame = self._replay_buffer.get_frame_at_or_before(target_timestamp)
-            if replay_frame is None:
+            replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
+            if replay_ref is None:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()
                 return
 
             self._playback_timestamp = target_timestamp
-            self._display_frame = replay_frame
-            self._state.current_playback_mode = PlaybackMode.REPLAY
+            self._display_replay_ref = replay_ref
+            self._display_frame = None
+            self._set_playback_state_locked(_PlaybackState.REPLAY)
             self._state.error_message = None
             self._start_replay_clock_locked(target_timestamp)
             self._update_state_timestamps_locked()
-            self._remember_replay_frame_locked(replay_frame)
-            selected_replay_frame = replay_frame
-        self._pipeline_manager.show_replay_frame(selected_replay_frame)
+            selected_replay_ref = replay_ref
+        self._pipeline_manager.activate_replay_output(selected_replay_ref, paused=False)
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def jump_to_live(self) -> None:
@@ -163,8 +178,9 @@ class PlaybackController:
         with self._lock:
             self._stop_replay_clock_locked()
             self._playback_timestamp = self._latest_live_timestamp
-            self._state.current_playback_mode = (
-                PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
+            self._display_replay_ref = None
+            self._set_playback_state_locked(
+                _PlaybackState.LIVE if self._state.source_connected else _PlaybackState.SOURCE_LOST
             )
             self._state.error_message = None
             self._display_frame = None
@@ -182,7 +198,7 @@ class PlaybackController:
         with self._lock:
             self._stop_replay_clock_locked()
             self._state.source_connected = False
-            self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
+            self._set_playback_state_locked(_PlaybackState.SOURCE_LOST)
             self._state.error_message = message
         self._emit_state(message)
 
@@ -191,8 +207,8 @@ class PlaybackController:
         activate_live_output = False
         with self._lock:
             self._state.source_connected = True
-            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
-                self._state.current_playback_mode = PlaybackMode.LIVE
+            if self._playback_state == _PlaybackState.SOURCE_LOST:
+                self._set_playback_state_locked(_PlaybackState.LIVE)
                 activate_live_output = True
             self._state.current_source_name = self._pipeline_manager.get_source_name()
             self._state.error_message = None
@@ -227,17 +243,12 @@ class PlaybackController:
             self._state.current_source_name = frame.source_name
             self._state.is_recording = self._recorder.is_recording()
 
-            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
-                self._state.current_playback_mode = PlaybackMode.LIVE
+            if self._playback_state == _PlaybackState.SOURCE_LOST:
+                self._set_playback_state_locked(_PlaybackState.LIVE)
 
-            if self._state.current_playback_mode == PlaybackMode.LIVE:
+            if self._playback_state == _PlaybackState.LIVE:
                 self._playback_timestamp = frame.timestamp
                 self._display_frame = frame
-            elif self._state.current_playback_mode == PlaybackMode.REPLAY:
-                if self._playback_timestamp is not None and self._display_frame is None:
-                    self._display_frame = self._replay_buffer.get_frame_at_or_before(
-                        self._playback_timestamp
-                    )
 
             self._update_state_timestamps_locked()
         self._emit_state()
@@ -250,17 +261,12 @@ class PlaybackController:
             self._state.current_source_name = source_name
             self._state.is_recording = self._recorder.is_recording()
 
-            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
-                self._state.current_playback_mode = PlaybackMode.LIVE
+            if self._playback_state == _PlaybackState.SOURCE_LOST:
+                self._set_playback_state_locked(_PlaybackState.LIVE)
 
-            if self._state.current_playback_mode == PlaybackMode.LIVE:
+            if self._playback_state == _PlaybackState.LIVE:
                 self._playback_timestamp = timestamp
                 self._display_frame = None
-            elif self._state.current_playback_mode == PlaybackMode.REPLAY:
-                if self._playback_timestamp is not None and self._display_frame is None:
-                    self._display_frame = self._replay_buffer.get_frame_at_or_before(
-                        self._playback_timestamp
-                    )
 
             self._update_state_timestamps_locked()
         self._emit_state()
@@ -275,20 +281,18 @@ class PlaybackController:
         self._replay_clock_anchor_monotonic = time.monotonic()
         if not self._replay_timer.isActive():
             self._replay_timer.start()
+        LOGGER.info("Replay clock started at %.3f", playback_timestamp)
 
     def _stop_replay_clock_locked(self) -> None:
         self._replay_clock_anchor_timestamp = None
         self._replay_clock_anchor_monotonic = None
         if self._replay_timer.isActive():
             self._replay_timer.stop()
-
-    def _remember_replay_frame_locked(self, frame: MediaFrame) -> None:
-        self._last_replay_frame_id = frame.frame_id
-        self._last_replay_frame_timestamp = frame.timestamp
+            LOGGER.info("Replay clock stopped")
 
     def _on_replay_timer_tick(self) -> None:
         with self._lock:
-            if self._state.current_playback_mode != PlaybackMode.REPLAY:
+            if self._playback_state != _PlaybackState.REPLAY:
                 self._stop_replay_clock_locked()
                 return
 
@@ -304,32 +308,39 @@ class PlaybackController:
 
         elapsed_seconds = max(0.0, time.monotonic() - anchor_monotonic)
         target_timestamp = min(latest_timestamp, max(oldest_timestamp, anchor_timestamp + elapsed_seconds))
-        replay_frame = self._replay_buffer.get_frame_at_or_before(target_timestamp)
-        if replay_frame is None:
+        replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
+        if replay_ref is None:
             return
 
         with self._lock:
             if (
-                self._state.current_playback_mode != PlaybackMode.REPLAY
+                self._playback_state != _PlaybackState.REPLAY
                 or self._replay_clock_anchor_timestamp != anchor_timestamp
                 or self._replay_clock_anchor_monotonic != anchor_monotonic
             ):
                 return
 
             self._playback_timestamp = target_timestamp
-            self._display_frame = replay_frame
+            self._display_replay_ref = replay_ref
+            self._display_frame = None
             self._state.error_message = None
             self._update_state_timestamps_locked()
-            should_push_frame = (
-                replay_frame.frame_id != self._last_replay_frame_id
-                or replay_frame.timestamp != self._last_replay_frame_timestamp
-            )
-            if should_push_frame:
-                self._remember_replay_frame_locked(replay_frame)
-
-        if should_push_frame:
-            self._pipeline_manager.show_replay_frame(replay_frame)
         self._emit_state()
+
+    def _set_playback_state_locked(self, new_state: _PlaybackState) -> None:
+        if self._playback_state != new_state and new_state not in _ALLOWED_TRANSITIONS[self._playback_state]:
+            raise RuntimeError(
+                f"Invalid playback state transition: {self._playback_state.name} -> {new_state.name}"
+            )
+
+        if self._playback_state != new_state:
+            LOGGER.info(
+                "Playback state transition %s -> %s",
+                self._playback_state.name,
+                new_state.name,
+            )
+        self._playback_state = new_state
+        self._state.current_playback_mode = PlaybackMode[new_state.name]
 
     def _update_state_timestamps_locked(self) -> None:
         self._state.last_frame_timestamp = self._latest_live_timestamp

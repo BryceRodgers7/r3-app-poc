@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 import importlib
+import logging
 import threading
 import time
 from typing import Any
@@ -16,8 +17,10 @@ import numpy as np
 from app.core.models import MediaFrame, SessionPaths
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
-from app.media.replay_buffer import ReplayBuffer
+from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
 from app.media.source_interface import SourceInterface
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -42,7 +45,7 @@ class PipelineManager:
         source: SourceInterface,
         preview_output: PreviewOutput,
         recorder: Recorder,
-        replay_buffer: ReplayBuffer,
+        replay_buffer: ReplayStore,
     ) -> None:
         self._source = source
         self._preview_output = preview_output
@@ -59,7 +62,7 @@ class PipelineManager:
         self._appsrc: Any | None = None
         self._bus: Any | None = None
         self._replay_pipeline: Any | None = None
-        self._replay_appsrc: Any | None = None
+        self._replay_source: Any | None = None
         self._replay_bus: Any | None = None
         self._tee_request_pads: list[Any] = []
         self._branch_valves: dict[str, Any] = {}
@@ -70,13 +73,7 @@ class PipelineManager:
         self._preview_probe_pad: Any | None = None
         self._preview_probe_id: int | None = None
         self._video_window_handle: int | None = None
-        self._replay_push_count = 0
         self._active_video_output = "live"
-        self._replay_display_active = False
-        self._replay_feed_thread: threading.Thread | None = None
-        self._replay_frame_lock = threading.Lock()
-        self._replay_frame_ready = threading.Event()
-        self._replay_pending_frame: MediaFrame | None = None
 
         self._frame_feed_thread: threading.Thread | None = None
         self._bus_thread: threading.Thread | None = None
@@ -94,7 +91,7 @@ class PipelineManager:
         return (
             "SourceInterface.read_frame -> appsrc -> videoconvert -> tee -> "
             "[preview embedded video sink, recording appsink, replay appsink] + "
-            "replay buffer -> replay appsrc -> embedded replay sink"
+            "rolling replay store -> native replay source -> embedded replay sink"
         )
 
     def start_preview(self) -> None:
@@ -118,7 +115,9 @@ class PipelineManager:
         """Start the rolling replay buffer branch."""
         self._replay_buffer.start(session_paths)
         self._replay_running = True
+        self._configure_replay_source()
         self._set_branch_enabled("replay", True)
+        LOGGER.info("Replay capture started with rolling storage in %s", session_paths.rolling_dir)
 
     def stop_preview(self) -> None:
         """Stop only the preview branch."""
@@ -153,20 +152,9 @@ class PipelineManager:
             except Exception:
                 pass
 
-        if self._replay_appsrc is not None:
-            try:
-                self._replay_appsrc.emit("end-of-stream")
-            except Exception:
-                pass
-
         if self._frame_feed_thread is not None:
             self._frame_feed_thread.join(timeout=2.0)
             self._frame_feed_thread = None
-
-        self._replay_frame_ready.set()
-        if self._replay_feed_thread is not None:
-            self._replay_feed_thread.join(timeout=2.0)
-            self._replay_feed_thread = None
 
         if self._bus_thread is not None:
             self._bus_thread.join(timeout=2.0)
@@ -235,44 +223,74 @@ class PipelineManager:
         """Route the shared video surface back to the live preview sink."""
         with self._pipeline_lock:
             if self._active_video_output == "live":
-                self._replay_display_active = False
-                with self._replay_frame_lock:
-                    self._replay_pending_frame = None
-                self._replay_frame_ready.clear()
                 self._set_branch_enabled("preview", self._preview_running)
                 self._bind_active_video_sink_locked()
                 return
 
             self._active_video_output = "live"
-            self._replay_display_active = False
-            with self._replay_frame_lock:
-                self._replay_pending_frame = None
-            self._replay_frame_ready.clear()
             self._set_branch_enabled("preview", self._preview_running)
             if self._replay_pipeline is not None:
                 self._replay_pipeline.set_state(self._Gst.State.PAUSED)
             self._bind_active_video_sink_locked()
+        LOGGER.info("Activated live preview output")
 
-    def show_replay_frame(self, frame: MediaFrame) -> None:
-        """Display a replay frame through the dedicated replay playback pipeline."""
+    def activate_replay_output(self, frame_ref: ReplayFrameRef, paused: bool) -> None:
+        """Display replay output starting at the requested replay frame."""
         with self._pipeline_lock:
-            if self._replay_pipeline is None or self._replay_appsrc is None:
+            if self._replay_pipeline is None or self._replay_source is None:
                 raise RuntimeError("Replay playback pipeline is not available.")
+            location_pattern = self._replay_buffer.get_multifile_location_pattern()
+            if location_pattern is None:
+                raise RuntimeError("Replay storage is not ready for native playback.")
 
-            if self._active_video_output != "replay":
-                self._active_video_output = "replay"
-                self._set_branch_enabled("preview", False)
-                self._replay_pipeline.set_state(self._Gst.State.PLAYING)
-                self._bind_active_video_sink_locked()
-            self._replay_display_active = True
-
-        with self._replay_frame_lock:
-            self._replay_pending_frame = frame
-            self._replay_frame_ready.set()
+            self._active_video_output = "replay"
+            self._set_branch_enabled("preview", False)
+            self._configure_replay_source_locked(
+                location_pattern=location_pattern,
+                start_index=frame_ref.sequence_index,
+                paused=paused,
+            )
+            self._bind_active_video_sink_locked()
+        LOGGER.info(
+            "Activated replay output at sequence=%s timestamp=%.3f paused=%s",
+            frame_ref.sequence_index,
+            frame_ref.timestamp,
+            paused,
+        )
 
     def get_source_name(self) -> str:
         """Return the current source display name."""
         return self._source.get_display_name()
+
+    def _configure_replay_source(self) -> None:
+        with self._pipeline_lock:
+            location_pattern = self._replay_buffer.get_multifile_location_pattern()
+            if location_pattern is None or self._replay_source is None:
+                return
+            self._set_property_if_supported(self._replay_source, "location", location_pattern)
+            self._set_property_if_supported(self._replay_source, "index", 0)
+        LOGGER.info("Configured native replay source pattern: %s", location_pattern)
+
+    def _configure_replay_source_locked(
+        self,
+        location_pattern: str,
+        start_index: int,
+        paused: bool,
+    ) -> None:
+        if self._replay_pipeline is None or self._replay_source is None:
+            return
+
+        self._replay_pipeline.set_state(self._Gst.State.READY)
+        self._set_property_if_supported(self._replay_source, "location", location_pattern)
+        self._set_property_if_supported(self._replay_source, "index", max(start_index, 0))
+        self._set_property_if_supported(self._replay_source, "start-index", max(start_index, 0))
+        target_state = self._Gst.State.PAUSED if paused else self._Gst.State.PLAYING
+        self._replay_pipeline.set_state(target_state)
+        LOGGER.info(
+            "Replay source seeked to index=%s target_state=%s",
+            start_index,
+            target_state.value_nick if hasattr(target_state, "value_nick") else target_state,
+        )
 
     def _ensure_gstreamer_loaded(self) -> None:
         if self._Gst is not None:
@@ -343,12 +361,7 @@ class PipelineManager:
             self._replay_sink_factory_name = None
             self._preview_probe_pad = None
             self._preview_probe_id = None
-            self._replay_push_count = 0
             self._active_video_output = "live"
-            self._replay_display_active = False
-            with self._replay_frame_lock:
-                self._replay_pending_frame = None
-            self._replay_frame_ready.clear()
 
             self._add_branch("preview", self._on_preview_sample)
             self._add_branch("record", self._on_record_sample)
@@ -454,34 +467,38 @@ class PipelineManager:
         assert self._Gst is not None
 
         replay_pipeline = self._Gst.Pipeline.new("sports-replay-display-pipeline")
-        replay_appsrc = self._make_element("appsrc", "replay_appsrc")
+        replay_source = self._make_element("multifilesrc", "replay_source")
+        replay_caps = self._make_element("capsfilter", "replay_caps")
+        replay_decoder = self._make_element("jpegdec", "replay_decoder")
         replay_convert = self._make_element("videoconvert", "replay_convert")
         replay_sink, replay_sink_factory_name = self._make_video_sink("replay_sink")
 
-        replay_appsrc.set_property("is-live", False)
-        replay_appsrc.set_property("format", self._Gst.Format.TIME)
-        replay_appsrc.set_property("block", True)
-        replay_appsrc.set_property("do-timestamp", False)
-        replay_appsrc.set_property(
+        replay_source.set_property("loop", False)
+        replay_caps.set_property(
             "caps",
             self._Gst.Caps.from_string(
-                "video/x-raw,format=BGR,"
-                f"width={width},height={height},"
-                f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
+                f"image/jpeg,framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
             ),
         )
         self._set_property_if_supported(replay_sink, "sync", False)
         self._set_property_if_supported(replay_sink, "qos", True)
         self._set_property_if_supported(replay_sink, "force-aspect-ratio", True)
 
-        replay_pipeline.add(replay_appsrc)
+        replay_pipeline.add(replay_source)
+        replay_pipeline.add(replay_caps)
+        replay_pipeline.add(replay_decoder)
         replay_pipeline.add(replay_convert)
         replay_pipeline.add(replay_sink)
-        if not replay_appsrc.link(replay_convert) or not replay_convert.link(replay_sink):
+        if (
+            not replay_source.link(replay_caps)
+            or not replay_caps.link(replay_decoder)
+            or not replay_decoder.link(replay_convert)
+            or not replay_convert.link(replay_sink)
+        ):
             raise RuntimeError("Failed to link the replay playback pipeline.")
 
         self._replay_pipeline = replay_pipeline
-        self._replay_appsrc = replay_appsrc
+        self._replay_source = replay_source
         self._replay_bus = replay_pipeline.get_bus()
         if self._replay_bus is not None:
             self._replay_bus.enable_sync_message_emission()
@@ -522,6 +539,7 @@ class PipelineManager:
                 continue
             sink = Gst.ElementFactory.make(factory_name, element_name)
             if sink is not None:
+                LOGGER.info("Selected video sink %s for %s", factory_name, element_name)
                 return sink, factory_name
 
         raise RuntimeError(
@@ -547,13 +565,6 @@ class PipelineManager:
                 daemon=True,
             )
             self._frame_feed_thread.start()
-
-            self._replay_feed_thread = threading.Thread(
-                target=self._feed_replay_appsrc_loop,
-                name="gst-replay-feed",
-                daemon=True,
-            )
-            self._replay_feed_thread.start()
 
             self._bus_thread = threading.Thread(
                 target=self._monitor_bus_loop,
@@ -599,47 +610,6 @@ class PipelineManager:
                     f"GStreamer source push failed: {flow_return}"
                 )
                 break
-
-    def _feed_replay_appsrc_loop(self) -> None:
-        frame_interval_seconds = self._frame_duration_ns / 1_000_000_000 if self._frame_duration_ns > 0 else 0.0
-        last_push_monotonic: float | None = None
-
-        while not self._stop_event.is_set():
-            if not self._replay_frame_ready.wait(timeout=0.1):
-                continue
-            if self._stop_event.is_set():
-                break
-
-            with self._replay_frame_lock:
-                frame = self._replay_pending_frame
-                self._replay_pending_frame = None
-                self._replay_frame_ready.clear()
-
-            if frame is None:
-                continue
-
-            if frame_interval_seconds > 0.0 and last_push_monotonic is not None:
-                elapsed = time.perf_counter() - last_push_monotonic
-                remaining = frame_interval_seconds - elapsed
-                if remaining > 0.0 and self._stop_event.wait(remaining):
-                    break
-
-            with self._replay_frame_lock:
-                if self._replay_pending_frame is not None:
-                    frame = self._replay_pending_frame
-                    self._replay_pending_frame = None
-                    self._replay_frame_ready.clear()
-
-            with self._pipeline_lock:
-                if (
-                    not self._replay_display_active
-                    or self._replay_pipeline is None
-                    or self._replay_appsrc is None
-                ):
-                    continue
-                self._push_replay_frame_locked(frame)
-
-            last_push_monotonic = time.perf_counter()
 
     def _monitor_bus_loop(self) -> None:
         Gst = self._Gst
@@ -726,25 +696,6 @@ class PipelineManager:
                     GstVideo.VideoOverlay.expose(sink)
                 except Exception:
                     pass
-
-    def _push_replay_frame_locked(self, frame: MediaFrame) -> None:
-        assert self._Gst is not None
-        assert self._replay_appsrc is not None
-
-        frame_array = np.ascontiguousarray(frame.image_bgr)
-        gst_buffer = self._Gst.Buffer.new_allocate(None, frame_array.nbytes, None)
-        gst_buffer.fill(0, frame_array.tobytes())
-        gst_buffer.offset = frame.frame_id
-        gst_buffer.pts = self._replay_push_count * self._frame_duration_ns
-        gst_buffer.dts = gst_buffer.pts
-        gst_buffer.duration = self._frame_duration_ns
-        self._replay_push_count += 1
-
-        flow_return = self._replay_appsrc.emit("push-buffer", gst_buffer)
-        if flow_return != self._Gst.FlowReturn.OK and not self._stop_event.is_set():
-            self._preview_output.show_placeholder_message(
-                f"Replay playback push failed: {flow_return}"
-            )
 
     def _on_preview_buffer(self, _pad: Any, info: Any) -> Any:
         Gst = self._Gst
@@ -877,12 +828,7 @@ class PipelineManager:
 
         self._replay_pipeline.set_state(self._Gst.State.NULL)
         self._replay_pipeline = None
-        self._replay_appsrc = None
+        self._replay_source = None
         self._replay_bus = None
         self._replay_sink = None
         self._replay_sink_factory_name = None
-        self._replay_push_count = 0
-        self._replay_display_active = False
-        with self._replay_frame_lock:
-            self._replay_pending_frame = None
-        self._replay_frame_ready.clear()

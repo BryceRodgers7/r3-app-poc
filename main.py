@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -21,6 +22,10 @@ from app.ui.main_window import MainWindow
 
 def build_application() -> tuple[QApplication, MainWindow]:
     """Create the Qt application and wire placeholder services together."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     settings = AppSettings()
 
     qt_app = QApplication(sys.argv)
