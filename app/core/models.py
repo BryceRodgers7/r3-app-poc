@@ -43,6 +43,41 @@ class MediaFrame:
         return self.image
 
 
+@dataclass(slots=True, frozen=True)
+class FrameOverlayInfo:
+    """Immutable metadata that describes a captured frame.
+
+    The optional `feed_id` keeps the contract open for future multi-feed support
+    without coupling the current implementation to a specific routing scheme.
+    """
+
+    feed_id: str | None = None
+    source_name: str | None = None
+    frame_id: int | None = None
+    capture_timestamp: float | None = None
+
+    @classmethod
+    def from_media_frame(cls, frame: MediaFrame, feed_id: str | None = None) -> "FrameOverlayInfo":
+        """Build overlay metadata directly from a delivered media frame."""
+        return cls(
+            feed_id=feed_id,
+            source_name=frame.source_name,
+            frame_id=frame.frame_id,
+            capture_timestamp=frame.timestamp,
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class PlaybackOverlayInfo:
+    """Dynamic metadata about the operator's current playback context."""
+
+    mode: PlaybackMode = PlaybackMode.SOURCE_LOST
+    playback_timestamp: float | None = None
+    wall_clock_timestamp: float | None = None
+    seconds_behind_live: float = 0.0
+    status_text: str | None = None
+
+
 @dataclass(slots=True)
 class SessionPaths:
     """Filesystem locations associated with a recording session."""

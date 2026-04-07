@@ -14,7 +14,8 @@ from typing import Any
 
 import numpy as np
 
-from app.core.models import MediaFrame, SessionPaths
+from app.core.models import FrameOverlayInfo, MediaFrame, SessionPaths
+from app.media.frame_overlay import render_frame_overlay
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
@@ -27,8 +28,7 @@ LOGGER = logging.getLogger(__name__)
 class _FrameMetadata:
     """Tracks source-side metadata while buffers fan out through GStreamer."""
 
-    timestamp: float
-    source_name: str
+    frame_overlay: FrameOverlayInfo
 
 
 class PipelineManager:
@@ -84,7 +84,7 @@ class PipelineManager:
         self._stream_start_timestamp: float | None = None
         self._frame_metadata: OrderedDict[int, _FrameMetadata] = OrderedDict()
         self._metadata_lock = threading.Lock()
-        self._live_sample_callback: Callable[[float, str], None] | None = None
+        self._live_sample_callback: Callable[[FrameOverlayInfo], None] | None = None
 
     def describe_architecture(self) -> str:
         """Describe the current transitional tee/fan-out architecture."""
@@ -188,8 +188,8 @@ class PipelineManager:
         """Register the legacy preview-frame callback."""
         self._frame_callback = callback
 
-    def set_live_sample_callback(self, callback: Callable[[float, str], None]) -> None:
-        """Register the controller callback for live-preview timestamps."""
+    def set_live_sample_callback(self, callback: Callable[[FrameOverlayInfo], None]) -> None:
+        """Register the controller callback for live-preview frame metadata."""
         self._live_sample_callback = callback
 
     def set_video_window_handle(self, window_handle: int) -> None:
@@ -589,7 +589,10 @@ class PipelineManager:
             if self._appsrc is None:
                 break
 
-            frame_array = np.ascontiguousarray(frame.image_bgr)
+            frame_overlay = FrameOverlayInfo.from_media_frame(frame, feed_id=frame.source_name)
+            # Burn immutable frame metadata once before tee fan-out so live preview,
+            # rolling replay storage, and recorded output stay visually consistent.
+            frame_array = np.ascontiguousarray(render_frame_overlay(frame.image_bgr, frame_overlay))
             gst_buffer = Gst.Buffer.new_allocate(None, frame_array.nbytes, None)
             gst_buffer.fill(0, frame_array.tobytes())
             gst_buffer.offset = frame.frame_id
@@ -602,8 +605,7 @@ class PipelineManager:
 
             with self._metadata_lock:
                 self._frame_metadata[frame.frame_id] = _FrameMetadata(
-                    timestamp=frame.timestamp,
-                    source_name=frame.source_name,
+                    frame_overlay=frame_overlay,
                 )
                 while len(self._frame_metadata) > 4096:
                     self._frame_metadata.popitem(last=False)
@@ -740,11 +742,13 @@ class PipelineManager:
         with self._metadata_lock:
             metadata = self._frame_metadata.get(frame_id) if frame_id is not None else None
 
-        timestamp = metadata.timestamp if metadata is not None else time.time()
-        source_name = metadata.source_name if metadata is not None else self._source.get_display_name()
-
         if self._preview_running and self._live_sample_callback is not None:
-            self._live_sample_callback(timestamp, source_name)
+            self._live_sample_callback(
+                self._build_frame_overlay(
+                    frame_id=frame_id,
+                    metadata=metadata,
+                )
+            )
 
         return Gst.PadProbeReturn.OK
 
@@ -807,14 +811,28 @@ class PipelineManager:
         with self._metadata_lock:
             metadata = self._frame_metadata.get(frame_id)
 
-        timestamp = metadata.timestamp if metadata is not None else time.time()
-        source_name = metadata.source_name if metadata is not None else self._source.get_display_name()
+        frame_overlay = self._build_frame_overlay(frame_id=frame_id, metadata=metadata)
 
         return MediaFrame(
             frame_id=frame_id,
-            timestamp=timestamp,
+            timestamp=frame_overlay.capture_timestamp or time.time(),
             image=frame_array,
-            source_name=source_name,
+            source_name=frame_overlay.source_name or self._source.get_display_name(),
+        )
+
+    def _build_frame_overlay(
+        self,
+        *,
+        frame_id: int | None,
+        metadata: _FrameMetadata | None,
+    ) -> FrameOverlayInfo:
+        if metadata is not None:
+            return metadata.frame_overlay
+        return FrameOverlayInfo(
+            feed_id=self._source.get_display_name(),
+            source_name=self._source.get_display_name(),
+            frame_id=frame_id,
+            capture_timestamp=time.time(),
         )
 
     def _teardown_pipeline(self) -> None:

@@ -67,17 +67,10 @@ class MainWindow(QMainWindow):
             PlaybackMode.REPLAY,
         }
         self.video_widget.set_video_surface_visible(show_embedded_video)
-
-        if state.current_playback_mode.value == "LIVE":
-            overlay = "LIVE VIEW"
-        elif state.current_playback_mode.value == "PAUSED":
-            overlay = "PAUSED\nCapture, recording, and replay buffering continue"
-        elif state.current_playback_mode.value == "REPLAY":
-            overlay = f"REPLAY\nViewing approximately {state.seconds_behind_live:.0f}s behind live"
-        else:
-            overlay = "SOURCE LOST\nWaiting for the selected source"
-
-        self.video_widget.set_overlay_text(overlay)
+        self.video_widget.set_playback_overlay(state.playback_overlay)
+        if not show_embedded_video:
+            placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
+            self.video_widget.set_placeholder_text(placeholder_text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Shut down placeholder services when the window closes."""

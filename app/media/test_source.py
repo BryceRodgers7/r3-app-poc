@@ -234,11 +234,6 @@ class TestSource(SourceInterface):
         cv2.circle(canvas, (center_x, center_y), 36, (0, 255, 255), -1)
         cv2.rectangle(canvas, (30, 30), (self._frame_width - 30, self._frame_height - 30), (255, 255, 255), 2)
 
-        label = time.strftime("%H:%M:%S", time.localtime(timestamp))
-        cv2.putText(canvas, "Synthetic Test Feed", (26, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv2.putText(canvas, f"Frame {self._frame_counter:05d}", (26, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(canvas, f"Time {label}", (26, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
         self._last_frame_monotonic = time.perf_counter()
         return MediaFrame(
             frame_id=self._frame_counter,
@@ -250,10 +245,6 @@ class TestSource(SourceInterface):
     def _build_media_frame(self, frame: np.ndarray) -> MediaFrame:
         self._frame_counter += 1
         timestamp = time.time()
-        label = time.strftime("%H:%M:%S", time.localtime(timestamp))
-        cv2.putText(frame, self._display_name, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(frame, f"Frame {self._frame_counter:05d}", (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Time {label}", (16, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self._last_frame_monotonic = time.perf_counter()
         return MediaFrame(
             frame_id=self._frame_counter,

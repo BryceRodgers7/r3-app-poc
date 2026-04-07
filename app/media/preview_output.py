@@ -16,7 +16,7 @@ class PreviewOutput(QObject):
     """Owns the widget that will eventually host the live preview sink."""
 
     frame_ready = Signal(object)
-    overlay_text_changed = Signal(str)
+    placeholder_text_changed = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -26,11 +26,11 @@ class PreviewOutput(QObject):
         """Register the widget that should display preview output."""
         self._video_widget = widget
         self.frame_ready.connect(widget.display_frame)
-        self.overlay_text_changed.connect(widget.set_overlay_text)
+        self.placeholder_text_changed.connect(widget.set_placeholder_text)
 
     def show_placeholder_message(self, message: str) -> None:
         """Update the placeholder video surface text."""
-        self.overlay_text_changed.emit(message)
+        self.placeholder_text_changed.emit(message)
 
     def show_frame(self, frame: MediaFrame) -> None:
         """Send the selected frame to the bound widget."""
@@ -40,5 +40,5 @@ class PreviewOutput(QObject):
         """Release the current preview widget binding."""
         if self._video_widget is not None:
             self.frame_ready.disconnect(self._video_widget.display_frame)
-            self.overlay_text_changed.disconnect(self._video_widget.set_overlay_text)
+            self.placeholder_text_changed.disconnect(self._video_widget.set_placeholder_text)
         self._video_widget = None

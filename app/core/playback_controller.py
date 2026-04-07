@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QTimer
 
 from app.core.app_state import AppState
-from app.core.models import MediaFrame, PlaybackMode
+from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
 from app.core.signals import AppSignals
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
@@ -64,6 +64,7 @@ class PlaybackController:
         self._latest_live_frame: MediaFrame | None = None
         self._display_frame: MediaFrame | None = None
         self._display_replay_ref: ReplayFrameRef | None = None
+        self._latest_live_overlay = FrameOverlayInfo()
         self._latest_live_timestamp: float | None = None
         self._playback_timestamp: float | None = None
         self._lock = threading.RLock()
@@ -72,9 +73,13 @@ class PlaybackController:
         self._replay_timer = QTimer(self.signals)
         self._replay_timer.setInterval(40)
         self._replay_timer.timeout.connect(self._on_replay_timer_tick)
+        self._overlay_timer = QTimer(self.signals)
+        self._overlay_timer.setInterval(250)
+        self._overlay_timer.timeout.connect(self._on_overlay_timer_tick)
 
     def initialize(self) -> None:
         """Create a session and start placeholder background services."""
+        self._overlay_timer.start()
         connected = self._pipeline_manager.connect_source()
         source_name = self._pipeline_manager.get_source_name()
         session_paths = self._session_manager.start_new_session(source_name)
@@ -88,6 +93,8 @@ class PlaybackController:
         self._state.current_source_name = source_name
         self._state.is_recording = self._recorder.is_recording()
         self._state.replay_buffer_span_seconds = self._replay_buffer.get_available_duration()
+        with self._lock:
+            self._update_state_timestamps_locked()
 
         if connected:
             self.set_source_connected()
@@ -201,6 +208,7 @@ class PlaybackController:
             self._set_playback_state_locked(_PlaybackState.SOURCE_LOST)
             self._state.error_message = message
             self._state.warning_message = None
+            self._update_state_timestamps_locked()
         self._emit_state(message)
 
     def set_source_connected(self) -> None:
@@ -215,6 +223,7 @@ class PlaybackController:
             self._state.current_source_name = self._pipeline_manager.get_source_name()
             self._state.error_message = None
             self._sync_source_status_locked()
+            self._update_state_timestamps_locked()
             if self._state.warning_message:
                 status_message = self._state.warning_message
         if activate_live_output:
@@ -234,6 +243,7 @@ class PlaybackController:
     def shutdown(self) -> None:
         """Stop placeholder services and release storage resources."""
         self._replay_timer.stop()
+        self._overlay_timer.stop()
         self._pipeline_manager.stop_all()
         self._recorder.stop()
         self._replay_buffer.stop()
@@ -241,11 +251,13 @@ class PlaybackController:
 
     def on_new_live_frame(self, frame: MediaFrame) -> None:
         """Update controller-owned playback state for a newly ingested live frame."""
+        frame_overlay = FrameOverlayInfo.from_media_frame(frame, feed_id=frame.source_name)
         with self._lock:
             self._latest_live_frame = frame
-            self._latest_live_timestamp = frame.timestamp
+            self._latest_live_overlay = frame_overlay
+            self._latest_live_timestamp = frame_overlay.capture_timestamp
             self._state.source_connected = True
-            self._state.current_source_name = frame.source_name
+            self._state.current_source_name = frame_overlay.source_name
             self._state.is_recording = self._recorder.is_recording()
             self._sync_source_status_locked()
 
@@ -253,18 +265,20 @@ class PlaybackController:
                 self._set_playback_state_locked(_PlaybackState.LIVE)
 
             if self._playback_state == _PlaybackState.LIVE:
-                self._playback_timestamp = frame.timestamp
+                self._playback_timestamp = frame_overlay.capture_timestamp
                 self._display_frame = frame
+                self._state.frame_overlay = frame_overlay
 
             self._update_state_timestamps_locked()
         self._emit_state()
 
-    def on_live_sample(self, timestamp: float, source_name: str) -> None:
+    def on_live_sample(self, frame_overlay: FrameOverlayInfo) -> None:
         """Update controller-owned playback state from the live preview branch."""
         with self._lock:
-            self._latest_live_timestamp = timestamp
+            self._latest_live_overlay = frame_overlay
+            self._latest_live_timestamp = frame_overlay.capture_timestamp
             self._state.source_connected = True
-            self._state.current_source_name = source_name
+            self._state.current_source_name = frame_overlay.source_name
             self._state.is_recording = self._recorder.is_recording()
             self._sync_source_status_locked()
 
@@ -272,8 +286,9 @@ class PlaybackController:
                 self._set_playback_state_locked(_PlaybackState.LIVE)
 
             if self._playback_state == _PlaybackState.LIVE:
-                self._playback_timestamp = timestamp
+                self._playback_timestamp = frame_overlay.capture_timestamp
                 self._display_frame = None
+                self._state.frame_overlay = frame_overlay
 
             self._update_state_timestamps_locked()
         self._emit_state()
@@ -337,6 +352,13 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._emit_state()
 
+    def _on_overlay_timer_tick(self) -> None:
+        with self._lock:
+            if self._playback_state not in {_PlaybackState.PAUSED, _PlaybackState.SOURCE_LOST}:
+                return
+            self._update_state_timestamps_locked()
+        self._emit_state()
+
     def _set_playback_state_locked(self, new_state: _PlaybackState) -> None:
         if self._playback_state != new_state and new_state not in _ALLOWED_TRANSITIONS[self._playback_state]:
             raise RuntimeError(
@@ -362,8 +384,43 @@ class PlaybackController:
             or self._latest_live_timestamp is None
         ):
             self._state.seconds_behind_live = 0.0
-            return
+        else:
+            self._state.seconds_behind_live = self._replay_buffer.get_seconds_behind_live(
+                self._playback_timestamp
+            )
 
-        self._state.seconds_behind_live = self._replay_buffer.get_seconds_behind_live(
-            self._playback_timestamp
+        if self._playback_state == _PlaybackState.LIVE:
+            self._state.frame_overlay = self._latest_live_overlay
+        elif self._display_replay_ref is not None:
+            self._state.frame_overlay = self._frame_overlay_from_replay_ref(self._display_replay_ref)
+        else:
+            self._state.frame_overlay = FrameOverlayInfo(
+                feed_id=self._latest_live_overlay.feed_id,
+                source_name=self._state.current_source_name,
+                capture_timestamp=self._playback_timestamp,
+            )
+
+        self._state.playback_overlay = PlaybackOverlayInfo(
+            mode=self._state.current_playback_mode,
+            playback_timestamp=self._playback_timestamp,
+            wall_clock_timestamp=time.time(),
+            seconds_behind_live=self._state.seconds_behind_live,
+            status_text=self._build_overlay_status_locked(),
         )
+
+    def _frame_overlay_from_replay_ref(self, replay_ref: ReplayFrameRef) -> FrameOverlayInfo:
+        return FrameOverlayInfo(
+            feed_id=replay_ref.source_name,
+            source_name=replay_ref.source_name,
+            frame_id=replay_ref.frame_id,
+            capture_timestamp=replay_ref.timestamp,
+        )
+
+    def _build_overlay_status_locked(self) -> str | None:
+        if self._state.current_playback_mode == PlaybackMode.PAUSED:
+            return "Capture, recording, and replay buffering continue"
+        if self._state.current_playback_mode == PlaybackMode.REPLAY:
+            return f"Viewing approximately {self._state.seconds_behind_live:.0f}s behind live"
+        if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
+            return self._state.error_message or "Waiting for the selected source"
+        return self._state.warning_message

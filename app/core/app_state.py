@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from app.core.models import PlaybackMode
+from app.core.models import FrameOverlayInfo, PlaybackMode, PlaybackOverlayInfo
 
 
 @dataclass(slots=True)
@@ -21,3 +21,5 @@ class AppState:
     replay_buffer_span_seconds: float = 0.0
     error_message: str | None = None
     warning_message: str | None = None
+    frame_overlay: FrameOverlayInfo = field(default_factory=FrameOverlayInfo)
+    playback_overlay: PlaybackOverlayInfo = field(default_factory=PlaybackOverlayInfo)
