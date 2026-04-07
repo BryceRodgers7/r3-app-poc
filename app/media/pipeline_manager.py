@@ -101,19 +101,20 @@ class PipelineManager:
         if self._active_video_output == "live":
             self._set_branch_enabled("preview", True)
 
-    def start_recording(self, session_paths: SessionPaths) -> None:
+    def start_recording(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
         """Start the full-session recording branch."""
         self._recorder.start(
             session_paths=session_paths,
             source_name=self._source.get_display_name(),
             fps_hint=self._source.get_nominal_fps(),
+            feed_id=feed_id or self._source.get_feed_id(),
         )
         self._recording_running = True
         self._set_branch_enabled("record", True)
 
-    def start_replay_buffer(self, session_paths: SessionPaths) -> None:
+    def start_replay_buffer(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
         """Start the rolling replay buffer branch."""
-        self._replay_buffer.start(session_paths)
+        self._replay_buffer.start(session_paths, feed_id=feed_id or self._source.get_feed_id())
         self._replay_running = True
         self._configure_replay_source()
         self._set_branch_enabled("replay", True)
@@ -261,6 +262,10 @@ class PipelineManager:
     def get_source_name(self) -> str:
         """Return the current source display name."""
         return self._source.get_display_name()
+
+    def get_source_feed_id(self) -> str:
+        """Return the current source feed identifier."""
+        return self._source.get_feed_id()
 
     def get_source_status_message(self) -> str | None:
         """Return the current non-fatal source status message."""
@@ -431,12 +436,15 @@ class PipelineManager:
         queue = self._make_element("queue", f"{branch_name}_queue")
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
-        sink, sink_factory_name = self._make_video_sink(f"{branch_name}_sink")
+        sink = self._make_element("appsink", f"{branch_name}_sink")
 
         valve.set_property("drop", True)
-        self._set_property_if_supported(sink, "sync", False)
-        self._set_property_if_supported(sink, "qos", True)
-        self._set_property_if_supported(sink, "force-aspect-ratio", True)
+        sink.set_property("emit-signals", True)
+        sink.set_property("sync", False)
+        sink.set_property("drop", True)
+        sink.set_property("max-buffers", 2)
+        sink.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
+        sink.connect("new-sample", self._on_preview_sample)
 
         self._pipeline.add(queue)
         self._pipeline.add(valve)
@@ -451,12 +459,6 @@ class PipelineManager:
         if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"Failed to link tee output to the {branch_name} branch.")
 
-        preview_probe_pad = queue.get_static_pad("src")
-        if preview_probe_pad is None:
-            raise RuntimeError("Failed to access the preview branch source pad.")
-        self._preview_probe_id = preview_probe_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_preview_buffer)
-        self._preview_probe_pad = preview_probe_pad
-
         queue.sync_state_with_parent()
         valve.sync_state_with_parent()
         convert.sync_state_with_parent()
@@ -464,8 +466,7 @@ class PipelineManager:
 
         self._branch_valves[branch_name] = valve
         self._preview_sink = sink
-        self._preview_sink_factory_name = sink_factory_name
-        self._bind_active_video_sink_locked()
+        self._preview_sink_factory_name = "appsink-preview"
 
     def _build_replay_pipeline(self, width: int, height: int, fps_fraction: Fraction) -> None:
         assert self._Gst is not None
@@ -589,7 +590,7 @@ class PipelineManager:
             if self._appsrc is None:
                 break
 
-            frame_overlay = FrameOverlayInfo.from_media_frame(frame, feed_id=frame.source_name)
+            frame_overlay = FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id)
             # Burn immutable frame metadata once before tee fan-out so live preview,
             # rolling replay storage, and recorded output stay visually consistent.
             frame_array = np.ascontiguousarray(render_frame_overlay(frame.image_bgr, frame_overlay))
@@ -742,14 +743,6 @@ class PipelineManager:
         with self._metadata_lock:
             metadata = self._frame_metadata.get(frame_id) if frame_id is not None else None
 
-        if self._preview_running and self._live_sample_callback is not None:
-            self._live_sample_callback(
-                self._build_frame_overlay(
-                    frame_id=frame_id,
-                    metadata=metadata,
-                )
-            )
-
         return Gst.PadProbeReturn.OK
 
     def _on_preview_sample(self, sink: Any) -> Any:
@@ -758,8 +751,11 @@ class PipelineManager:
 
         sample = sink.emit("pull-sample")
         frame = self._sample_to_media_frame(sample)
-        if frame is not None and self._preview_running and self._frame_callback is not None:
-            self._frame_callback(frame)
+        if frame is not None and self._preview_running:
+            if self._frame_callback is not None:
+                self._frame_callback(frame)
+            if self._live_sample_callback is not None:
+                self._live_sample_callback(FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id))
         return Gst.FlowReturn.OK
 
     def _on_record_sample(self, sink: Any) -> Any:
@@ -818,6 +814,7 @@ class PipelineManager:
             timestamp=frame_overlay.capture_timestamp or time.time(),
             image=frame_array,
             source_name=frame_overlay.source_name or self._source.get_display_name(),
+            feed_id=frame_overlay.feed_id or self._source.get_feed_id(),
         )
 
     def _build_frame_overlay(
@@ -829,7 +826,7 @@ class PipelineManager:
         if metadata is not None:
             return metadata.frame_overlay
         return FrameOverlayInfo(
-            feed_id=self._source.get_display_name(),
+            feed_id=self._source.get_feed_id(),
             source_name=self._source.get_display_name(),
             frame_id=frame_id,
             capture_timestamp=time.time(),

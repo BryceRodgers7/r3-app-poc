@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.config.settings import AppSettings
-from app.core.models import SessionPaths
+from app.core.models import FeedPaths, SessionPaths
 
 
 class FileManager:
@@ -51,6 +51,13 @@ class FileManager:
             rolling_dir=rolling_dir,
             clips_dir=clips_dir,
         )
+
+    def ensure_feed_paths(self, session_paths: SessionPaths, feed_id: str) -> FeedPaths:
+        """Create and return the per-feed folder layout inside a session."""
+        feed_paths = session_paths.get_feed_paths(feed_id)
+        for path in (feed_paths.recording_dir, feed_paths.rolling_dir, feed_paths.clips_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        return feed_paths
 
     def get_recording_manifest_path(self, session_paths: SessionPaths) -> Path:
         """Return a placeholder location for future recording metadata."""

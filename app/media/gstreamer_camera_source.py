@@ -22,12 +22,14 @@ class GStreamerCameraSource(SourceInterface):
     def __init__(
         self,
         source_name: str,
+        feed_id: str,
         camera_index: int,
         frame_width: int,
         frame_height: int,
         target_fps: float,
     ) -> None:
         self._base_source_name = source_name
+        self._feed_id = feed_id
         self._display_name = source_name
         self._camera_index = camera_index
         self._frame_width = frame_width
@@ -104,6 +106,10 @@ class GStreamerCameraSource(SourceInterface):
     def get_display_name(self) -> str:
         """Return the active source label."""
         return self._display_name
+
+    def get_feed_id(self) -> str:
+        """Return the stable feed identifier."""
+        return self._feed_id
 
     def create_pipeline_fragment(self) -> str:
         """Describe the native GStreamer source path."""
@@ -316,4 +322,5 @@ class GStreamerCameraSource(SourceInterface):
             timestamp=timestamp,
             image=frame,
             source_name=self._display_name,
+            feed_id=self._feed_id,
         )

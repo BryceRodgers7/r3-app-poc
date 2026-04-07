@@ -36,6 +36,7 @@ class MediaFrame:
     timestamp: float
     image: FrameArray
     source_name: str
+    feed_id: str = "default"
 
     @property
     def image_bgr(self) -> FrameArray:
@@ -75,7 +76,30 @@ class PlaybackOverlayInfo:
     playback_timestamp: float | None = None
     wall_clock_timestamp: float | None = None
     seconds_behind_live: float = 0.0
+    playback_rate: float = 1.0
     status_text: str | None = None
+
+
+@dataclass(slots=True)
+class FeedDefinition:
+    """Configuration for a single ingest feed."""
+
+    feed_id: str
+    display_name: str
+    source_kind: str = "auto"
+    camera_index: int = 0
+    ndi_name: str | None = None
+    enabled: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class FeedPaths:
+    """Filesystem locations associated with one feed inside a session."""
+
+    feed_id: str
+    recording_dir: Path
+    rolling_dir: Path
+    clips_dir: Path
 
 
 @dataclass(slots=True)
@@ -87,3 +111,13 @@ class SessionPaths:
     recording_dir: Path
     rolling_dir: Path
     clips_dir: Path
+
+    def get_feed_paths(self, feed_id: str) -> FeedPaths:
+        """Return the per-feed directories used inside the session tree."""
+        safe_feed_id = feed_id.strip() or "default"
+        return FeedPaths(
+            feed_id=safe_feed_id,
+            recording_dir=self.recording_dir / safe_feed_id,
+            rolling_dir=self.rolling_dir / safe_feed_id,
+            clips_dir=self.clips_dir / safe_feed_id,
+        )

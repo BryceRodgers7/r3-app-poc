@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 
 from app.config.settings import AppSettings
-from app.core.models import MediaFrame
+from app.core.models import FeedDefinition, MediaFrame
 from app.media.gstreamer_camera_source import GStreamerCameraSource
+from app.media.ndi_receiver import NDIReceiver
 from app.media.source_interface import SourceInterface
 from app.media.test_source import TestSource
 
@@ -51,6 +52,10 @@ class PreferredSourceChain(SourceInterface):
         """Return the selected source name."""
         return self._active().get_display_name()
 
+    def get_feed_id(self) -> str:
+        """Return the selected feed identifier."""
+        return self._active().get_feed_id()
+
     def create_pipeline_fragment(self) -> str:
         """Return the selected source fragment description."""
         return self._active().create_pipeline_fragment()
@@ -77,23 +82,48 @@ class PreferredSourceChain(SourceInterface):
         return self._active_source
 
 
-def build_default_source(settings: AppSettings) -> SourceInterface:
-    """Build the preferred live source chain for the current platform."""
+def build_source_for_feed(settings: AppSettings, feed: FeedDefinition) -> SourceInterface:
+    """Build the preferred source chain for a configured feed."""
+    if feed.source_kind == "ndi":
+        return NDIReceiver(
+            source_name=feed.display_name,
+            feed_id=feed.feed_id,
+            ndi_name=feed.ndi_name,
+            frame_width=settings.target_frame_width,
+            frame_height=settings.target_frame_height,
+            target_fps=settings.target_fps,
+        )
+
     return PreferredSourceChain(
         [
             GStreamerCameraSource(
-                source_name=settings.default_source_name,
-                camera_index=settings.test_camera_index,
+                source_name=feed.display_name,
+                feed_id=feed.feed_id,
+                camera_index=feed.camera_index,
                 frame_width=settings.target_frame_width,
                 frame_height=settings.target_frame_height,
                 target_fps=settings.target_fps,
             ),
             TestSource(
-                source_name=settings.default_source_name,
-                camera_index=settings.test_camera_index,
+                source_name=feed.display_name,
+                feed_id=feed.feed_id,
+                camera_index=feed.camera_index,
                 frame_width=settings.target_frame_width,
                 frame_height=settings.target_frame_height,
                 target_fps=settings.target_fps,
             ),
         ]
+    )
+
+
+def build_default_source(settings: AppSettings) -> SourceInterface:
+    """Build the preferred live source chain for the current platform."""
+    return build_source_for_feed(
+        settings,
+        FeedDefinition(
+            feed_id="feed_main",
+            display_name=settings.default_source_name,
+            source_kind="auto",
+            camera_index=settings.test_camera_index,
+        ),
     )

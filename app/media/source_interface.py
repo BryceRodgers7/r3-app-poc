@@ -31,6 +31,10 @@ class SourceInterface(ABC):
     def get_display_name(self) -> str:
         """Return a user-facing name for the source."""
 
+    def get_feed_id(self) -> str:
+        """Return the stable feed identifier for the source."""
+        return self.get_display_name()
+
     @abstractmethod
     def create_pipeline_fragment(self) -> str:
         """Describe how this source will later plug into a native GStreamer graph."""

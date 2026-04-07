@@ -9,7 +9,7 @@ from app.config.settings import AppSettings
 from app.core.app_state import AppState
 from app.core.models import PlaybackMode
 from app.core.playback_controller import PlaybackController
-from app.media.preview_output import PreviewOutput
+from app.media.output_renderer import OutputRenderer
 from app.ui.controls_widget import ControlsWidget
 from app.ui.status_bar_widget import StatusBarWidget
 from app.ui.video_widget import VideoWidget
@@ -22,18 +22,26 @@ class MainWindow(QMainWindow):
         self,
         settings: AppSettings,
         controller: PlaybackController,
-        preview_output: PreviewOutput,
+        output_renderer: OutputRenderer,
+        *,
+        window_title: str | None = None,
+        show_controls: bool = True,
     ) -> None:
         super().__init__()
         self._settings = settings
         self._controller = controller
-        self._preview_output = preview_output
+        self._output_renderer = output_renderer
+        self._show_controls = show_controls
 
-        self.setWindowTitle(settings.window_title)
+        self.setWindowTitle(window_title or settings.window_title)
         self.resize(1280, 860)
 
         self.video_widget = VideoWidget(self)
-        self.controls_widget = ControlsWidget(button_height=settings.touch_button_height, parent=self)
+        self.controls_widget = (
+            ControlsWidget(button_height=settings.touch_button_height, parent=self)
+            if show_controls
+            else None
+        )
         self.status_widget = StatusBarWidget(self)
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
@@ -43,19 +51,24 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(16)
         layout.addWidget(self.video_widget, stretch=1)
-        layout.addWidget(self.controls_widget)
+        if self.controls_widget is not None:
+            layout.addWidget(self.controls_widget)
         layout.addWidget(self.status_widget)
         self.setCentralWidget(central_widget)
 
-        self._preview_output.bind_widget(self.video_widget)
-        self._controller.attach_preview_widget(self.video_widget)
+        self._output_renderer.bind_widget(self.video_widget)
         self._wire_events()
         self._render_state(self._controller.get_state())
 
     def _wire_events(self) -> None:
-        self.controls_widget.pause_requested.connect(self._controller.pause_playback)
-        self.controls_widget.rewind_requested.connect(self._controller.rewind_10_seconds)
-        self.controls_widget.live_requested.connect(self._controller.jump_to_live)
+        if self.controls_widget is not None:
+            self.controls_widget.pause_requested.connect(self._controller.pause_playback)
+            self.controls_widget.rewind_requested.connect(self._controller.rewind_10_seconds)
+            self.controls_widget.half_speed_requested.connect(lambda: self._controller.set_playback_rate(0.5))
+            self.controls_widget.quarter_speed_requested.connect(
+                lambda: self._controller.set_playback_rate(0.25)
+            )
+            self.controls_widget.live_requested.connect(self._controller.jump_to_live)
         self._controller.signals.state_changed.connect(self._render_state)
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
 
@@ -73,7 +86,6 @@ class MainWindow(QMainWindow):
             self.video_widget.set_placeholder_text(placeholder_text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Shut down placeholder services when the window closes."""
-        self._preview_output.detach_widget()
-        self._controller.shutdown()
+        """Release the widget binding when the window closes."""
+        self._output_renderer.detach_widget()
         super().closeEvent(event)

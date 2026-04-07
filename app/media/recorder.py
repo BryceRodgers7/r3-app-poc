@@ -24,6 +24,7 @@ class Recorder:
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
         self._session_paths: SessionPaths | None = None
+        self._feed_id = "default"
         self._is_recording = False
         self._writer: cv2.VideoWriter | None = None
         self._output_path: Path | None = None
@@ -33,14 +34,23 @@ class Recorder:
         self._source_name = settings.default_source_name
         self._lock = threading.Lock()
 
-    def start(self, session_paths: SessionPaths, source_name: str, fps_hint: float) -> None:
+    def start(
+        self,
+        session_paths: SessionPaths,
+        source_name: str,
+        fps_hint: float,
+        feed_id: str = "default",
+    ) -> None:
         """Prepare the recorder for a new session."""
         with self._lock:
             self._session_paths = session_paths
+            self._feed_id = feed_id
             self._source_name = source_name
             self._fps_hint = max(fps_hint, 1.0)
-            self._output_path = session_paths.recording_dir / self._settings.recording_filename
-            self._manifest_path = session_paths.recording_dir / self._settings.recording_manifest_filename
+            feed_paths = session_paths.get_feed_paths(feed_id)
+            feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
+            self._output_path = feed_paths.recording_dir / self._settings.recording_filename
+            self._manifest_path = feed_paths.recording_dir / self._settings.recording_manifest_filename
             self._frame_count = 0
             self._release_writer()
             self._is_recording = True
@@ -74,9 +84,11 @@ class Recorder:
 
     def get_recording_target(self) -> Path | None:
         """Return the directory where full-session media should be written."""
+        if self._output_path is not None:
+            return self._output_path.parent
         if self._session_paths is None:
             return None
-        return self._session_paths.recording_dir
+        return self._session_paths.get_feed_paths(self._feed_id).recording_dir
 
     def get_output_path(self) -> Path | None:
         """Return the current recording file path."""
@@ -116,6 +128,7 @@ class Recorder:
             return
 
         manifest = {
+            "feed_id": self._feed_id,
             "source_name": self._source_name,
             "output_path": str(self._output_path),
             "frame_count": self._frame_count,

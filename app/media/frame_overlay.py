@@ -51,6 +51,7 @@ def build_playback_overlay_lines(playback_overlay: PlaybackOverlayInfo) -> list[
         lines.append(f"Now: {format_timestamp(playback_overlay.wall_clock_timestamp)}")
     if playback_overlay.mode.value in {"PAUSED", "REPLAY"}:
         lines.append(f"Behind live: {playback_overlay.seconds_behind_live:0.1f}s")
+        lines.append(f"Rate: {playback_overlay.playback_rate:0.2f}x")
     return lines
 
 

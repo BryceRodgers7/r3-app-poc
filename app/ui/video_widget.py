@@ -112,15 +112,11 @@ class VideoWidget(QWidget):
         return int(self._live_surface.winId())
 
     def set_video_surface_visible(self, enabled: bool) -> None:
-        """Switch between embedded video output and the fallback placeholder label."""
-        if enabled == self._showing_video_surface:
-            return
+        """Switch between active-frame mode and placeholder mode."""
         self._showing_video_surface = enabled
-        current_widget = self._live_surface if enabled else self._frame_label
-        self._surface_stack.setCurrentWidget(current_widget)
+        self._surface_stack.setCurrentWidget(self._frame_label)
         self._layout_playback_overlay()
-        if enabled:
-            self.video_surface_resized.emit()
+        self.video_surface_resized.emit()
 
     def display_frame(self, frame: MediaFrame) -> None:
         """Render a new frame inside the preview area."""

@@ -13,7 +13,7 @@ import threading
 import cv2
 import numpy as np
 
-from app.core.models import MediaFrame, SessionPaths
+from app.core.models import FeedPaths, MediaFrame, SessionPaths
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ class ReplayFrameRef:
     sequence_index: int
     image_path: Path
     source_name: str
+    feed_id: str = "default"
 
 
 class ReplayStore(ABC):
@@ -105,6 +106,8 @@ class ReplayBuffer(ReplayStore):
         self._buffer_duration_seconds = buffer_duration_seconds
         self._jpeg_quality = jpeg_quality
         self._session_paths: SessionPaths | None = None
+        self._feed_paths: FeedPaths | None = None
+        self._feed_id = "default"
         self._rolling_dir: Path | None = None
         self._manifest_path: Path | None = None
         self._is_running = False
@@ -117,12 +120,14 @@ class ReplayBuffer(ReplayStore):
         """Return the configured rolling buffer length."""
         return self._buffer_duration_seconds
 
-    def start(self, session_paths: SessionPaths) -> None:
+    def start(self, session_paths: SessionPaths, feed_id: str = "default") -> None:
         """Prepare rolling buffer storage for the active session."""
         with self._lock:
             self._session_paths = session_paths
-            self._rolling_dir = session_paths.rolling_dir
-            self._manifest_path = session_paths.rolling_dir / self._MANIFEST_FILENAME
+            self._feed_id = feed_id
+            self._feed_paths = session_paths.get_feed_paths(feed_id)
+            self._rolling_dir = self._feed_paths.rolling_dir
+            self._manifest_path = self._rolling_dir / self._MANIFEST_FILENAME
             self._is_running = True
             self._next_sequence_index = 0
             self._clear_rolling_directory_locked()
@@ -137,6 +142,7 @@ class ReplayBuffer(ReplayStore):
             self._frames.clear()
             self._next_sequence_index = 0
             self._clear_rolling_directory_locked()
+            self._feed_paths = None
         LOGGER.info("Replay store stopped")
 
     def is_running(self) -> bool:
@@ -169,6 +175,7 @@ class ReplayBuffer(ReplayStore):
                     sequence_index=self._next_sequence_index,
                     image_path=frame_path,
                     source_name=frame.source_name,
+                    feed_id=frame.feed_id,
                 )
             )
             self._next_sequence_index += 1
@@ -290,6 +297,7 @@ class ReplayBuffer(ReplayStore):
             timestamp=frame_ref.timestamp,
             image=decoded_image,
             source_name=frame_ref.source_name,
+            feed_id=frame_ref.feed_id,
         )
 
     def _clear_rolling_directory_locked(self) -> None:
@@ -306,6 +314,7 @@ class ReplayBuffer(ReplayStore):
             return
 
         manifest = {
+            "feed_id": self._feed_id,
             "frame_count": len(self._frames),
             "buffer_duration_seconds": self._buffer_duration_seconds,
             "jpeg_quality": self._jpeg_quality,
@@ -316,6 +325,7 @@ class ReplayBuffer(ReplayStore):
                     "sequence_index": frame_ref.sequence_index,
                     "image_path": frame_ref.image_path.name,
                     "source_name": frame_ref.source_name,
+                    "feed_id": frame_ref.feed_id,
                 }
                 for frame_ref in self._frames
             ],

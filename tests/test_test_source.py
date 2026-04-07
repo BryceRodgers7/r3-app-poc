@@ -54,6 +54,7 @@ class TestSourceTests(unittest.TestCase):
 
         source = TestSource(
             source_name="Test Source",
+            feed_id="feed_cam1",
             camera_index=0,
             frame_width=64,
             frame_height=36,
@@ -71,6 +72,7 @@ class TestSourceTests(unittest.TestCase):
         self.assertIsNotNone(frame)
         assert frame is not None
         self.assertEqual(frame.image.shape, (36, 64, 3))
+        self.assertEqual(frame.feed_id, "feed_cam1")
         self.assertTrue(captures[cv2.CAP_DSHOW].released)
         self.assertFalse(captures[secondary_backend].released)
 
@@ -84,6 +86,7 @@ class TestSourceTests(unittest.TestCase):
 
         source = TestSource(
             source_name="Test Source",
+            feed_id="feed_cam2",
             camera_index=2,
             frame_width=64,
             frame_height=36,
@@ -104,6 +107,7 @@ class TestSourceTests(unittest.TestCase):
         self.assertIsNotNone(frame)
         assert frame is not None
         self.assertGreater(int(frame.image.max()), 0)
+        self.assertEqual(frame.feed_id, "feed_cam2")
 
 
 if __name__ == "__main__":

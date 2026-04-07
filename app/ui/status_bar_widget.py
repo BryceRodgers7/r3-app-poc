@@ -68,7 +68,8 @@ class StatusBarWidget(QFrame):
             self.detail_value.setText("Playback frozen while ingest and recording continue")
         elif state.current_playback_mode.value == "REPLAY":
             self.detail_value.setText(
-                f"Rolling buffer contains about {state.replay_buffer_span_seconds:.0f}s"
+                f"Rolling buffer contains about {state.replay_buffer_span_seconds:.0f}s at "
+                f"{state.playback_overlay.playback_rate:0.2f}x"
             )
         else:
             self.detail_value.setText("Showing newest live frame")

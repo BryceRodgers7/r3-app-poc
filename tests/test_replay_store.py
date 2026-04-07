@@ -41,11 +41,12 @@ class ReplayStoreTests(unittest.TestCase):
             timestamp=timestamp,
             image=image,
             source_name="Test Source",
+            feed_id="feed_test",
         )
 
     def test_store_persists_frames_and_manifest(self) -> None:
         store = ReplayBuffer(buffer_duration_seconds=60, jpeg_quality=85)
-        store.start(self.session_paths)
+        store.start(self.session_paths, feed_id="feed_test")
 
         store.append_frame(self._make_frame(1, 1.0))
         store.append_frame(self._make_frame(2, 2.0))
@@ -65,15 +66,17 @@ class ReplayStoreTests(unittest.TestCase):
         self.assertEqual(decoded_frame.frame_id, 2)
         self.assertEqual(decoded_frame.image_bgr.shape, (24, 32, 3))
 
-        manifest_path = self.session_paths.rolling_dir / "rolling_manifest.json"
+        manifest_path = self.session_paths.get_feed_paths("feed_test").rolling_dir / "rolling_manifest.json"
         self.assertTrue(manifest_path.exists())
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["frame_count"], 3)
+        self.assertEqual(manifest["feed_id"], "feed_test")
         self.assertEqual(manifest["frames"][-1]["frame_id"], 3)
+        self.assertEqual(manifest["frames"][-1]["feed_id"], "feed_test")
 
     def test_store_prunes_old_frames_and_deletes_files(self) -> None:
         store = ReplayBuffer(buffer_duration_seconds=1, jpeg_quality=85)
-        store.start(self.session_paths)
+        store.start(self.session_paths, feed_id="feed_test")
 
         store.append_frame(self._make_frame(1, 1.0))
         store.append_frame(self._make_frame(2, 1.9))

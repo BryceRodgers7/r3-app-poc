@@ -12,6 +12,8 @@ class AppSettings:
 
     app_name: str = "Sports Replay POC"
     window_title: str = "Sports Replay Control"
+    operator_window_title: str = "Sports Replay Operator"
+    program_window_title: str = "Sports Replay Program"
     base_data_dir: Path = Path(r"C:\SportsReplay")
     replay_buffer_seconds: int = 120
     touch_button_height: int = 72
