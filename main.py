@@ -24,7 +24,7 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    settings = AppSettings()
+    settings = AppSettings.load()
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName(settings.app_name)

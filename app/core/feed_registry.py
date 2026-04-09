@@ -20,10 +20,11 @@ class FeedRegistry:
         return cls(
             feeds=[
                 FeedDefinition(
-                    feed_id="feed_main",
+                    feed_id=settings.default_feed_id,
                     display_name=settings.default_source_name,
-                    source_kind="auto",
+                    source_kind=settings.default_source_kind,
                     camera_index=settings.test_camera_index,
+                    ndi_name=settings.ndi_source_name,
                 )
             ]
         )

@@ -1,0 +1,29 @@
+# Optional runtime configuration for source selection and app defaults.
+# The app loads this file automatically from the workspace root when present.
+
+[app]
+app_name = "Sports Replay POC"
+operator_window_title = "Sports Replay Operator"
+program_window_title = "Sports Replay Program"
+base_data_dir = "C:\\SportsReplay"
+target_frame_width = 640
+target_frame_height = 360
+target_fps = 15.0
+replay_buffer_seconds = 120
+
+[source]
+# Use "auto" to prefer the native webcam path and fall back automatically.
+# Use "ndi" to connect to an NDI sender by name.
+kind = "ndi"
+
+# User-facing label shown in the UI and session metadata.
+display_name = "Main Feed"
+feed_id = "feed_main"
+
+# Used when kind = "auto".
+camera_index = 0
+
+# Used when kind = "ndi".
+# Example:
+# ndi_name = "OBS PGM"
+ndi_name = ""

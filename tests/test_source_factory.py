@@ -93,6 +93,19 @@ class PreferredSourceChainTests(unittest.TestCase):
         self.assertEqual(gst_source.connect_attempts, 1)
         self.assertEqual(opencv_source.connect_attempts, 1)
 
+    def test_build_default_source_uses_ndi_receiver_when_configured(self) -> None:
+        settings = AppSettings(
+            default_source_name="Bench NDI",
+            default_source_kind="ndi",
+            ndi_source_name="Bench Sender",
+        )
+        ndi_source = _FakeSource("NDI", connects=True)
+
+        with patch("app.media.source_factory.NDIReceiver", return_value=ndi_source):
+            source = build_default_source(settings)
+
+        self.assertIs(source, ndi_source)
+
 
 if __name__ == "__main__":
     unittest.main()
