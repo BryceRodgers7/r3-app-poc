@@ -47,6 +47,9 @@ venv.bak/
 .env
 .env.local
 
+# Settings files
+app_settings.toml
+
 # Model files (large files)
 *.pt
 *.h5
