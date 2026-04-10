@@ -10,7 +10,8 @@ from typing import Any
 
 import numpy as np
 
-from app.core.models import MediaFrame
+from app.core.models import IngestTelemetry, MediaFrame
+from app.media.gst_ingest_telemetry import poll_convert_sink_caps
 from app.media.source_interface import SourceInterface
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ class GStreamerCameraSource(SourceInterface):
         self._bus: Any | None = None
         self._source_factory_name: str | None = None
         self._pending_frame: np.ndarray | None = None
+        self._convert: Any | None = None
+        self._ingest_telemetry: IngestTelemetry | None = None
 
     def connect_source(self) -> bool:
         """Open the preferred GStreamer webcam source if one is available."""
@@ -84,6 +87,7 @@ class GStreamerCameraSource(SourceInterface):
                 self._camera_index,
                 factory_name,
             )
+            self._refresh_ingest_telemetry()
             return True
 
         return False
@@ -97,6 +101,8 @@ class GStreamerCameraSource(SourceInterface):
         self._bus = None
         self._source_factory_name = None
         self._pending_frame = None
+        self._convert = None
+        self._ingest_telemetry = None
         self._connected = False
 
     def is_connected(self) -> bool:
@@ -137,6 +143,10 @@ class GStreamerCameraSource(SourceInterface):
     def get_nominal_fps(self) -> float:
         """Return the requested capture frame rate."""
         return self._target_fps
+
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return negotiated decode dimensions vs configured target."""
+        return self._ingest_telemetry
 
     def get_status_message(self) -> str | None:
         """Return the current non-fatal status message."""
@@ -222,7 +232,22 @@ class GStreamerCameraSource(SourceInterface):
         self._appsink = appsink
         self._bus = pipeline.get_bus()
         self._source_factory_name = factory_name
+        self._convert = convert
         return True
+
+    def _refresh_ingest_telemetry(self) -> None:
+        raw_w, raw_h, raw_fps = None, None, None
+        if self._convert is not None:
+            raw_w, raw_h, raw_fps = poll_convert_sink_caps(self._convert)
+        self._ingest_telemetry = IngestTelemetry(
+            target_width=self._frame_width,
+            target_height=self._frame_height,
+            target_fps=self._target_fps,
+            raw_width=raw_w,
+            raw_height=raw_h,
+            raw_fps=raw_fps,
+        )
+        LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
 
     def _make_element(self, factory_name: str, element_name: str) -> Any:
         assert self._Gst is not None

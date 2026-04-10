@@ -15,6 +15,8 @@ class StatusBarWidget(QFrame):
         self.mode_value = QLabel("-")
         self.recording_value = QLabel("-")
         self.source_value = QLabel("-")
+        self.ingest_value = QLabel("-")
+        self.ingest_value.setWordWrap(True)
         self.session_value = QLabel("-")
         self.detail_value = QLabel("-")
 
@@ -27,6 +29,7 @@ class StatusBarWidget(QFrame):
             ("Mode", self.mode_value),
             ("Recording", self.recording_value),
             ("Source", self.source_value),
+            ("Ingest", self.ingest_value),
             ("Session", self.session_value),
             ("Detail", self.detail_value),
         )
@@ -58,6 +61,10 @@ class StatusBarWidget(QFrame):
         self.source_value.setText(
             f"{state.current_source_name or 'Unknown'} ({'CONNECTED' if state.source_connected else 'DISCONNECTED'})"
         )
+        if state.ingest_telemetry is not None:
+            self.ingest_value.setText(state.ingest_telemetry.summary_line())
+        else:
+            self.ingest_value.setText("-")
         self.session_value.setText(state.current_session_id or "No session")
 
         if state.error_message:

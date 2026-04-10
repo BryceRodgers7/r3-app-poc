@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from app.core.models import MediaFrame
+from app.core.models import IngestTelemetry, MediaFrame
 
 
 class SourceInterface(ABC):
@@ -53,4 +53,8 @@ class SourceInterface(ABC):
 
     def get_status_message(self) -> str | None:
         """Return a non-fatal operator-facing status message, if any."""
+        return None
+
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return raw vs target resolution/FPS when the source can determine them."""
         return None

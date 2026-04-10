@@ -23,6 +23,28 @@ class PlaybackMode(str, Enum):
 FrameArray: TypeAlias = npt.NDArray[np.uint8]
 
 
+@dataclass(slots=True, frozen=True)
+class IngestTelemetry:
+    """Negotiated capture characteristics vs the pipeline target (resize / rate caps)."""
+
+    target_width: int
+    target_height: int
+    target_fps: float
+    raw_width: int | None = None
+    raw_height: int | None = None
+    raw_fps: float | None = None
+
+    def summary_line(self) -> str:
+        """Single-line description for logs and the operator status panel."""
+        target_part = f"{self.target_width}x{self.target_height} @ {self.target_fps:.4g} fps"
+        if self.raw_width is None or self.raw_height is None:
+            raw_part = "unknown"
+        else:
+            fps_text = f"{self.raw_fps:.4g}" if self.raw_fps is not None else "?"
+            raw_part = f"{self.raw_width}x{self.raw_height} @ {fps_text} fps"
+        return f"Raw {raw_part} → target {target_part}"
+
+
 @dataclass(slots=True)
 class MediaFrame:
     """A single timestamped frame delivered through the temporary media layer.

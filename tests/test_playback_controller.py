@@ -87,6 +87,9 @@ class _FakePipelineManager:
     def get_source_status_message(self) -> str | None:
         return None
 
+    def get_ingest_telemetry(self) -> None:
+        return None
+
 
 class _FakeRenderer(OutputRenderer):
     def __init__(self) -> None:

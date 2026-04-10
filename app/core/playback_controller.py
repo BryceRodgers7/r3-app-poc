@@ -198,6 +198,7 @@ class PlaybackController:
             self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
             self._state.error_message = message
             self._state.warning_message = None
+            self._state.ingest_telemetry = None
             self._update_state_timestamps_locked()
         self._output_renderer.show_placeholder_message(message)
         self._emit_state(message)
@@ -282,6 +283,7 @@ class PlaybackController:
 
     def _sync_source_status_locked(self) -> None:
         self._state.warning_message = self._feed_runtime.get_status_message()
+        self._state.ingest_telemetry = self._feed_runtime.get_ingest_telemetry()
 
     def _start_replay_clock_locked(self, playback_timestamp: float) -> None:
         self._replay_clock_anchor_timestamp = playback_timestamp

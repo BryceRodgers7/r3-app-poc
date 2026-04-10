@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from app.core.models import FeedDefinition, FrameOverlayInfo, MediaFrame, SessionPaths
+from app.core.models import FeedDefinition, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
 from app.media.pipeline_manager import PipelineManager
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayStore
@@ -64,6 +64,10 @@ class FeedRuntime:
     def get_status_message(self) -> str | None:
         """Return any current non-fatal source warning."""
         return self.pipeline_manager.get_source_status_message()
+
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return negotiated capture vs target dimensions for the active source."""
+        return self.pipeline_manager.get_ingest_telemetry()
 
     def get_latest_live_frame(self) -> MediaFrame | None:
         """Return the newest live frame, if any."""

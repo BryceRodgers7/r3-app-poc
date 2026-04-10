@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from app.config.settings import AppSettings
-from app.core.models import FeedDefinition, MediaFrame
+from app.core.models import FeedDefinition, IngestTelemetry, MediaFrame
 from app.media.gstreamer_camera_source import GStreamerCameraSource
 from app.media.ndi_receiver import NDIReceiver
 from app.media.source_interface import SourceInterface
@@ -75,6 +75,12 @@ class PreferredSourceChain(SourceInterface):
     def get_status_message(self) -> str | None:
         """Return the selected source status message."""
         return self._active().get_status_message()
+
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return ingest telemetry for the active source."""
+        if self._active_source is None:
+            return None
+        return self._active_source.get_ingest_telemetry()
 
     def _active(self) -> SourceInterface:
         if self._active_source is None:

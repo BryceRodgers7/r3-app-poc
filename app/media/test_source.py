@@ -10,7 +10,7 @@ from math import sin
 import cv2
 import numpy as np
 
-from app.core.models import MediaFrame
+from app.core.models import IngestTelemetry, MediaFrame
 from app.media.source_interface import SourceInterface
 
 LOGGER = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ class TestSource(SourceInterface):
         self._last_frame_monotonic = 0.0
         self._pending_frame: np.ndarray | None = None
         self._status_message: str | None = None
+        self._ingest_telemetry: IngestTelemetry | None = None
 
     def connect_source(self) -> bool:
         """Open the preferred camera or fall back to a synthetic test feed."""
@@ -98,6 +99,7 @@ class TestSource(SourceInterface):
 
         self._connected = True
         self._last_frame_monotonic = time.perf_counter()
+        self._refresh_ingest_telemetry()
         return True
 
     def disconnect_source(self) -> None:
@@ -108,6 +110,7 @@ class TestSource(SourceInterface):
         self._capture_backend_name = None
         self._pending_frame = None
         self._connected = False
+        self._ingest_telemetry = None
 
     def is_connected(self) -> bool:
         """Return whether the source is available for frame reads."""
@@ -170,6 +173,61 @@ class TestSource(SourceInterface):
         """Return the target frame rate."""
         return self._target_fps
 
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return OpenCV-reported camera mode vs configured target dimensions."""
+        return self._ingest_telemetry
+
+    def _refresh_ingest_telemetry(self) -> None:
+        if not self._connected:
+            self._ingest_telemetry = None
+            return
+
+        if self._use_synthetic_frames:
+            self._ingest_telemetry = IngestTelemetry(
+                target_width=self._frame_width,
+                target_height=self._frame_height,
+                target_fps=self._target_fps,
+                raw_width=None,
+                raw_height=None,
+                raw_fps=None,
+            )
+            LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
+            return
+
+        assert self._capture is not None
+        try:
+            getter = self._capture.get
+        except AttributeError:
+            getter = None
+        if getter is None:
+            self._ingest_telemetry = IngestTelemetry(
+                target_width=self._frame_width,
+                target_height=self._frame_height,
+                target_fps=self._target_fps,
+                raw_width=None,
+                raw_height=None,
+                raw_fps=None,
+            )
+            LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
+            return
+
+        try:
+            raw_w = int(getter(cv2.CAP_PROP_FRAME_WIDTH))
+            raw_h = int(getter(cv2.CAP_PROP_FRAME_HEIGHT))
+            raw_fps_prop = float(getter(cv2.CAP_PROP_FPS))
+        except (TypeError, ValueError):
+            raw_w, raw_h, raw_fps_prop = 0, 0, 0.0
+        raw_fps = raw_fps_prop if raw_fps_prop > 0.0 else None
+        self._ingest_telemetry = IngestTelemetry(
+            target_width=self._frame_width,
+            target_height=self._frame_height,
+            target_fps=self._target_fps,
+            raw_width=raw_w if raw_w > 0 else None,
+            raw_height=raw_h if raw_h > 0 else None,
+            raw_fps=raw_fps,
+        )
+        LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
+
     def _switch_to_synthetic_fallback(self, status_message: str | None = None) -> None:
         if self._capture is not None:
             self._capture.release()
@@ -179,6 +237,7 @@ class TestSource(SourceInterface):
         self._use_synthetic_frames = True
         self._display_name = f"{self._base_source_name} (Synthetic Fallback)"
         self._status_message = status_message
+        self._refresh_ingest_telemetry()
 
     def _get_backend_candidates(self) -> list[tuple[str, int]]:
         if sys.platform.startswith("win"):

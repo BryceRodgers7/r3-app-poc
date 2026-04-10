@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from app.core.models import FrameOverlayInfo, MediaFrame, SessionPaths
+from app.core.models import FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
 from app.media.frame_overlay import render_frame_overlay
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
@@ -270,6 +270,10 @@ class PipelineManager:
     def get_source_status_message(self) -> str | None:
         """Return the current non-fatal source status message."""
         return self._source.get_status_message()
+
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return raw vs target ingest resolution/FPS from the live source."""
+        return self._source.get_ingest_telemetry()
 
     def _configure_replay_source(self) -> None:
         with self._pipeline_lock:

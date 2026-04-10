@@ -10,7 +10,8 @@ from typing import Any
 
 import numpy as np
 
-from app.core.models import MediaFrame
+from app.core.models import IngestTelemetry, MediaFrame
+from app.media.gst_ingest_telemetry import poll_convert_sink_caps
 from app.media.source_interface import SourceInterface
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class NDIReceiver(SourceInterface):
         self._pipeline: Any | None = None
         self._appsink: Any | None = None
         self._bus: Any | None = None
+        self._convert: Any | None = None
+        self._ingest_telemetry: IngestTelemetry | None = None
 
     def connect_source(self) -> bool:
         """Connect to an NDI source via the `ndisrc` GStreamer plugin."""
@@ -120,8 +123,10 @@ class NDIReceiver(SourceInterface):
         self._pipeline = pipeline
         self._appsink = appsink
         self._bus = pipeline.get_bus()
+        self._convert = convert
         self._connected = True
         self._status_message = None
+        self._refresh_ingest_telemetry()
         return True
 
     def disconnect_source(self) -> None:
@@ -131,6 +136,8 @@ class NDIReceiver(SourceInterface):
         self._pipeline = None
         self._appsink = None
         self._bus = None
+        self._convert = None
+        self._ingest_telemetry = None
         self._connected = False
 
     def is_connected(self) -> bool:
@@ -175,6 +182,10 @@ class NDIReceiver(SourceInterface):
         """Return the target NDI frame rate."""
         return self._target_fps
 
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        """Return negotiated decode dimensions vs configured target."""
+        return self._ingest_telemetry
+
     def get_status_message(self) -> str | None:
         """Return the current non-fatal source status."""
         return self._status_message
@@ -201,6 +212,20 @@ class NDIReceiver(SourceInterface):
             element.set_property(property_name, value)
         except Exception:
             pass
+
+    def _refresh_ingest_telemetry(self) -> None:
+        raw_w, raw_h, raw_fps = None, None, None
+        if self._convert is not None:
+            raw_w, raw_h, raw_fps = poll_convert_sink_caps(self._convert)
+        self._ingest_telemetry = IngestTelemetry(
+            target_width=self._frame_width,
+            target_height=self._frame_height,
+            target_fps=self._target_fps,
+            raw_width=raw_w,
+            raw_height=raw_h,
+            raw_fps=raw_fps,
+        )
+        LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
 
     def _on_decodebin_pad_added(self, _decodebin: Any, pad: Any, convert: Any) -> None:
         sink_pad = convert.get_static_pad("sink")
