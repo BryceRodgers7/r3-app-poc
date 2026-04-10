@@ -14,7 +14,7 @@ replay_buffer_seconds = 120
 [source]
 # Use "auto" to prefer the native webcam path and fall back automatically.
 # Use "ndi" to connect to an NDI sender by name.
-kind = "ndi"
+kind = "auto"
 
 # User-facing label shown in the UI and session metadata.
 display_name = "Main Feed"
