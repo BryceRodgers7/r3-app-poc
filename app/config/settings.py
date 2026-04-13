@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -32,6 +32,8 @@ class AppSettings:
     replay_buffer_jpeg_quality: int = 80
     recording_filename: str = "session_recording.mp4"
     recording_manifest_filename: str = "recording_manifest.json"
+    # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
+    feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> "AppSettings":
@@ -86,7 +88,40 @@ class AppSettings:
             ndi_name = str(source_config["ndi_name"]).strip()
             settings.ndi_source_name = ndi_name or None
 
+        settings.feeds_table_rows = cls._parse_feeds_table(data.get("feeds"))
+
         return settings
+
+    @staticmethod
+    def _parse_feeds_table(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            feed_id = str(row.get("feed_id", "")).strip()
+            if not feed_id:
+                continue
+            display_name = str(row.get("display_name", feed_id or "Feed")).strip()
+            kind = str(row.get("kind", "auto")).strip().lower() or "auto"
+            camera_index = int(row.get("camera_index", 0))
+            ndi_raw = row.get("ndi_name")
+            ndi_name = str(ndi_raw).strip() if ndi_raw is not None else None
+            if ndi_name == "":
+                ndi_name = None
+            enabled = bool(row.get("enabled", True))
+            out.append(
+                {
+                    "feed_id": feed_id,
+                    "display_name": display_name or feed_id,
+                    "source_kind": kind,
+                    "camera_index": camera_index,
+                    "ndi_name": ndi_name,
+                    "enabled": enabled,
+                }
+            )
+        return out
 
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:

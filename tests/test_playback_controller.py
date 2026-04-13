@@ -169,7 +169,7 @@ class PlaybackControllerTests(unittest.TestCase):
 
         self.renderer = _FakeRenderer()
         self.controller = PlaybackController(
-            feed_runtime=self.runtime,
+            feed_runtimes=[self.runtime],
             output_renderer=self.renderer,
             recording_manager=self.recording_manager,
             replay_store_manager=self.replay_store_manager,
@@ -221,7 +221,7 @@ class PlaybackControllerTests(unittest.TestCase):
     def test_live_only_controller_rejects_transport_changes(self) -> None:
         renderer = _FakeRenderer()
         controller = PlaybackController(
-            feed_runtime=self.runtime,
+            feed_runtimes=[self.runtime],
             output_renderer=renderer,
             recording_manager=self.recording_manager,
             replay_store_manager=self.replay_store_manager,
@@ -234,6 +234,52 @@ class PlaybackControllerTests(unittest.TestCase):
 
         controller.pause_playback()
         self.assertEqual(controller.get_state().current_playback_mode, PlaybackMode.LIVE)
+
+    def test_multi_feed_pause_renders_each_feed(self) -> None:
+        feed_b = FeedDefinition(feed_id="feed_b", display_name="Cam B")
+        replay_b = ReplayBuffer(buffer_duration_seconds=30, jpeg_quality=85)
+        self.replay_store_manager.register(feed_b.feed_id, replay_b)
+        self.recording_manager.register(feed_b.feed_id, _FakeRecorder())
+        fake_b = _FakePipelineManager(feed_b.feed_id, replay_b)
+        runtime_b = FeedRuntime(
+            feed=feed_b,
+            source=_FakeSource(feed_b.feed_id),
+            pipeline_manager=fake_b,
+            recorder=_FakeRecorder(),
+            replay_store=replay_b,
+        )
+        runtime_b.start(self.session_paths)
+        for frame_id in range(240):
+            timestamp = 100.0 + (frame_id * (1.0 / 15.0))
+            image = np.full((24, 32, 3), (frame_id + 7) % 255, dtype=np.uint8)
+            frame = MediaFrame(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                image=image,
+                source_name="Fake B",
+                feed_id=feed_b.feed_id,
+            )
+            replay_b.append_frame(frame)
+
+        renderer = _FakeRenderer()
+        controller = PlaybackController(
+            feed_runtimes=[self.runtime, runtime_b],
+            output_renderer=renderer,
+            recording_manager=self.recording_manager,
+            replay_store_manager=self.replay_store_manager,
+            default_source_name="Fake Source",
+            session_role="operator",
+            live_only=False,
+        )
+        controller.initialize(self.session_paths.session_id)
+        self.addCleanup(controller.shutdown)
+        self.addCleanup(replay_b.stop)
+
+        n_before = len(renderer.frames)
+        controller.pause_playback()
+        new_frames = renderer.frames[n_before:]
+        self.assertGreaterEqual(len(new_frames), 2)
+        self.assertEqual({f.feed_id for f in new_frames[-2:]}, {self.feed.feed_id, feed_b.feed_id})
 
 
 if __name__ == "__main__":

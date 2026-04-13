@@ -65,6 +65,39 @@ ndi_name = "OBS-PC (Camera)"
         self.assertEqual(feed.camera_index, 3)
         self.assertEqual(feed.ndi_name, "Program NDI")
 
+    def test_load_reads_feeds_array_for_multi_feed(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[app]
+target_fps = 30.0
+
+[[feeds]]
+feed_id = "a"
+display_name = "Cam A"
+kind = "auto"
+camera_index = 0
+
+[[feeds]]
+feed_id = "b"
+display_name = "NDI B"
+kind = "ndi"
+ndi_name = "Sender 1"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            settings = AppSettings.load(config_path)
+
+        self.assertEqual(len(settings.feeds_table_rows), 2)
+        registry = FeedRegistry.build_default(settings)
+        enabled = registry.get_enabled_feeds()
+        self.assertEqual(len(enabled), 2)
+        self.assertEqual(enabled[0].feed_id, "a")
+        self.assertEqual(enabled[1].source_kind, "ndi")
+        self.assertEqual(enabled[1].ndi_name, "Sender 1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ from app.config.settings import AppSettings
 from app.core.feed_registry import FeedRegistry
 from app.core.playback_controller import PlaybackController
 from app.media.feed_runtime import FeedRuntime
-from app.media.output_renderer import OutputRenderer
+from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
@@ -28,12 +28,12 @@ class ApplicationCoordinator:
         feed_runtimes: dict[str, FeedRuntime],
         recording_manager: RecordingManager,
         replay_store_manager: ReplayStoreManager,
-        operator_renderer: OutputRenderer,
-        program_renderer: OutputRenderer,
+        operator_renderer: MultiFeedOutputRenderer,
+        program_renderer: MultiFeedOutputRenderer,
     ) -> None:
         self._settings = settings
         self._session_manager = session_manager
-        self._feed_registry = feed_registry
+        self.feed_registry = feed_registry
         self._feed_runtimes = feed_runtimes
         self._recording_manager = recording_manager
         self._replay_store_manager = replay_store_manager
@@ -41,9 +41,10 @@ class ApplicationCoordinator:
         self.program_renderer = program_renderer
 
         primary_feed = feed_registry.get_primary_feed()
-        primary_runtime = feed_runtimes[primary_feed.feed_id]
+        enabled_feeds = feed_registry.get_enabled_feeds()
+        enabled_runtimes = [feed_runtimes[f.feed_id] for f in enabled_feeds]
         self.operator_controller = PlaybackController(
-            feed_runtime=primary_runtime,
+            feed_runtimes=enabled_runtimes,
             output_renderer=operator_renderer,
             recording_manager=recording_manager,
             replay_store_manager=replay_store_manager,
@@ -52,7 +53,7 @@ class ApplicationCoordinator:
             live_only=False,
         )
         self.program_controller = PlaybackController(
-            feed_runtime=primary_runtime,
+            feed_runtimes=enabled_runtimes,
             output_renderer=program_renderer,
             recording_manager=recording_manager,
             replay_store_manager=replay_store_manager,
@@ -66,7 +67,7 @@ class ApplicationCoordinator:
         """Start storage, ingest, and playback sessions."""
         if self._session_started:
             return
-        session_paths = self._session_manager.start_new_session(self._feed_registry.build_session_label())
+        session_paths = self._session_manager.start_new_session(self.feed_registry.build_session_label())
         for runtime in self._feed_runtimes.values():
             runtime.start(session_paths)
         self.operator_controller.initialize(session_paths.session_id)
@@ -87,6 +88,9 @@ class ApplicationCoordinator:
 def build_default_application_coordinator(
     settings: AppSettings,
     session_manager: SessionManager,
+    *,
+    operator_renderer: MultiFeedOutputRenderer,
+    program_renderer: MultiFeedOutputRenderer,
 ) -> ApplicationCoordinator:
     """Build the default coordinator graph for the current app."""
     feed_registry = FeedRegistry.build_default(settings)
@@ -126,6 +130,6 @@ def build_default_application_coordinator(
         feed_runtimes=feed_runtimes,
         recording_manager=recording_manager,
         replay_store_manager=replay_store_manager,
-        operator_renderer=OutputRenderer(),
-        program_renderer=OutputRenderer(),
+        operator_renderer=operator_renderer,
+        program_renderer=program_renderer,
     )

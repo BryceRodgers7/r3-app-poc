@@ -11,7 +11,30 @@ target_frame_height = 360
 target_fps = 15.0
 replay_buffer_seconds = 120
 
+# Multi-feed (up to 8 enabled feeds). When present, [[feeds]] replaces the single [source] block below.
+# Mix USB/webcam rows (kind = "auto") and NDI rows (kind = "ndi", ndi_name required).
+
+[[feeds]]
+feed_id = "cam_a"
+display_name = "USB Cam A"
+kind = "auto"
+camera_index = 0
+enabled = true
+
+[[feeds]]
+feed_id = "cam_b"
+display_name = "USB Cam B"
+kind = "auto"
+camera_index = 1
+
+[[feeds]]
+feed_id = "ndi_1"
+display_name = "NDI Program"
+kind = "ndi"
+ndi_name = "OBS PGM"
+
 [source]
+# Used only when no [[feeds]] entries are defined.
 # Use "auto" to prefer the native webcam path and fall back automatically.
 # Use "ndi" to connect to an NDI sender by name.
 kind = "auto"

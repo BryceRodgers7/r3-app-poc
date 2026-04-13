@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from app.config.settings import AppSettings
 from app.core.models import FeedDefinition
+
+_MAX_ENABLED_FEEDS = 8
 
 
 @dataclass(slots=True)
@@ -16,7 +19,28 @@ class FeedRegistry:
 
     @classmethod
     def build_default(cls, settings: AppSettings) -> "FeedRegistry":
-        """Return the default single-feed configuration used today."""
+        """Build feeds from [[feeds]] in TOML when present, else legacy [source]."""
+        if settings.feeds_table_rows:
+            feeds = [_feed_from_settings_row(row) for row in settings.feeds_table_rows]
+            enabled = [f for f in feeds if f.enabled]
+            if not enabled:
+                raise RuntimeError("At least one enabled feed is required in [[feeds]].")
+            if len(enabled) > _MAX_ENABLED_FEEDS:
+                raise RuntimeError(f"At most {_MAX_ENABLED_FEEDS} enabled feeds are allowed.")
+            seen: set[str] = set()
+            for feed in enabled:
+                if feed.feed_id in seen:
+                    raise RuntimeError(f"Duplicate feed_id in [[feeds]]: {feed.feed_id!r}.")
+                seen.add(feed.feed_id)
+                kind = feed.source_kind.strip().lower()
+                if kind not in {"auto", "ndi"}:
+                    raise RuntimeError(
+                        f"Feed {feed.feed_id!r}: kind must be 'auto' or 'ndi', not {feed.source_kind!r}."
+                    )
+                if kind == "ndi" and not (feed.ndi_name and str(feed.ndi_name).strip()):
+                    raise RuntimeError(f"Feed {feed.feed_id!r}: ndi_name is required when kind is 'ndi'.")
+            return cls(feeds=feeds)
+
         return cls(
             feeds=[
                 FeedDefinition(
@@ -53,3 +77,14 @@ class FeedRegistry:
         if len(enabled) == 1:
             return enabled[0].display_name
         return f"{enabled[0].display_name} +{max(len(enabled) - 1, 0)} feeds"
+
+
+def _feed_from_settings_row(row: dict[str, Any]) -> FeedDefinition:
+    return FeedDefinition(
+        feed_id=str(row["feed_id"]),
+        display_name=str(row.get("display_name", row["feed_id"])),
+        source_kind=str(row.get("source_kind", "auto")),
+        camera_index=int(row.get("camera_index", 0)),
+        ndi_name=row.get("ndi_name"),
+        enabled=bool(row.get("enabled", True)),
+    )

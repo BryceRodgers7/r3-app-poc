@@ -12,6 +12,47 @@ if TYPE_CHECKING:
     from app.ui.video_widget import VideoWidget
 
 
+class MultiFeedOutputRenderer(QObject):
+    """Route frames to the correct `VideoWidget` by `MediaFrame.feed_id`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._per_feed: dict[str, OutputRenderer] = {}
+
+    def bind_feed_widget(self, feed_id: str, widget: "VideoWidget") -> None:
+        """Attach one output renderer to a tile for this feed."""
+        renderer = OutputRenderer()
+        renderer.bind_widget(widget)
+        self._per_feed[feed_id] = renderer
+
+    def feed_ids(self) -> list[str]:
+        """Return bound feed identifiers in insertion order."""
+        return list(self._per_feed.keys())
+
+    def show_frame(self, frame: MediaFrame) -> None:
+        """Display a frame on the matching feed tile, if any."""
+        renderer = self._per_feed.get(frame.feed_id)
+        if renderer is not None:
+            renderer.show_frame(frame)
+
+    def show_placeholder_message(self, message: str) -> None:
+        """Set the same placeholder text on every bound tile."""
+        for renderer in self._per_feed.values():
+            renderer.show_placeholder_message(message)
+
+    def show_placeholder_for_feed(self, feed_id: str, message: str) -> None:
+        """Set placeholder text for a single feed tile."""
+        renderer = self._per_feed.get(feed_id)
+        if renderer is not None:
+            renderer.show_placeholder_message(message)
+
+    def detach_all(self) -> None:
+        """Disconnect all per-feed renderers."""
+        for renderer in self._per_feed.values():
+            renderer.detach_widget()
+        self._per_feed.clear()
+
+
 class OutputRenderer(QObject):
     """Own the widget binding for one displayed output."""
 

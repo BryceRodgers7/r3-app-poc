@@ -7,12 +7,12 @@ from PySide6.QtWidgets import QMainWindow, QStatusBar, QVBoxLayout, QWidget
 
 from app.config.settings import AppSettings
 from app.core.app_state import AppState
-from app.core.models import PlaybackMode
+from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
-from app.media.output_renderer import OutputRenderer
+from app.media.output_renderer import MultiFeedOutputRenderer
 from app.ui.controls_widget import ControlsWidget
+from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.status_bar_widget import StatusBarWidget
-from app.ui.video_widget import VideoWidget
 
 
 class MainWindow(QMainWindow):
@@ -22,21 +22,28 @@ class MainWindow(QMainWindow):
         self,
         settings: AppSettings,
         controller: PlaybackController,
-        output_renderer: OutputRenderer,
+        output_renderer: MultiFeedOutputRenderer,
+        feeds: list[FeedDefinition],
         *,
         window_title: str | None = None,
         show_controls: bool = True,
+        program_live_only: bool = False,
     ) -> None:
         super().__init__()
         self._settings = settings
         self._controller = controller
         self._output_renderer = output_renderer
         self._show_controls = show_controls
+        self._program_live_only = program_live_only
 
         self.setWindowTitle(window_title or settings.window_title)
         self.resize(1280, 860)
 
-        self.video_widget = VideoWidget(self)
+        enabled_feeds = [f for f in feeds if f.enabled]
+        self.video_panel = MultiFeedVideoPanel(enabled_feeds, self)
+        for feed_id, widget in self.video_panel.widgets_by_feed_id.items():
+            self._output_renderer.bind_feed_widget(feed_id, widget)
+
         self.controls_widget = (
             ControlsWidget(button_height=settings.touch_button_height, parent=self)
             if show_controls
@@ -50,13 +57,12 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(16)
-        layout.addWidget(self.video_widget, stretch=1)
+        layout.addWidget(self.video_panel, stretch=1)
         if self.controls_widget is not None:
             layout.addWidget(self.controls_widget)
         layout.addWidget(self.status_widget)
         self.setCentralWidget(central_widget)
 
-        self._output_renderer.bind_widget(self.video_widget)
         self._wire_events()
         self._render_state(self._controller.get_state())
 
@@ -79,13 +85,16 @@ class MainWindow(QMainWindow):
             PlaybackMode.PAUSED,
             PlaybackMode.REPLAY,
         }
-        self.video_widget.set_video_surface_visible(show_embedded_video)
-        self.video_widget.set_playback_overlay(state.playback_overlay)
+        self.video_panel.set_playback_overlay(state.playback_overlay)
+        self.video_panel.apply_tile_visibility(
+            state.current_playback_mode,
+            program_live_only=self._program_live_only,
+        )
         if not show_embedded_video:
             placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
-            self.video_widget.set_placeholder_text(placeholder_text)
+            self.video_panel.set_global_placeholder(placeholder_text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Release the widget binding when the window closes."""
-        self._output_renderer.detach_widget()
+        """Release widget bindings when the window closes."""
+        self._output_renderer.detach_all()
         super().closeEvent(event)

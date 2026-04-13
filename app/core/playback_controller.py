@@ -5,16 +5,17 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Sequence
 
 from PySide6.QtCore import QTimer
 
 from app.core.app_state import AppState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
 from app.core.signals import AppSignals
-from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
 from app.media.feed_runtime import FeedRuntime
-from app.media.output_renderer import OutputRenderer
+from app.media.output_renderer import MultiFeedOutputRenderer, OutputRenderer
 from app.media.recording_manager import RecordingManager
+from app.media.replay_buffer import ReplayFrameRef
 from app.media.replay_store_manager import ReplayStoreManager
 
 LOGGER = logging.getLogger(__name__)
@@ -25,19 +26,23 @@ class PlaybackController:
 
     def __init__(
         self,
-        feed_runtime: FeedRuntime,
-        output_renderer: OutputRenderer,
+        feed_runtimes: Sequence[FeedRuntime],
+        output_renderer: OutputRenderer | MultiFeedOutputRenderer,
         recording_manager: RecordingManager,
         replay_store_manager: ReplayStoreManager,
         default_source_name: str,
         session_role: str,
         live_only: bool = False,
     ) -> None:
-        self._feed_runtime = feed_runtime
+        if not feed_runtimes:
+            raise ValueError("PlaybackController requires at least one FeedRuntime.")
+        self._feed_runtimes: tuple[FeedRuntime, ...] = tuple(feed_runtimes)
+        self._primary_runtime = self._feed_runtimes[0]
+        self._primary_feed_id = self._primary_runtime.feed.feed_id
         self._output_renderer = output_renderer
         self._recording_manager = recording_manager
         self._replay_store_manager = replay_store_manager
-        self._replay_buffer = replay_store_manager.get(feed_runtime.feed.feed_id)
+        self._replay_buffer = replay_store_manager.get(self._primary_feed_id)
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
@@ -45,6 +50,7 @@ class PlaybackController:
         self._state = AppState(current_source_name=default_source_name)
         self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
         self._latest_live_frame: MediaFrame | None = None
+        self._latest_live_by_feed: dict[str, MediaFrame] = {}
         self._display_replay_ref: ReplayFrameRef | None = None
         self._latest_live_overlay = FrameOverlayInfo()
         self._latest_live_timestamp: float | None = None
@@ -62,24 +68,25 @@ class PlaybackController:
         self._overlay_timer.timeout.connect(self._on_overlay_timer_tick)
 
     def initialize(self, session_id: str) -> None:
-        """Activate the controller for a started feed runtime."""
+        """Activate the controller for started feed runtimes."""
         self._session_id = session_id
         self._state.current_session_id = session_id
-        self._state.current_source_name = self._feed_runtime.get_source_name()
-        self._state.warning_message = self._feed_runtime.get_status_message()
+        self._state.current_source_name = self._primary_runtime.get_source_name()
+        self._sync_all_source_status_locked()
         self._overlay_timer.start()
-        self._feed_runtime.add_live_frame_listener(self.on_new_live_frame)
-        self._feed_runtime.add_live_overlay_listener(self.on_live_sample)
-        self._state.is_recording = self._recording_manager.is_recording(self.feed_id)
-        if self._feed_runtime.is_connected():
+        for runtime in self._feed_runtimes:
+            runtime.add_live_frame_listener(self.on_new_live_frame)
+            runtime.add_live_overlay_listener(self.on_live_sample)
+        self._refresh_recording_state_locked()
+        if all(rt.is_connected() for rt in self._feed_runtimes):
             self.set_source_connected()
         else:
             self.set_source_lost("Unable to connect to source.")
 
     @property
     def feed_id(self) -> str:
-        """Return the selected feed identifier."""
-        return self._feed_runtime.feed.feed_id
+        """Return the primary feed identifier (session / status aggregation)."""
+        return self._primary_feed_id
 
     def pause_playback(self) -> None:
         """Pause only the viewed playback state."""
@@ -107,8 +114,8 @@ class PlaybackController:
             self._state.current_playback_mode = PlaybackMode.PAUSED
             self._state.error_message = None
             self._update_state_timestamps_locked()
-            selected_pause_ref = pause_ref
-        self._render_replay_frame(selected_pause_ref)
+            ts = base_timestamp
+        self._render_all_replay_at_timestamp(ts)
         self._emit_state("Playback paused")
 
     def rewind_10_seconds(self) -> None:
@@ -150,8 +157,8 @@ class PlaybackController:
             self._state.error_message = None
             self._start_replay_clock_locked(target_timestamp)
             self._update_state_timestamps_locked()
-            selected_replay_ref = replay_ref
-        self._render_replay_frame(selected_replay_ref)
+            ts = target_timestamp
+        self._render_all_replay_at_timestamp(ts)
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def jump_to_live(self) -> None:
@@ -166,9 +173,10 @@ class PlaybackController:
             )
             self._state.error_message = None
             self._update_state_timestamps_locked()
-            latest_live_frame = self._latest_live_frame
-        if latest_live_frame is not None:
-            self._output_renderer.show_frame(latest_live_frame)
+        for runtime in self._feed_runtimes:
+            frame = self._latest_live_by_feed.get(runtime.feed.feed_id)
+            if frame is not None:
+                self._output_renderer.show_frame(frame)
         self._emit_state("Returned to live")
 
     def set_playback_rate(self, playback_rate: float) -> None:
@@ -210,9 +218,9 @@ class PlaybackController:
             self._state.source_connected = True
             if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
                 self._state.current_playback_mode = PlaybackMode.LIVE
-            self._state.current_source_name = self._feed_runtime.get_source_name()
+            self._state.current_source_name = self._primary_runtime.get_source_name()
             self._state.error_message = None
-            self._sync_source_status_locked()
+            self._sync_all_source_status_locked()
             self._update_state_timestamps_locked()
             if self._state.warning_message:
                 status_message = self._state.warning_message
@@ -224,7 +232,7 @@ class PlaybackController:
             return self._state
 
     def get_display_frame(self) -> MediaFrame | None:
-        """Return the frame the UI should currently display."""
+        """Return the frame the UI should currently display (primary feed)."""
         with self._lock:
             if self._state.current_playback_mode == PlaybackMode.LIVE:
                 return self._latest_live_frame
@@ -241,34 +249,44 @@ class PlaybackController:
         """Update controller-owned playback state for a newly ingested live frame."""
         frame_overlay = FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id)
         with self._lock:
-            self._latest_live_frame = frame
-            self._latest_live_overlay = frame_overlay
-            self._latest_live_timestamp = frame_overlay.capture_timestamp
-            self._state.source_connected = True
-            self._state.current_source_name = frame_overlay.source_name
-            self._state.is_recording = self._recording_manager.is_recording(self.feed_id)
-            self._sync_source_status_locked()
-            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
+            self._latest_live_by_feed[frame.feed_id] = frame
+            all_connected = all(rt.is_connected() for rt in self._feed_runtimes)
+            self._state.source_connected = all_connected
+            if frame.feed_id == self._primary_feed_id:
+                self._latest_live_frame = frame
+                self._latest_live_overlay = frame_overlay
+                self._latest_live_timestamp = frame_overlay.capture_timestamp
+                self._state.current_source_name = frame_overlay.source_name
+                if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST and all_connected:
+                    self._state.current_playback_mode = PlaybackMode.LIVE
+                if self._state.current_playback_mode == PlaybackMode.LIVE:
+                    self._playback_timestamp = frame_overlay.capture_timestamp
+                    self._state.frame_overlay = frame_overlay
+            self._refresh_recording_state_locked()
+            self._sync_all_source_status_locked()
+            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST and all_connected:
                 self._state.current_playback_mode = PlaybackMode.LIVE
-            if self._state.current_playback_mode == PlaybackMode.LIVE:
-                self._playback_timestamp = frame_overlay.capture_timestamp
-                self._state.frame_overlay = frame_overlay
             self._update_state_timestamps_locked()
-            should_show_frame = self._state.current_playback_mode == PlaybackMode.LIVE
+            if self._live_only:
+                should_show_frame = True
+            else:
+                should_show_frame = self._state.current_playback_mode == PlaybackMode.LIVE
         if should_show_frame:
             self._output_renderer.show_frame(frame)
         self._emit_state()
 
     def on_live_sample(self, frame_overlay: FrameOverlayInfo) -> None:
         """Update controller-owned playback state from the live preview branch."""
+        if frame_overlay.feed_id != self._primary_feed_id:
+            return
         with self._lock:
             self._latest_live_overlay = frame_overlay
             self._latest_live_timestamp = frame_overlay.capture_timestamp
-            self._state.source_connected = True
+            self._state.source_connected = all(rt.is_connected() for rt in self._feed_runtimes)
             self._state.current_source_name = frame_overlay.source_name
-            self._state.is_recording = self._recording_manager.is_recording(self.feed_id)
-            self._sync_source_status_locked()
-            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
+            self._refresh_recording_state_locked()
+            self._sync_all_source_status_locked()
+            if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST and self._state.source_connected:
                 self._state.current_playback_mode = PlaybackMode.LIVE
             if self._state.current_playback_mode == PlaybackMode.LIVE:
                 self._playback_timestamp = frame_overlay.capture_timestamp
@@ -276,14 +294,22 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._emit_state()
 
+    def _refresh_recording_state_locked(self) -> None:
+        if len(self._feed_runtimes) > 1:
+            self._state.is_recording = self._recording_manager.is_any_recording()
+        else:
+            self._state.is_recording = self._recording_manager.is_recording(self._primary_feed_id)
+
     def _emit_state(self, status_message: str | None = None) -> None:
         self.signals.state_changed.emit(self._state)
         if status_message:
             self.signals.status_message.emit(status_message)
 
-    def _sync_source_status_locked(self) -> None:
-        self._state.warning_message = self._feed_runtime.get_status_message()
-        self._state.ingest_telemetry = self._feed_runtime.get_ingest_telemetry()
+    def _sync_all_source_status_locked(self) -> None:
+        parts = [rt.get_status_message() for rt in self._feed_runtimes]
+        messages = [m for m in parts if m]
+        self._state.warning_message = " | ".join(messages) if messages else None
+        self._state.ingest_telemetry = self._primary_runtime.get_ingest_telemetry()
 
     def _start_replay_clock_locked(self, playback_timestamp: float) -> None:
         self._replay_clock_anchor_timestamp = playback_timestamp
@@ -323,7 +349,8 @@ class PlaybackController:
             self._display_replay_ref = replay_ref
             self._state.error_message = None
             self._update_state_timestamps_locked()
-        self._render_replay_frame(replay_ref)
+            ts = target_timestamp
+        self._render_all_replay_at_timestamp(ts)
         self._emit_state()
 
     def _on_overlay_timer_tick(self) -> None:
@@ -382,7 +409,14 @@ class PlaybackController:
             return self._state.error_message or "Waiting for the selected source"
         return self._state.warning_message
 
-    def _render_replay_frame(self, replay_ref: ReplayFrameRef) -> None:
-        frame = self._replay_buffer.get_frame_at_or_before(replay_ref.timestamp)
-        if frame is not None:
-            self._output_renderer.show_frame(frame)
+    def _render_all_replay_at_timestamp(self, timestamp: float) -> None:
+        """Draw each feed at the same logical timeline position (primary clock)."""
+        for runtime in self._feed_runtimes:
+            feed_id = runtime.feed.feed_id
+            buf = self._replay_store_manager.get(feed_id)
+            ref = buf.get_frame_ref_at_or_before(timestamp)
+            if ref is None:
+                continue
+            frame = buf.get_frame_at_or_before(ref.timestamp)
+            if frame is not None:
+                self._output_renderer.show_frame(frame)
