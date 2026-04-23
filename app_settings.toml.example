@@ -31,7 +31,7 @@ camera_index = 1
 feed_id = "ndi_1"
 display_name = "NDI Program"
 kind = "ndi"
-ndi_name = "OBS PGM"
+ndi_name = "DAVIDI7 (Test Pattern)"
 
 [source]
 # Used only when no [[feeds]] entries are defined.
