@@ -2,6 +2,8 @@
 
 Windows desktop proof of concept for live sports replay using Python and PySide6, with a temporary OpenCV-based vertical slice for webcam capture, recording, and replay.
 
+**Developing on Windows:** the media layer uses GStreamer through PyGObject, which is easiest to satisfy with a coherent MSYS2 **UCRT64** Python and GStreamer stack. If you are hitting import or DLL issues outside that environment, read [docs/UCRT64_DEVELOPMENT.md](docs/UCRT64_DEVELOPMENT.md).
+
 ## Run
 
 1. Create and activate a virtual environment:
