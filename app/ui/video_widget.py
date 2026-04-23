@@ -46,10 +46,8 @@ class VideoWidget(QWidget):
             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
         )
         self._playback_overlay_label.setWordWrap(True)
-        self._playback_overlay_label.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self._playback_overlay_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._playback_overlay_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._playback_overlay_label.winId()
         self._playback_overlay_label.hide()
 
         self._display_resolution_label = QLabel(self._surface_stack_host)
@@ -218,10 +216,14 @@ class VideoWidget(QWidget):
     def _layout_playback_overlay(self) -> None:
         if self._playback_overlay_label.text() == "":
             return
-        margin = 18
+        side_margin = 18
+        top_margin = 80
         self._playback_overlay_label.adjustSize()
         overlay_width = self._playback_overlay_label.width()
-        overlay_height = self._playback_overlay_label.height()
-        x_position = max(margin, self._surface_stack_host.width() - overlay_width - margin)
-        self._playback_overlay_label.move(x_position, margin)
+        # adjustSize() under-reports height for wrapped multi-line QLabels; use
+        # heightForWidth when available so the first line isn't clipped.
+        hfw = self._playback_overlay_label.heightForWidth(overlay_width)
+        overlay_height = max(self._playback_overlay_label.height(), hfw)
+        x_position = max(side_margin, self._surface_stack_host.width() - overlay_width - side_margin)
+        self._playback_overlay_label.move(x_position, top_margin)
         self._playback_overlay_label.resize(overlay_width, overlay_height)

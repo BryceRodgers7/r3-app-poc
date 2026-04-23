@@ -4,6 +4,8 @@ Windows desktop proof of concept for live sports replay using Python and PySide6
 
 **Developing on Windows:** the media layer uses GStreamer through PyGObject, which is easiest to satisfy with a coherent MSYS2 **UCRT64** Python and GStreamer stack. If you are hitting import or DLL issues outside that environment, read [docs/UCRT64_DEVELOPMENT.md](docs/UCRT64_DEVELOPMENT.md).
 
+**Enabling NDI sources:** the `ndi` source kind is served by GStreamer's `ndisrc` element from `gst-plugins-rs`, plus the NewTek NDI runtime. For step-by-step install and configuration (including the full `HOSTNAME (Source)` form that `ndi_name` requires), see [docs/NDI_SETUP.md](docs/NDI_SETUP.md).
+
 ## Run
 
 1. Create and activate a virtual environment:
