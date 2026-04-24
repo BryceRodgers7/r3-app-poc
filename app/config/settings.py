@@ -32,6 +32,8 @@ class AppSettings:
     replay_buffer_jpeg_quality: int = 80
     recording_filename: str = "session_recording.mp4"
     recording_manifest_filename: str = "recording_manifest.json"
+    short_segments_subdir: str = "segments"
+    short_segment_filename_prefix: str = "segment"
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -75,6 +77,10 @@ class AppSettings:
             settings.recording_filename = str(app_config["recording_filename"])
         if "recording_manifest_filename" in app_config:
             settings.recording_manifest_filename = str(app_config["recording_manifest_filename"])
+        if "short_segments_subdir" in app_config:
+            settings.short_segments_subdir = str(app_config["short_segments_subdir"])
+        if "short_segment_filename_prefix" in app_config:
+            settings.short_segment_filename_prefix = str(app_config["short_segment_filename_prefix"])
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])

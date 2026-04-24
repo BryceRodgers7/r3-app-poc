@@ -69,9 +69,6 @@ class _FakePipelineManager:
     def start_replay_buffer(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
         self._replay_store.start(session_paths, feed_id=feed_id or self._feed_id)
 
-    def start_recording(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
-        del session_paths, feed_id
-
     def start_preview(self) -> None:
         return
 
@@ -108,10 +105,13 @@ class _FakeRenderer(OutputRenderer):
 
 class _FakeRecorder:
     def is_recording(self) -> bool:
-        return True
+        return False
 
     def stop(self) -> None:
         return
+
+    def advance_short_segment(self) -> bool:
+        return False
 
 
 class PlaybackControllerTests(unittest.TestCase):
@@ -280,6 +280,10 @@ class PlaybackControllerTests(unittest.TestCase):
         new_frames = renderer.frames[n_before:]
         self.assertGreaterEqual(len(new_frames), 2)
         self.assertEqual({f.feed_id for f in new_frames[-2:]}, {self.feed.feed_id, feed_b.feed_id})
+
+    def test_refresh_recording_state_emits(self) -> None:
+        self.controller.refresh_recording_state()
+        self.assertFalse(self.controller.get_state().is_recording)
 
 
 if __name__ == "__main__":

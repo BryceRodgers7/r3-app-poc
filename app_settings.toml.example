@@ -10,6 +10,9 @@ target_frame_width = 640
 target_frame_height = 360
 target_fps = 15.0
 replay_buffer_seconds = 120
+# recording_filename = "session_recording.mp4"
+# short_segments_subdir = "segments"
+# short_segment_filename_prefix = "segment"
 
 # Multi-feed (up to 8 enabled feeds). When present, [[feeds]] replaces the single [source] block below.
 # Mix USB/webcam rows (kind = "auto") and NDI rows (kind = "ndi", ndi_name required).

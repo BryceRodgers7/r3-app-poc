@@ -39,7 +39,6 @@ class FeedRuntime:
         self.pipeline_manager.set_live_sample_callback(self._on_live_overlay)
         connected = self.pipeline_manager.connect_source()
         self.pipeline_manager.start_replay_buffer(session_paths, feed_id=self.feed.feed_id)
-        self.pipeline_manager.start_recording(session_paths, feed_id=self.feed.feed_id)
         self.pipeline_manager.start_preview()
         self._started = True
         return connected

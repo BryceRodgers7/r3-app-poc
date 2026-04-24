@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMainWindow, QStatusBar, QVBoxLayout, QWidget
 
 from app.config.settings import AppSettings
+
+if TYPE_CHECKING:
+    from app.core.application_coordinator import ApplicationCoordinator
 from app.core.app_state import AppState
 from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
@@ -28,6 +33,7 @@ class MainWindow(QMainWindow):
         window_title: str | None = None,
         show_controls: bool = True,
         program_live_only: bool = False,
+        application_coordinator: ApplicationCoordinator | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -35,6 +41,7 @@ class MainWindow(QMainWindow):
         self._output_renderer = output_renderer
         self._show_controls = show_controls
         self._program_live_only = program_live_only
+        self._application_coordinator = application_coordinator
 
         self.setWindowTitle(window_title or settings.window_title)
         self.resize(1280, 860)
@@ -75,6 +82,13 @@ class MainWindow(QMainWindow):
                 lambda: self._controller.set_playback_rate(0.25)
             )
             self.controls_widget.live_requested.connect(self._controller.jump_to_live)
+            if self._application_coordinator is not None:
+                self.controls_widget.long_recording_toggle_requested.connect(
+                    self._application_coordinator.toggle_long_session_recording
+                )
+                self.controls_widget.short_segment_advance_requested.connect(
+                    self._application_coordinator.advance_short_segments
+                )
         self._controller.signals.state_changed.connect(self._render_state)
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
 
@@ -93,6 +107,12 @@ class MainWindow(QMainWindow):
         if not show_embedded_video:
             placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
             self.video_panel.set_global_placeholder(placeholder_text)
+
+        if self.controls_widget is not None:
+            self.controls_widget.next_clip_button.setEnabled(state.is_recording)
+            self.controls_widget.long_recording_button.setText(
+                "Stop game recording" if state.is_recording else "Start game recording"
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release widget bindings when the window closes."""

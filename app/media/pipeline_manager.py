@@ -101,16 +101,20 @@ class PipelineManager:
         if self._active_video_output == "live":
             self._set_branch_enabled("preview", True)
 
-    def start_recording(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
-        """Start the full-session recording branch."""
-        self._recorder.start(
+    def enable_file_recording(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
+        """Start writing long session capture; record tee branch stays open for flow control."""
+        self._recorder.begin_long_recording(
             session_paths=session_paths,
             source_name=self._source.get_display_name(),
             fps_hint=self._source.get_nominal_fps(),
             feed_id=feed_id or self._source.get_feed_id(),
         )
         self._recording_running = True
-        self._set_branch_enabled("record", True)
+
+    def disable_file_recording(self) -> None:
+        """Stop writing to disk; keep draining the record branch so preview is not stalled."""
+        self._recording_running = False
+        self._recorder.end_long_recording()
 
     def start_replay_buffer(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
         """Start the rolling replay buffer branch."""
@@ -124,12 +128,6 @@ class PipelineManager:
         """Stop only the preview branch."""
         self._preview_running = False
         self._set_branch_enabled("preview", False)
-
-    def stop_recording(self) -> None:
-        """Stop only the recording branch."""
-        self._recording_running = False
-        self._set_branch_enabled("record", False)
-        self._recorder.stop()
 
     def stop_replay_buffer(self) -> None:
         """Stop only the rolling replay buffer branch."""
@@ -179,6 +177,9 @@ class PipelineManager:
             self._ensure_gstreamer_loaded()
             self._build_pipeline()
             self._start_pipeline_threads()
+            # Keep the record branch draining the tee even when not writing to disk; closing
+            # it can block preroll and stall preview/replay on multi-branch pipelines.
+            self._set_branch_enabled("record", True)
         except Exception:
             self._teardown_pipeline()
             self._source.disconnect_source()

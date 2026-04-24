@@ -51,6 +51,7 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
         window_title=settings.operator_window_title,
         show_controls=True,
         program_live_only=False,
+        application_coordinator=coordinator,
     )
     program_window = MainWindow(
         settings=settings,

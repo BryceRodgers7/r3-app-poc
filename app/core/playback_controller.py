@@ -231,6 +231,12 @@ class PlaybackController:
         with self._lock:
             return self._state
 
+    def refresh_recording_state(self) -> None:
+        """Re-read recording flags from the recording manager and notify listeners."""
+        with self._lock:
+            self._refresh_recording_state_locked()
+        self._emit_state()
+
     def get_display_frame(self) -> MediaFrame | None:
         """Return the frame the UI should currently display (primary feed)."""
         with self._lock:

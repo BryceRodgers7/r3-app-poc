@@ -63,6 +63,34 @@ class ApplicationCoordinator:
         )
         self._session_started = False
 
+    def toggle_long_session_recording(self) -> None:
+        """Start or stop game-length recording on every feed (operator control)."""
+        session_paths = self._session_manager.get_active_session_paths()
+        if session_paths is None:
+            self.operator_controller.signals.status_message.emit("No active session; cannot record.")
+            return
+        if self._recording_manager.is_any_recording():
+            for runtime in self._feed_runtimes.values():
+                runtime.pipeline_manager.disable_file_recording()
+            self.operator_controller.refresh_recording_state()
+            self.program_controller.refresh_recording_state()
+            self.operator_controller.signals.status_message.emit("Game recording stopped.")
+            return
+        for runtime in self._feed_runtimes.values():
+            runtime.pipeline_manager.enable_file_recording(session_paths, feed_id=runtime.feed.feed_id)
+        self.operator_controller.refresh_recording_state()
+        self.program_controller.refresh_recording_state()
+        self.operator_controller.signals.status_message.emit("Game recording started.")
+
+    def advance_short_segments(self) -> None:
+        """Close the current rally clip and start the next on every feed."""
+        if not self._recording_manager.is_any_recording():
+            self.operator_controller.signals.status_message.emit("Start game recording before starting a clip.")
+            return
+        for runtime in self._feed_runtimes.values():
+            runtime.recorder.advance_short_segment()
+        self.operator_controller.signals.status_message.emit("Started next clip.")
+
     def initialize(self) -> None:
         """Start storage, ingest, and playback sessions."""
         if self._session_started:
