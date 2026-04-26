@@ -67,6 +67,46 @@ class MediaFrame:
 
 
 @dataclass(slots=True, frozen=True)
+class AudioFormat:
+    """PCM audio characteristics used by the transitional audio tee."""
+
+    sample_rate: int = 48_000
+    channels: int = 2
+    sample_format: str = "S16LE"
+
+    @property
+    def bytes_per_sample(self) -> int:
+        """Return bytes per sample for the configured PCM format."""
+        if self.sample_format.upper() != "S16LE":
+            raise ValueError(f"Unsupported audio sample format: {self.sample_format}")
+        return 2
+
+    @property
+    def bytes_per_frame(self) -> int:
+        """Return bytes for one interleaved sample frame."""
+        return self.channels * self.bytes_per_sample
+
+
+@dataclass(slots=True, frozen=True)
+class AudioChunk:
+    """Timestamped source-embedded PCM audio delivered through the audio tee."""
+
+    timestamp: float
+    data: bytes
+    format: AudioFormat
+    source_name: str
+    feed_id: str = "default"
+
+    @property
+    def duration_seconds(self) -> float:
+        """Return the chunk duration based on byte count and PCM format."""
+        bytes_per_frame = self.format.bytes_per_frame
+        if bytes_per_frame <= 0 or self.format.sample_rate <= 0:
+            return 0.0
+        return len(self.data) / float(bytes_per_frame * self.format.sample_rate)
+
+
+@dataclass(slots=True, frozen=True)
 class FrameOverlayInfo:
     """Immutable metadata that describes a captured frame.
 

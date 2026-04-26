@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from app.config.settings import AppSettings
-from app.core.models import FeedDefinition, IngestTelemetry, MediaFrame
+from app.core.models import AudioChunk, AudioFormat, FeedDefinition, IngestTelemetry, MediaFrame
 from app.media.gstreamer_camera_source import GStreamerCameraSource
 from app.media.ndi_receiver import NDIReceiver
 from app.media.source_interface import SourceInterface
@@ -63,6 +63,24 @@ class PreferredSourceChain(SourceInterface):
     def read_frame(self) -> MediaFrame | None:
         """Read the next frame from the selected source."""
         return self._active().read_frame()
+
+    def supports_embedded_audio(self) -> bool:
+        """Return whether the selected source exposes embedded audio."""
+        if self._active_source is None:
+            return any(source.supports_embedded_audio() for source in self._sources)
+        return self._active_source.supports_embedded_audio()
+
+    def get_audio_format(self) -> AudioFormat | None:
+        """Return embedded audio format for the selected source."""
+        if self._active_source is None:
+            return None
+        return self._active_source.get_audio_format()
+
+    def read_audio_chunk(self) -> AudioChunk | None:
+        """Read embedded audio from the selected source."""
+        if self._active_source is None:
+            return None
+        return self._active_source.read_audio_chunk()
 
     def get_frame_size(self) -> tuple[int, int]:
         """Return the selected source frame size."""

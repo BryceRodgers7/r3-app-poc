@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from fractions import Fraction
 import importlib
 import logging
+from pathlib import Path
 import threading
 import time
 from typing import Any
 
 import numpy as np
 
-from app.core.models import FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
+from app.core.models import AudioChunk, AudioFormat, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
 from app.media.frame_overlay import render_frame_overlay
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
@@ -46,11 +47,15 @@ class PipelineManager:
         preview_output: PreviewOutput,
         recorder: Recorder,
         replay_buffer: ReplayStore,
+        audio_enabled: bool = True,
+        live_audio_monitor_enabled: bool = True,
     ) -> None:
         self._source = source
         self._preview_output = preview_output
         self._recorder = recorder
         self._replay_buffer = replay_buffer
+        self._audio_enabled = audio_enabled
+        self._live_audio_monitor_enabled = live_audio_monitor_enabled
         self._preview_running = False
         self._recording_running = False
         self._replay_running = False
@@ -60,12 +65,18 @@ class PipelineManager:
         self._GstVideo: Any | None = None
         self._pipeline: Any | None = None
         self._appsrc: Any | None = None
+        self._audio_appsrc: Any | None = None
         self._bus: Any | None = None
         self._replay_pipeline: Any | None = None
         self._replay_source: Any | None = None
         self._replay_bus: Any | None = None
+        self._replay_audio_pipeline: Any | None = None
+        self._replay_audio_source: Any | None = None
+        self._replay_audio_bus: Any | None = None
         self._tee_request_pads: list[Any] = []
+        self._audio_tee_request_pads: list[Any] = []
         self._branch_valves: dict[str, Any] = {}
+        self._audio_branch_valves: dict[str, Any] = {}
         self._preview_sink: Any | None = None
         self._preview_sink_factory_name: str | None = None
         self._replay_sink: Any | None = None
@@ -76,11 +87,14 @@ class PipelineManager:
         self._active_video_output = "live"
 
         self._frame_feed_thread: threading.Thread | None = None
+        self._audio_feed_thread: threading.Thread | None = None
         self._bus_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._pipeline_lock = threading.Lock()
 
         self._frame_duration_ns = 0
+        self._audio_format: AudioFormat | None = None
+        self._audio_stream_start_timestamp: float | None = None
         self._stream_start_timestamp: float | None = None
         self._frame_metadata: OrderedDict[int, _FrameMetadata] = OrderedDict()
         self._metadata_lock = threading.Lock()
@@ -89,8 +103,10 @@ class PipelineManager:
     def describe_architecture(self) -> str:
         """Describe the current transitional tee/fan-out architecture."""
         return (
-            "SourceInterface.read_frame -> appsrc -> videoconvert -> tee -> "
+            "SourceInterface.read_frame -> video appsrc -> videoconvert -> tee -> "
             "[preview embedded video sink, recording appsink, replay appsink] + "
+            "SourceInterface.read_audio_chunk -> audio appsrc -> tee -> "
+            "[live audio sink, recording appsink, replay appsink] + "
             "rolling replay store -> native replay source -> embedded replay sink"
         )
 
@@ -154,6 +170,10 @@ class PipelineManager:
         if self._frame_feed_thread is not None:
             self._frame_feed_thread.join(timeout=2.0)
             self._frame_feed_thread = None
+
+        if self._audio_feed_thread is not None:
+            self._audio_feed_thread.join(timeout=2.0)
+            self._audio_feed_thread = None
 
         if self._bus_thread is not None:
             self._bus_thread.join(timeout=2.0)
@@ -241,15 +261,16 @@ class PipelineManager:
         with self._pipeline_lock:
             if self._replay_pipeline is None or self._replay_source is None:
                 raise RuntimeError("Replay playback pipeline is not available.")
-            location_pattern = self._replay_buffer.get_multifile_location_pattern()
-            if location_pattern is None:
+            segment = self._replay_buffer.get_media_segment_at_or_before(frame_ref.timestamp)
+            if segment is None:
                 raise RuntimeError("Replay storage is not ready for native playback.")
 
             self._active_video_output = "replay"
             self._set_branch_enabled("preview", False)
             self._configure_replay_source_locked(
-                location_pattern=location_pattern,
-                start_index=frame_ref.sequence_index,
+                media_path=segment.media_path,
+                segment_start_timestamp=segment.start_timestamp,
+                playback_timestamp=frame_ref.timestamp,
                 paused=paused,
             )
             self._bind_active_video_sink_locked()
@@ -277,32 +298,38 @@ class PipelineManager:
         return self._source.get_ingest_telemetry()
 
     def _configure_replay_source(self) -> None:
-        with self._pipeline_lock:
-            location_pattern = self._replay_buffer.get_multifile_location_pattern()
-            if location_pattern is None or self._replay_source is None:
-                return
-            self._set_property_if_supported(self._replay_source, "location", location_pattern)
-            self._set_property_if_supported(self._replay_source, "index", 0)
-        LOGGER.info("Configured native replay source pattern: %s", location_pattern)
+        """Replay source is selected per requested timestamp for muxed segments."""
+        return
 
     def _configure_replay_source_locked(
         self,
-        location_pattern: str,
-        start_index: int,
+        media_path: Any,
+        segment_start_timestamp: float,
+        playback_timestamp: float,
         paused: bool,
     ) -> None:
         if self._replay_pipeline is None or self._replay_source is None:
             return
 
         self._replay_pipeline.set_state(self._Gst.State.READY)
-        self._set_property_if_supported(self._replay_source, "location", location_pattern)
-        self._set_property_if_supported(self._replay_source, "index", max(start_index, 0))
-        self._set_property_if_supported(self._replay_source, "start-index", max(start_index, 0))
+        uri = Path(media_path).resolve().as_uri()
+        self._set_property_if_supported(self._replay_source, "uri", uri)
         target_state = self._Gst.State.PAUSED if paused else self._Gst.State.PLAYING
         self._replay_pipeline.set_state(target_state)
+
+        offset_seconds = max(0.0, playback_timestamp - segment_start_timestamp)
+        if offset_seconds > 0.0:
+            try:
+                self._replay_pipeline.seek_simple(
+                    self._Gst.Format.TIME,
+                    self._Gst.SeekFlags.FLUSH | self._Gst.SeekFlags.KEY_UNIT,
+                    int(offset_seconds * self._Gst.SECOND),
+                )
+            except Exception:
+                LOGGER.debug("Replay segment seek failed for %s", media_path, exc_info=True)
         LOGGER.info(
-            "Replay source seeked to index=%s target_state=%s",
-            start_index,
+            "Replay source configured for %s target_state=%s",
+            media_path,
             target_state.value_nick if hasattr(target_state, "value_nick") else target_state,
         )
 
@@ -368,7 +395,9 @@ class PipelineManager:
                 self._bus.enable_sync_message_emission()
                 self._bus.connect("sync-message::element", self._on_bus_sync_message)
             self._tee_request_pads.clear()
+            self._audio_tee_request_pads.clear()
             self._branch_valves.clear()
+            self._audio_branch_valves.clear()
             self._preview_sink = None
             self._preview_sink_factory_name = None
             self._replay_sink = None
@@ -380,7 +409,9 @@ class PipelineManager:
             self._add_branch("preview", self._on_preview_sample)
             self._add_branch("record", self._on_record_sample)
             self._add_branch("replay", self._on_replay_sample)
+            self._build_audio_path_locked()
             self._build_replay_pipeline(width=width, height=height, fps_fraction=fps_fraction)
+            self._build_replay_audio_pipeline()
 
             state_change = pipeline.set_state(Gst.State.PLAYING)
             if state_change == Gst.StateChangeReturn.FAILURE:
@@ -389,6 +420,10 @@ class PipelineManager:
                 replay_state_change = self._replay_pipeline.set_state(Gst.State.READY)
                 if replay_state_change == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError("Failed to move the replay playback pipeline to READY.")
+            if self._replay_audio_pipeline is not None:
+                replay_audio_state_change = self._replay_audio_pipeline.set_state(Gst.State.READY)
+                if replay_audio_state_change == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("Failed to move the replay audio pipeline to READY.")
 
     def _add_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
         assert self._pipeline is not None
@@ -473,39 +508,151 @@ class PipelineManager:
         self._preview_sink = sink
         self._preview_sink_factory_name = "appsink-preview"
 
+    def _build_audio_path_locked(self) -> None:
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        audio_format = self._source.get_audio_format()
+        if not self._audio_enabled or not self._source.supports_embedded_audio() or audio_format is None:
+            self._audio_format = None
+            self._audio_appsrc = None
+            return
+
+        self._audio_format = audio_format
+        appsrc = self._make_element("appsrc", "audio_appsrc")
+        convert = self._make_element("audioconvert", "audio_convert")
+        resample = self._make_element("audioresample", "audio_resample")
+        tee = self._make_element("tee", "audio_tee")
+
+        appsrc.set_property("is-live", True)
+        appsrc.set_property("format", Gst.Format.TIME)
+        appsrc.set_property("block", True)
+        appsrc.set_property("do-timestamp", False)
+        appsrc.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                "audio/x-raw,"
+                f"format={audio_format.sample_format},"
+                f"rate={audio_format.sample_rate},"
+                f"channels={audio_format.channels},"
+                "layout=interleaved"
+            ),
+        )
+
+        self._pipeline.add(appsrc)
+        self._pipeline.add(convert)
+        self._pipeline.add(resample)
+        self._pipeline.add(tee)
+        if not appsrc.link(convert) or not convert.link(resample) or not resample.link(tee):
+            raise RuntimeError("Failed to link the GStreamer audio source path.")
+
+        self._audio_appsrc = appsrc
+        self._add_live_audio_branch()
+        self._add_audio_appsink_branch("record", self._on_record_audio_sample)
+        self._add_audio_appsink_branch("replay", self._on_replay_audio_sample)
+
+    def _add_live_audio_branch(self) -> None:
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", "audio_preview_queue")
+        valve = self._make_element("valve", "audio_preview_valve")
+        convert = self._make_element("audioconvert", "audio_preview_convert")
+        resample = self._make_element("audioresample", "audio_preview_resample")
+        sink, _sink_name = self._make_audio_sink("audio_preview_sink")
+
+        valve.set_property("drop", True)
+        self._set_property_if_supported(sink, "sync", False)
+
+        self._pipeline.add(queue)
+        self._pipeline.add(valve)
+        self._pipeline.add(convert)
+        self._pipeline.add(resample)
+        self._pipeline.add(sink)
+        if not queue.link(valve) or not valve.link(convert) or not convert.link(resample) or not resample.link(sink):
+            raise RuntimeError("Failed to link the live audio branch.")
+
+        tee_src_pad = self._request_audio_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link audio tee output to the live audio branch.")
+
+        for element in (queue, valve, convert, resample, sink):
+            element.sync_state_with_parent()
+        self._audio_branch_valves["preview"] = valve
+
+    def _add_audio_appsink_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", f"audio_{branch_name}_queue")
+        valve = self._make_element("valve", f"audio_{branch_name}_valve")
+        sink = self._make_element("appsink", f"audio_{branch_name}_sink")
+
+        valve.set_property("drop", True)
+        sink.set_property("emit-signals", True)
+        sink.set_property("sync", False)
+        sink.set_property("max-buffers", 32)
+        sink.connect("new-sample", sample_handler)
+
+        self._pipeline.add(queue)
+        self._pipeline.add(valve)
+        self._pipeline.add(sink)
+        if not queue.link(valve) or not valve.link(sink):
+            raise RuntimeError(f"Failed to link the {branch_name} audio branch.")
+
+        tee_src_pad = self._request_audio_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"Failed to link audio tee output to the {branch_name} branch.")
+
+        queue.sync_state_with_parent()
+        valve.sync_state_with_parent()
+        sink.sync_state_with_parent()
+        self._audio_branch_valves[branch_name] = valve
+
     def _build_replay_pipeline(self, width: int, height: int, fps_fraction: Fraction) -> None:
         assert self._Gst is not None
 
         replay_pipeline = self._Gst.Pipeline.new("sports-replay-display-pipeline")
-        replay_source = self._make_element("multifilesrc", "replay_source")
-        replay_caps = self._make_element("capsfilter", "replay_caps")
-        replay_decoder = self._make_element("jpegdec", "replay_decoder")
+        replay_source = self._make_element("uridecodebin", "replay_source")
+        replay_video_queue = self._make_element("queue", "replay_video_queue")
         replay_convert = self._make_element("videoconvert", "replay_convert")
+        replay_audio_queue = self._make_element("queue", "replay_audio_queue")
+        replay_audio_convert = self._make_element("audioconvert", "replay_audio_convert")
+        replay_audio_resample = self._make_element("audioresample", "replay_audio_resample")
         replay_sink, replay_sink_factory_name = self._make_video_sink("replay_sink")
+        replay_audio_sink, _replay_audio_sink_name = self._make_audio_sink("replay_audio_sink")
 
-        replay_source.set_property("loop", False)
-        replay_caps.set_property(
-            "caps",
-            self._Gst.Caps.from_string(
-                f"image/jpeg,framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
-            ),
-        )
         self._set_property_if_supported(replay_sink, "sync", False)
         self._set_property_if_supported(replay_sink, "qos", True)
         self._set_property_if_supported(replay_sink, "force-aspect-ratio", True)
+        self._set_property_if_supported(replay_audio_sink, "sync", False)
 
         replay_pipeline.add(replay_source)
-        replay_pipeline.add(replay_caps)
-        replay_pipeline.add(replay_decoder)
+        replay_pipeline.add(replay_video_queue)
         replay_pipeline.add(replay_convert)
+        replay_pipeline.add(replay_audio_queue)
+        replay_pipeline.add(replay_audio_convert)
+        replay_pipeline.add(replay_audio_resample)
         replay_pipeline.add(replay_sink)
-        if (
-            not replay_source.link(replay_caps)
-            or not replay_caps.link(replay_decoder)
-            or not replay_decoder.link(replay_convert)
-            or not replay_convert.link(replay_sink)
-        ):
+        replay_pipeline.add(replay_audio_sink)
+        if not replay_video_queue.link(replay_convert) or not replay_convert.link(replay_sink):
             raise RuntimeError("Failed to link the replay playback pipeline.")
+        if (
+            not replay_audio_queue.link(replay_audio_convert)
+            or not replay_audio_convert.link(replay_audio_resample)
+            or not replay_audio_resample.link(replay_audio_sink)
+        ):
+            raise RuntimeError("Failed to link the replay audio path.")
+        replay_source.connect(
+            "pad-added",
+            self._on_replay_decodebin_pad_added,
+            (replay_video_queue, replay_audio_queue),
+        )
 
         self._replay_pipeline = replay_pipeline
         self._replay_source = replay_source
@@ -516,6 +663,22 @@ class PipelineManager:
         self._replay_sink = replay_sink
         self._replay_sink_factory_name = replay_sink_factory_name
         self._bind_active_video_sink_locked()
+
+    def _build_replay_audio_pipeline(self) -> None:
+        """Muxed replay uses the main replay decode pipeline for audio and video."""
+        return
+
+    def _on_replay_decodebin_pad_added(self, _decodebin: Any, pad: Any, targets: tuple[Any, Any]) -> None:
+        video_queue, audio_queue = targets
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        caps_name = ""
+        if caps is not None and caps.get_size() > 0:
+            caps_name = caps.get_structure(0).get_name()
+        target = audio_queue if caps_name.startswith("audio/") else video_queue
+        sink_pad = target.get_static_pad("sink")
+        if sink_pad is None or sink_pad.is_linked():
+            return
+        pad.link(sink_pad)
 
     def _request_tee_pad(self) -> Any:
         assert self._pipeline is not None
@@ -529,6 +692,20 @@ class PipelineManager:
             raise RuntimeError("Failed to request a tee source pad.")
 
         self._tee_request_pads.append(request_pad)
+        return request_pad
+
+    def _request_audio_tee_pad(self) -> Any:
+        assert self._pipeline is not None
+        tee = self._pipeline.get_by_name("audio_tee")
+        assert tee is not None
+
+        request_pad = tee.request_pad_simple("src_%u")
+        if request_pad is None:
+            request_pad = tee.get_request_pad("src_%u")
+        if request_pad is None:
+            raise RuntimeError("Failed to request an audio tee source pad.")
+
+        self._audio_tee_request_pads.append(request_pad)
         return request_pad
 
     def _make_element(self, factory_name: str, element_name: str) -> Any:
@@ -557,6 +734,22 @@ class PipelineManager:
             "Tried d3d11videosink, glimagesink, and d3dvideosink."
         )
 
+    def _make_audio_sink(self, element_name: str) -> tuple[Any, str]:
+        Gst = self._Gst
+        assert Gst is not None
+
+        for factory_name in ("wasapisink", "directsoundsink", "autoaudiosink", "fakesink"):
+            if Gst.ElementFactory.find(factory_name) is None:
+                continue
+            sink = Gst.ElementFactory.make(factory_name, element_name)
+            if sink is not None:
+                LOGGER.info("Selected audio sink %s for %s", factory_name, element_name)
+                return sink, factory_name
+
+        raise RuntimeError(
+            "Failed to create an audio sink. Tried wasapisink, directsoundsink, autoaudiosink, and fakesink."
+        )
+
     def _set_property_if_supported(self, element: Any, property_name: str, value: Any) -> None:
         try:
             element.set_property(property_name, value)
@@ -575,6 +768,14 @@ class PipelineManager:
                 daemon=True,
             )
             self._frame_feed_thread.start()
+
+            if self._audio_appsrc is not None and self._audio_feed_thread is None:
+                self._audio_feed_thread = threading.Thread(
+                    target=self._feed_audio_appsrc_loop,
+                    name="gst-audio-appsrc-feed",
+                    daemon=True,
+                )
+                self._audio_feed_thread.start()
 
             self._bus_thread = threading.Thread(
                 target=self._monitor_bus_loop,
@@ -623,6 +824,32 @@ class PipelineManager:
                 )
                 break
 
+    def _feed_audio_appsrc_loop(self) -> None:
+        Gst = self._Gst
+        assert Gst is not None
+
+        while not self._stop_event.is_set():
+            if self._audio_appsrc is None:
+                break
+            chunk = self._source.read_audio_chunk()
+            if chunk is None:
+                time.sleep(0.005)
+                continue
+
+            gst_buffer = Gst.Buffer.new_allocate(None, len(chunk.data), None)
+            gst_buffer.fill(0, chunk.data)
+            if self._audio_stream_start_timestamp is None:
+                self._audio_stream_start_timestamp = chunk.timestamp
+            running_timestamp = max(0.0, chunk.timestamp - self._audio_stream_start_timestamp)
+            gst_buffer.pts = int(running_timestamp * Gst.SECOND)
+            gst_buffer.dts = gst_buffer.pts
+            gst_buffer.duration = int(chunk.duration_seconds * Gst.SECOND)
+
+            flow_return = self._audio_appsrc.emit("push-buffer", gst_buffer)
+            if flow_return != Gst.FlowReturn.OK and not self._stop_event.is_set():
+                LOGGER.warning("GStreamer audio source push failed: %s", flow_return)
+                break
+
     def _monitor_bus_loop(self) -> None:
         Gst = self._Gst
         assert Gst is not None
@@ -642,6 +869,14 @@ class PipelineManager:
                 interesting_messages,
                 0,
                 pipeline_name="replay",
+                fatal=False,
+            ):
+                break
+            if self._poll_bus_for_messages(
+                self._replay_audio_bus,
+                interesting_messages,
+                0,
+                pipeline_name="replay-audio",
                 fatal=False,
             ):
                 break
@@ -699,6 +934,12 @@ class PipelineManager:
         valve = self._branch_valves.get(branch_name)
         if valve is not None:
             valve.set_property("drop", not enabled)
+        audio_valve = self._audio_branch_valves.get(branch_name)
+        if audio_valve is not None:
+            audio_enabled = enabled
+            if branch_name == "preview":
+                audio_enabled = enabled and self._live_audio_monitor_enabled and self._active_video_output == "live"
+            audio_valve.set_property("drop", not audio_enabled)
 
     def _bind_active_video_sink_locked(self, expose: bool = True) -> None:
         self._bind_video_sink_locked(self._get_active_video_sink_locked(), expose=expose)
@@ -783,6 +1024,26 @@ class PipelineManager:
             self._replay_buffer.append_frame(frame)
         return Gst.FlowReturn.OK
 
+    def _on_record_audio_sample(self, sink: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        sample = sink.emit("pull-sample")
+        chunk = self._sample_to_audio_chunk(sample)
+        if chunk is not None and self._recording_running:
+            self._recorder.write_audio_chunk(chunk)
+        return Gst.FlowReturn.OK
+
+    def _on_replay_audio_sample(self, sink: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+
+        sample = sink.emit("pull-sample")
+        chunk = self._sample_to_audio_chunk(sample)
+        if chunk is not None and self._replay_running:
+            self._replay_buffer.append_audio_chunk(chunk)
+        return Gst.FlowReturn.OK
+
     def _sample_to_media_frame(self, sample: Any) -> MediaFrame | None:
         if sample is None:
             return None
@@ -822,6 +1083,37 @@ class PipelineManager:
             feed_id=frame_overlay.feed_id or self._source.get_feed_id(),
         )
 
+    def _sample_to_audio_chunk(self, sample: Any) -> AudioChunk | None:
+        if sample is None or self._audio_format is None:
+            return None
+
+        Gst = self._Gst
+        assert Gst is not None
+
+        buffer = sample.get_buffer()
+        if buffer is None:
+            return None
+
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return None
+
+        try:
+            data = bytes(map_info.data)
+        finally:
+            buffer.unmap(map_info)
+
+        timestamp = time.time()
+        if self._audio_stream_start_timestamp is not None and buffer.pts != Gst.CLOCK_TIME_NONE:
+            timestamp = self._audio_stream_start_timestamp + (buffer.pts / Gst.SECOND)
+        return AudioChunk(
+            timestamp=timestamp,
+            data=data,
+            format=self._audio_format,
+            source_name=self._source.get_display_name(),
+            feed_id=self._source.get_feed_id(),
+        )
+
     def _build_frame_overlay(
         self,
         *,
@@ -848,6 +1140,7 @@ class PipelineManager:
             assert Gst is not None
 
             tee = self._pipeline.get_by_name("source_tee")
+            audio_tee = self._pipeline.get_by_name("audio_tee")
             self._pipeline.set_state(Gst.State.NULL)
 
             if self._preview_probe_pad is not None and self._preview_probe_id is not None:
@@ -858,27 +1151,41 @@ class PipelineManager:
             if tee is not None:
                 for request_pad in self._tee_request_pads:
                     tee.release_request_pad(request_pad)
+            if audio_tee is not None:
+                for request_pad in self._audio_tee_request_pads:
+                    audio_tee.release_request_pad(request_pad)
 
             self._tee_request_pads.clear()
+            self._audio_tee_request_pads.clear()
             self._branch_valves.clear()
+            self._audio_branch_valves.clear()
             self._preview_sink = None
             self._preview_sink_factory_name = None
             self._preview_probe_pad = None
             self._preview_probe_id = None
             self._pipeline = None
             self._appsrc = None
+            self._audio_appsrc = None
             self._bus = None
             self._stream_start_timestamp = None
+            self._audio_stream_start_timestamp = None
+            self._audio_format = None
             with self._metadata_lock:
                 self._frame_metadata.clear()
 
     def _teardown_replay_pipeline_locked(self) -> None:
-        if self._replay_pipeline is None:
+        if self._replay_pipeline is None and self._replay_audio_pipeline is None:
             return
 
-        self._replay_pipeline.set_state(self._Gst.State.NULL)
+        if self._replay_pipeline is not None:
+            self._replay_pipeline.set_state(self._Gst.State.NULL)
         self._replay_pipeline = None
         self._replay_source = None
         self._replay_bus = None
         self._replay_sink = None
         self._replay_sink_factory_name = None
+        if self._replay_audio_pipeline is not None:
+            self._replay_audio_pipeline.set_state(self._Gst.State.NULL)
+        self._replay_audio_pipeline = None
+        self._replay_audio_source = None
+        self._replay_audio_bus = None

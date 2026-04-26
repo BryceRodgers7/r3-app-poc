@@ -8,6 +8,8 @@ import unittest
 
 from app.config.settings import AppSettings
 from app.core.feed_registry import FeedRegistry
+from app.core.models import FeedDefinition
+from app.media.source_factory import build_source_for_feed
 
 
 class AppSettingsTests(unittest.TestCase):
@@ -26,6 +28,13 @@ class AppSettingsTests(unittest.TestCase):
 [app]
 base_data_dir = 'D:\\ReplayData'
 target_fps = 29.97
+enable_embedded_audio = true
+live_audio_monitor_enabled = false
+audio_sample_rate = 44100
+audio_channels = 1
+audio_bitrate = 96000
+audio_container = "mp4"
+replay_audio_segment_seconds = 1.5
 
 [source]
 kind = "ndi"
@@ -46,6 +55,13 @@ ndi_name = "OBS-PC (Camera)"
         self.assertEqual(settings.default_feed_id, "feed_ndi")
         self.assertEqual(settings.test_camera_index, 2)
         self.assertEqual(settings.ndi_source_name, "OBS-PC (Camera)")
+        self.assertTrue(settings.enable_embedded_audio)
+        self.assertFalse(settings.live_audio_monitor_enabled)
+        self.assertEqual(settings.audio_sample_rate, 44100)
+        self.assertEqual(settings.audio_channels, 1)
+        self.assertEqual(settings.audio_bitrate, 96000)
+        self.assertEqual(settings.audio_container, "mp4")
+        self.assertEqual(settings.replay_audio_segment_seconds, 1.5)
 
     def test_feed_registry_uses_loaded_source_settings(self) -> None:
         settings = AppSettings(
@@ -97,6 +113,29 @@ ndi_name = "Sender 1"
         self.assertEqual(enabled[0].feed_id, "a")
         self.assertEqual(enabled[1].source_kind, "ndi")
         self.assertEqual(enabled[1].ndi_name, "Sender 1")
+
+    def test_source_chain_reports_embedded_audio_capability_for_ndi(self) -> None:
+        settings = AppSettings(default_source_kind="ndi")
+        ndi_source = build_source_for_feed(
+            settings,
+            FeedDefinition(
+                feed_id="ndi",
+                display_name="NDI",
+                source_kind="ndi",
+                ndi_name="Sender",
+            ),
+        )
+        test_source = build_source_for_feed(
+            settings,
+            FeedDefinition(
+                feed_id="test",
+                display_name="Test",
+                source_kind="auto",
+            ),
+        )
+
+        self.assertTrue(ndi_source.supports_embedded_audio())
+        self.assertFalse(test_source.supports_embedded_audio())
 
 
 if __name__ == "__main__":

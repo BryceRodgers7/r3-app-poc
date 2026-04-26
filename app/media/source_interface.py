@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from app.core.models import IngestTelemetry, MediaFrame
+from app.core.models import AudioChunk, AudioFormat, IngestTelemetry, MediaFrame
 
 
 class SourceInterface(ABC):
@@ -42,6 +42,18 @@ class SourceInterface(ABC):
     @abstractmethod
     def read_frame(self) -> MediaFrame | None:
         """Return the next delivered frame or `None` if no frame is available."""
+
+    def supports_embedded_audio(self) -> bool:
+        """Return whether this source can deliver source-embedded audio chunks."""
+        return False
+
+    def get_audio_format(self) -> AudioFormat | None:
+        """Return the negotiated embedded audio format when available."""
+        return None
+
+    def read_audio_chunk(self) -> AudioChunk | None:
+        """Return the next source-embedded audio chunk, if available."""
+        return None
 
     @abstractmethod
     def get_frame_size(self) -> tuple[int, int]:

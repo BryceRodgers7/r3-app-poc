@@ -34,6 +34,13 @@ class AppSettings:
     recording_manifest_filename: str = "recording_manifest.json"
     short_segments_subdir: str = "segments"
     short_segment_filename_prefix: str = "segment"
+    enable_embedded_audio: bool = True
+    live_audio_monitor_enabled: bool = True
+    audio_sample_rate: int = 48_000
+    audio_channels: int = 2
+    audio_bitrate: int = 128_000
+    audio_container: str = "mp4"
+    replay_audio_segment_seconds: float = 2.0
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -81,6 +88,20 @@ class AppSettings:
             settings.short_segments_subdir = str(app_config["short_segments_subdir"])
         if "short_segment_filename_prefix" in app_config:
             settings.short_segment_filename_prefix = str(app_config["short_segment_filename_prefix"])
+        if "enable_embedded_audio" in app_config:
+            settings.enable_embedded_audio = bool(app_config["enable_embedded_audio"])
+        if "live_audio_monitor_enabled" in app_config:
+            settings.live_audio_monitor_enabled = bool(app_config["live_audio_monitor_enabled"])
+        if "audio_sample_rate" in app_config:
+            settings.audio_sample_rate = int(app_config["audio_sample_rate"])
+        if "audio_channels" in app_config:
+            settings.audio_channels = int(app_config["audio_channels"])
+        if "audio_bitrate" in app_config:
+            settings.audio_bitrate = int(app_config["audio_bitrate"])
+        if "audio_container" in app_config:
+            settings.audio_container = str(app_config["audio_container"]).strip().lower() or "mp4"
+        if "replay_audio_segment_seconds" in app_config:
+            settings.replay_audio_segment_seconds = float(app_config["replay_audio_segment_seconds"])
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])

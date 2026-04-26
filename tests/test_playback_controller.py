@@ -13,11 +13,36 @@ from PySide6.QtTest import QTest
 from app.core.models import FeedDefinition, FrameOverlayInfo, MediaFrame, PlaybackMode, SessionPaths
 from app.core.playback_controller import PlaybackController
 from app.media.feed_runtime import FeedRuntime
+from app.media.muxed_writer import MuxedWriterInfo
 from app.media.output_renderer import OutputRenderer
 from app.media.recording_manager import RecordingManager
 from app.media.replay_buffer import ReplayBuffer
 from app.media.replay_store_manager import ReplayStoreManager
 from app.media.source_interface import SourceInterface
+
+
+class _FakeMuxedWriter:
+    def __init__(self, output_path: Path, *, fps_hint: float, audio_bitrate: int = 128_000, **_) -> None:
+        self.output_path = output_path
+        self.video_frame_count = 0
+        self.audio_bytes = 0
+        self.info = MuxedWriterInfo("mp4", "fake-h264", "fake-aac", output_path)
+
+    def write_frame(self, frame: MediaFrame) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_bytes(b"fake mp4")
+        self.video_frame_count += 1
+
+    def write_audio_chunk(self, chunk) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.output_path.exists():
+            self.output_path.write_bytes(b"fake mp4")
+        self.audio_bytes += len(chunk.data)
+
+    def close(self) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.output_path.exists():
+            self.output_path.write_bytes(b"fake mp4")
 
 
 class _FakeSource(SourceInterface):
@@ -136,7 +161,11 @@ class PlaybackControllerTests(unittest.TestCase):
             clips_dir=clips_dir,
         )
         self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
-        self.replay_store = ReplayBuffer(buffer_duration_seconds=30, jpeg_quality=85)
+        self.replay_store = ReplayBuffer(
+            buffer_duration_seconds=30,
+            jpeg_quality=85,
+            writer_factory=_FakeMuxedWriter,
+        )
         fake_source = _FakeSource(self.feed.feed_id)
         fake_pipeline = _FakePipelineManager(self.feed.feed_id, self.replay_store)
         fake_recorder = _FakeRecorder()
@@ -237,7 +266,7 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def test_multi_feed_pause_renders_each_feed(self) -> None:
         feed_b = FeedDefinition(feed_id="feed_b", display_name="Cam B")
-        replay_b = ReplayBuffer(buffer_duration_seconds=30, jpeg_quality=85)
+        replay_b = ReplayBuffer(buffer_duration_seconds=30, jpeg_quality=85, writer_factory=_FakeMuxedWriter)
         self.replay_store_manager.register(feed_b.feed_id, replay_b)
         self.recording_manager.register(feed_b.feed_id, _FakeRecorder())
         fake_b = _FakePipelineManager(feed_b.feed_id, replay_b)

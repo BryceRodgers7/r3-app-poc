@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from app.core.models import IngestTelemetry, MediaFrame
+from app.core.models import AudioChunk, AudioFormat, IngestTelemetry, MediaFrame
 from app.media.gst_ingest_telemetry import poll_convert_sink_caps
 from app.media.source_interface import SourceInterface
 
@@ -42,9 +42,11 @@ class NDIReceiver(SourceInterface):
         self._Gst: Any | None = None
         self._pipeline: Any | None = None
         self._appsink: Any | None = None
+        self._audio_appsink: Any | None = None
         self._bus: Any | None = None
         self._convert: Any | None = None
         self._ingest_telemetry: IngestTelemetry | None = None
+        self._audio_format = AudioFormat()
 
     def connect_source(self) -> bool:
         """Connect to an NDI source via the `ndisrc` GStreamer plugin."""
@@ -73,6 +75,10 @@ class NDIReceiver(SourceInterface):
             rate = self._make_element("videorate", "ndi_rate")
             capsfilter = self._make_element("capsfilter", "ndi_caps")
             appsink = self._make_element("appsink", "ndi_sink")
+            audio_convert = self._make_element("audioconvert", "ndi_audio_convert")
+            audio_resample = self._make_element("audioresample", "ndi_audio_resample")
+            audio_capsfilter = self._make_element("capsfilter", "ndi_audio_caps")
+            audio_appsink = self._make_element("appsink", "ndi_audio_sink")
         except RuntimeError as exc:
             self._status_message = str(exc)
             LOGGER.warning("Failed to create NDI pipeline: %s", exc)
@@ -96,6 +102,20 @@ class NDIReceiver(SourceInterface):
         appsink.set_property("sync", False)
         appsink.set_property("drop", True)
         appsink.set_property("max-buffers", 1)
+        audio_capsfilter.set_property(
+            "caps",
+            self._Gst.Caps.from_string(
+                "audio/x-raw,"
+                f"format={self._audio_format.sample_format},"
+                f"rate={self._audio_format.sample_rate},"
+                f"channels={self._audio_format.channels},"
+                "layout=interleaved"
+            ),
+        )
+        audio_appsink.set_property("emit-signals", False)
+        audio_appsink.set_property("sync", False)
+        audio_appsink.set_property("drop", True)
+        audio_appsink.set_property("max-buffers", 16)
 
         pipeline.add(source)
         pipeline.add(decodebin)
@@ -104,6 +124,10 @@ class NDIReceiver(SourceInterface):
         pipeline.add(rate)
         pipeline.add(capsfilter)
         pipeline.add(appsink)
+        pipeline.add(audio_convert)
+        pipeline.add(audio_resample)
+        pipeline.add(audio_capsfilter)
+        pipeline.add(audio_appsink)
 
         if not source.link(decodebin):
             self._status_message = "Failed to link NDI source into decodebin."
@@ -111,8 +135,15 @@ class NDIReceiver(SourceInterface):
         if not convert.link(scale) or not scale.link(rate) or not rate.link(capsfilter) or not capsfilter.link(appsink):
             self._status_message = "Failed to link the NDI processing path."
             return False
+        if (
+            not audio_convert.link(audio_resample)
+            or not audio_resample.link(audio_capsfilter)
+            or not audio_capsfilter.link(audio_appsink)
+        ):
+            self._status_message = "Failed to link the NDI audio processing path."
+            return False
 
-        decodebin.connect("pad-added", self._on_decodebin_pad_added, convert)
+        decodebin.connect("pad-added", self._on_decodebin_pad_added, (convert, audio_convert))
 
         state_change = pipeline.set_state(self._Gst.State.PLAYING)
         if state_change == self._Gst.StateChangeReturn.FAILURE:
@@ -122,6 +153,7 @@ class NDIReceiver(SourceInterface):
 
         self._pipeline = pipeline
         self._appsink = appsink
+        self._audio_appsink = audio_appsink
         self._bus = pipeline.get_bus()
         self._convert = convert
         self._connected = True
@@ -135,6 +167,7 @@ class NDIReceiver(SourceInterface):
             self._pipeline.set_state(self._Gst.State.NULL)
         self._pipeline = None
         self._appsink = None
+        self._audio_appsink = None
         self._bus = None
         self._convert = None
         self._ingest_telemetry = None
@@ -170,6 +203,48 @@ class NDIReceiver(SourceInterface):
             frame_id=self._frame_counter,
             timestamp=time.time(),
             image=frame,
+            source_name=self._source_name,
+            feed_id=self._feed_id,
+        )
+
+    def supports_embedded_audio(self) -> bool:
+        """Return whether NDI embedded audio can be read from the active pipeline."""
+        return True
+
+    def get_audio_format(self) -> AudioFormat | None:
+        """Return the normalized PCM audio format emitted by the NDI source."""
+        return self._audio_format
+
+    def read_audio_chunk(self) -> AudioChunk | None:
+        """Read the next embedded audio chunk from the NDI appsink."""
+        if not self._connected or self._audio_appsink is None:
+            return None
+
+        self._poll_bus()
+        assert self._Gst is not None
+        sample = self._audio_appsink.emit("try-pull-sample", int(self._Gst.SECOND / 100))
+        if sample is None:
+            return None
+
+        buffer = sample.get_buffer()
+        if buffer is None:
+            return None
+        success, map_info = buffer.map(self._Gst.MapFlags.READ)
+        if not success:
+            return None
+        try:
+            data = bytes(map_info.data)
+        finally:
+            buffer.unmap(map_info)
+
+        timestamp = time.time()
+        if buffer.pts != self._Gst.CLOCK_TIME_NONE:
+            # Keep the same wall-clock timestamp style used by MediaFrame.
+            timestamp = time.time()
+        return AudioChunk(
+            timestamp=timestamp,
+            data=data,
+            format=self._audio_format,
             source_name=self._source_name,
             feed_id=self._feed_id,
         )
@@ -227,8 +302,14 @@ class NDIReceiver(SourceInterface):
         )
         LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
 
-    def _on_decodebin_pad_added(self, _decodebin: Any, pad: Any, convert: Any) -> None:
-        sink_pad = convert.get_static_pad("sink")
+    def _on_decodebin_pad_added(self, _decodebin: Any, pad: Any, targets: tuple[Any, Any]) -> None:
+        video_convert, audio_convert = targets
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        caps_name = ""
+        if caps is not None and caps.get_size() > 0:
+            caps_name = caps.get_structure(0).get_name()
+        target = audio_convert if caps_name.startswith("audio/") else video_convert
+        sink_pad = target.get_static_pad("sink")
         if sink_pad is None or sink_pad.is_linked():
             return
         pad.link(sink_pad)

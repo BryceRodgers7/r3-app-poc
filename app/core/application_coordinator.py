@@ -132,6 +132,8 @@ def build_default_application_coordinator(
         replay_store = ReplayBuffer(
             buffer_duration_seconds=settings.replay_buffer_seconds,
             jpeg_quality=settings.replay_buffer_jpeg_quality,
+            audio_segment_seconds=settings.replay_audio_segment_seconds,
+            audio_bitrate=settings.audio_bitrate,
         )
         preview_output = PreviewOutput()
         pipeline_manager = PipelineManager(
@@ -139,6 +141,8 @@ def build_default_application_coordinator(
             preview_output=preview_output,
             recorder=recorder,
             replay_buffer=replay_store,
+            audio_enabled=settings.enable_embedded_audio,
+            live_audio_monitor_enabled=settings.live_audio_monitor_enabled,
         )
         runtime = FeedRuntime(
             feed=feed,
