@@ -52,9 +52,7 @@ Or, from an MSYS2 UCRT64 terminal:
 pacman -S mingw-w64-ucrt-x86_64-gst-plugins-rs
 ```
 
-Expected package at time of writing: `gst-plugins-rs 1.28.1-1` (pulls in a
-handful of deps such as `json-glib`, `gst-devtools`, `gtk4`, `libepoxy`,
-`libsodium`, and the adwaita icon themes — ~228 MB installed). After install,
+The package pulls a handful of dependencies (GStreamer devtools, GUI-related libs, etc.); the exact set and size change with MSYS2 updates — confirm with `pacman -Si mingw-w64-ucrt-x86_64-gst-plugins-rs` if you need current numbers. After install,
 the NDI plugin lives at:
 
 ```

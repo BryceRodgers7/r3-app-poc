@@ -4,28 +4,31 @@ This document describes the intended production-oriented architecture for the sp
 
 ## Status Summary
 
-The current codebase is a good vertical slice, not a finished foundation.
+The current codebase is a good vertical slice, not a finished foundation. Several items that were once “next refactors” are **already implemented** in tree.
 
-What is already heading in the right direction:
+**Implemented today (as of this document’s last pass against the code):**
 
 - Pluggable ingest via `SourceInterface`
+- **Feed-oriented** graph: `FeedRegistry`, one `FeedRuntime` per enabled feed, each with its own `PipelineManager`, `Recorder`, and `ReplayBuffer` / `ReplayStore`
+- **Two output channels:** `ApplicationCoordinator` wires an **operator** and **program** `PlaybackController`, each with its own `MultiFeedOutputRenderer` and `MainWindow` (`main.py`)
+- **Per-feed recording:** `RecordingManager` holds one `Recorder` per `feed_id`; session paths use `recording/{feed_id}/` under each session
 - Separation between ingest, replay storage, recording, UI, and session storage
-- A GStreamer-centered `tee`/fan-out direction in `PipelineManager`
-- A controller layer that already thinks in terms of playback state instead of raw UI events
+- GStreamer-centered `tee`/fan-out direction in each feed’s `PipelineManager`
+- Controllers that track playback mode and transport (not raw button events only)
 
-What must change before the app grows into a production replay system:
+**Still open before the app matches the full “target” story in this document:**
 
-- Replace the single-source app object graph with a feed-oriented architecture
-- Replace the single active video surface with independent output channels
-- Replace the single recorder with per-feed recording services
-- Replace fixed-speed replay with timeline + rate based playback control
+- A first-class **`PlaybackSession`** model (timeline position, rate, per-output state) as a named type — today much of this lives inside `PlaybackController`
+- **Full** timeline- and rate-based replay (slow motion, independent timelines) without leaning on the primary feed for some replay paths
+- Hardening for production: deployment, ops, source-loss policy, timestamp alignment across many feeds, etc.
+- Replace or narrow **transitional** Python frame push + OpenCV fallbacks where native GStreamer sources should own the full graph
 
 ## Design Goals
 
-- Support multiple simultaneous camera feeds, including future NDI ingest
-- Support two independent windows:
+- Support multiple simultaneous camera feeds, including NDI for configured feeds
+- Two independent windows exist in the current app. Operator replay supports **1/2x and 1/4x** rates via `PlaybackController.set_playback_rate`; a richer **timeline + rate** model (as a first-class `PlaybackSession` type) is still future work.
   - Program window: live multiview only, no transport controls
-  - Operator window: live multiview plus pause, replay, jump-to-live, and slow motion
+  - Operator window: live multiview plus pause, replay, jump-to-live, and slow replay speeds
 - Keep ingest and recording running while the operator pauses or replays
 - Record one copy of each live feed for later review
 - Keep future clip export and event logging straightforward
@@ -40,7 +43,7 @@ The system should be organized around four layers:
 3. Output composition and playback layer
 4. UI/control layer
 
-Each live camera feed should become a first-class object in the system instead of a detail hidden behind one global `source`.
+Each enabled feed is already a first-class `FeedDefinition` / `FeedRuntime` in the system; legacy single-feed mode without `[[feeds]]` still uses one effective feed from `[source]`.
 
 ## Core Runtime Components
 
@@ -54,38 +57,33 @@ Responsibilities:
 - Track source type per feed (`ndi`, camera, file, synthetic test source)
 - Expose health, format, fps, and availability metadata
 
-### `FeedIngestService`
+### `FeedIngestService` (conceptual name)
 
-One instance per feed.
+**Current code:** one `FeedRuntime` per feed wraps `SourceInterface` + `PipelineManager` + `PreviewOutput` + shared `Recorder` / `ReplayStore` for that feed.
 
 Responsibilities:
 
 - Connect to a single source
-- Normalize timestamps and frame metadata
+- Normalize timestamps and frame metadata (ongoing)
 - Drive a per-feed GStreamer ingest pipeline
 - Fan out frames to recording, replay buffering, and optional monitoring paths
 
 Notes:
 
-- This is the natural evolution of the current `SourceInterface` plus `PipelineManager`
-- For NDI, each feed should have its own receiver/pipeline rather than sharing one global source object
+- This matches the direction of `SourceInterface` + `PipelineManager` per feed
+- NDI feeds use a per-feed `NDIReceiver`; they do not share one global source object
 
 ### `RecordingManager`
 
-Owns the full-session recordings.
+Coordinates per-feed `Recorder` instances (`app/media/recording_manager.py`).
 
 Responsibilities:
 
-- Start and stop recording for all active feeds
-- Create one recorder per feed
-- Write one output file set per feed
-- Persist recording manifests and session metadata
+- Register one `Recorder` per `feed_id`
+- Expose whether any feed is recording for UI state
+- Stop all recorders on shutdown
 
-Expected output layout:
-
-- `session_xxx/recording/feed_cam1/...`
-- `session_xxx/recording/feed_cam2/...`
-- `session_xxx/recording/feed_cam3/...`
+**On disk today:** under each session, `recording/{feed_id}/` holds that feed’s muxed outputs and manifest when long recording is enabled (see `SessionPaths.get_feed_paths`).
 
 The recorded files may contain burned-in timestamp/source overlays if desired. That does not conflict with this architecture.
 
@@ -105,11 +103,11 @@ Important:
 - Replay should be modeled as timeline-based, not as a special UI trick
 - Every feed should expose a timestamp-addressable replay timeline
 
-### `PlaybackSession`
+### `PlaybackSession` (target; not a separate class yet)
 
-Represents what one output is currently showing.
+Represents what one output is currently showing. **Today** the closest implementation is **`PlaybackController`** (one per window) plus its private state and `AppState` for the UI.
 
-There should be one `PlaybackSession` per output window, not one for the whole app.
+There should be one logical playback session per output window, not one for the whole app (the app already runs two `PlaybackController` instances for operator vs program).
 
 Responsibilities:
 
@@ -119,7 +117,7 @@ Responsibilities:
 - Hold selected feeds/layout for that output
 - Compute "seconds behind live"
 
-This is the key step that makes slow motion and independent windows safe to add.
+Extracting a dedicated `PlaybackSession` type from `PlaybackController` would make slow motion and rate changes easier to reason about.
 
 ### `OutputRenderer`
 
@@ -139,17 +137,16 @@ There should be at least two output renderers:
 
 ### `ApplicationCoordinator`
 
-Owns the full runtime graph.
+Owns the full runtime graph (see `app/core/application_coordinator.py`).
 
 Responsibilities:
 
-- Start feeds
-- Start per-feed recorders and replay stores
-- Create program and operator playback sessions
-- Route operator commands to the operator playback session only
-- Keep the program output pinned to live unless intentionally changed later
+- Start feeds (`FeedRuntime.start` per enabled feed)
+- Register per-feed recorders and replay stores with `RecordingManager` / `ReplayStoreManager`
+- Own program and operator `PlaybackController` instances and route long recording / clip actions
+- Keep the program controller in **live-only** mode while the operator controller handles pause/replay
 
-This is the natural replacement for the current single-controller bootstrap in `main.py`.
+`main.py` constructs the coordinator, two `MultiFeedOutputRenderer` instances, and two `MainWindow` instances (operator vs program).
 
 ## Window Model
 
@@ -182,55 +179,35 @@ With that structure:
 
 ## Multi-Camera Growth Path
 
-Multi-camera support is still safe to add, but it should be added by lifting the architecture from "one source" to "many feeds" before more features pile onto the current single-source assumptions.
+Multi-feed ingest is **in place**: `FeedRegistry` + per-feed `FeedRuntime` + multiview-oriented `MultiFeedOutputRenderer`.
 
-Good news:
+**Still rough for “true” multi-camera replay products:**
 
-- `SourceInterface` is a useful seam
-- Session storage concepts are reusable
-- Per-feed overlay metadata already exists in spirit through `feed_id`/`source_name`
-
-Current limitations to address:
-
-- `AppState` is global and single-source
-- `PipelineManager` owns one source and one active video output
-- `Recorder` owns one output file
-- `PreviewOutput` binds to one widget
+- Operator transport and replay **buffer selection** still center the **primary** feed in places (e.g. replay store lookup by primary `feed_id` in `PlaybackController`); independent per-feed replay timelines are not fully modeled
+- `AppState` is **per `PlaybackController`**, not global, but it still reflects one aggregate view of status for that window
+- Each feed already has its own `PipelineManager`, `Recorder`, `PreviewOutput`, and replay store instance
 
 Conclusion:
 
-- Multi-camera is not precluded
-- It is not safe to bolt on by duplicating the current singleton-style objects
-- It is safe if the next architectural step is feed-oriented orchestration
+- Multi-feed is no longer “future only” at the object-graph level
+- Deeper work remains for equal-class timeline and layout semantics across every feed
 
 ## Multi-Window Growth Path
 
-Multi-window support is also still safe to add, but only if output ownership is separated first.
+**Implemented:** two top-level windows (operator + program), two `PlaybackController` instances, two `MultiFeedOutputRenderer` instances (`main.py`).
 
-Good news:
+Remaining refinements:
 
-- Qt can host multiple windows cleanly
-- The current controller already separates playback state from raw UI button wiring
+- Keep program and operator semantics clear as features grow (e.g. program never shows replay)
+- Ensure any new global shortcuts or focus behavior do not conflate the two outputs
 
-Current limitation:
-
-- The current media layer swaps one shared surface between live and replay
-
-Conclusion:
-
-- A second window is absolutely possible
-- One window can be live-only while the other has live/replay controls
-- That should be implemented by creating independent output renderers/playback sessions, not by teaching one shared output object new tricks
+The earlier “single shared surface swapping live/replay” limitation is **no longer** the current architecture.
 
 ## Multiple Per-Feed Recordings
 
-Multiple file recordings are still safe to add.
+**Implemented:** one `Recorder` per feed, registered in `RecordingManager`, with per-feed directories under `recording/{feed_id}/`.
 
-Recommended design:
-
-- One recording branch per feed
-- One recorder instance per feed
-- One manifest per feed plus a session-level manifest
+Session-level manifests and multi-feed policy (when to start/stop all feeds together) live in `ApplicationCoordinator.toggle_long_session_recording` and related UI.
 
 This does not require recorded video to be raw/unprocessed. A "copy of the live feed" with overlays is fine as long as:
 
@@ -238,54 +215,36 @@ This does not require recorded video to be raw/unprocessed. A "copy of the live 
 - The timestamps are consistent
 - Recording does not depend on what either window is currently displaying
 
-Conclusion:
-
-- The current architecture does not preclude this
-- The current `Recorder` class is too narrow and should evolve into a manager + per-feed recorder model
-
 ## Slow Motion
 
-Slow motion is still safe to add later if replay is promoted from a fixed 1x timer into a timeline/rate model.
+**Current app:** the operator can set **1/2x** and **1/4x** replay via `set_playback_rate` (see `main_window` / `controls_widget`); the clock uses `PlaybackController`’s anchor + rate fields.
 
-Recommended rule:
+**Target rule** (for a cleaner long-term design):
 
-- Replay state should always be expressed as:
-  - target timestamp
-  - playback rate
-  - mode
-
-Then the same operator actions become straightforward:
-
-- Pause: rate `0.0`
-- Replay: rate `1.0`
-- Slow motion: rate `0.5` or `0.25`
-- Jump to live: mode `live`, timestamp pinned to live edge
+- Replay state should always be explicit as: target timestamp, playback rate, and mode, ideally carried by a dedicated `PlaybackSession` (or factored-out state object) instead of ad hoc fields only.
 
 Conclusion:
 
-- Slow motion is not blocked
-- It should be added after `PlaybackSession` exists, not as a one-off special case inside the current controller
+- Basic slow replay exists; the remaining step is to align it with a **timeline + rate** model everywhere (including multi-feed replay) rather than accreting more one-off cases in the controller
 
 ## Recommended Near-Term Refactor Order
 
-1. Introduce feed identifiers and a feed registry
-2. Split ingest/record/replay ownership into per-feed services
-3. Introduce `PlaybackSession` as an independent per-output state model
-4. Replace the single preview binding with per-window output renderers
-5. Add the second window
-6. Add slow-motion playback rates
-7. Add real NDI ingest
+1. ~~Introduce feed identifiers and a feed registry~~ — `FeedRegistry` and `[[feeds]]` configuration exist
+2. ~~Split ingest/record/replay ownership into per-feed services~~ — `FeedRuntime` + per-feed `PipelineManager` / `Recorder` / `ReplayStore`
+3. Introduce `PlaybackSession` (or factor state out of `PlaybackController`) as an explicit per-output model
+4. ~~Per-window output renderers and a second window~~ — operator + program `MainWindow` and renderers
+5. Extend replay to **true** per-feed (or cross-feed) timeline semantics, not only primary-feed replay where applicable
+6. Add slow-motion playback rates consistently with a timeline + rate model
+7. Harden NDI and non-test sources; reduce reliance on `TestSource` / Python-pushed frames where the graph should be native end-to-end
 
 ## Architectural Verdict
 
-The project is on the right track only if the current code is treated as a vertical slice and not as the final application shape.
+The project remains a **vertical slice** in terms of product maturity, but the **object graph** has already moved to **feeds**, **per-feed media stacks**, and **two outputs** (operator + program). New work should build on that — avoid reintroducing a single global source or a single shared preview as the only output path.
 
-The existing design does not preclude:
+**Already aligned with the long-term story:**
 
-- Multi-camera support
-- A second live-only window
-- Independent live/replay operator output
-- Multiple feed recordings
-- Slow-motion replay
+- Multi-feed ingest, per-feed recording, two windows, feed registry
 
-But the next steps matter. If new features are added directly onto the current single-source, single-output object graph, the design will become brittle quickly. If the next step is to introduce feed-oriented ingest and per-output playback sessions, the project can grow into the intended system safely.
+**Where complexity will grow next:**
+
+- Explicit playback session / timeline model, slow motion, and symmetric multi-feed replay behavior — not more one-off special cases in one controller

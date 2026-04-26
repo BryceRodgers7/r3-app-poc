@@ -24,8 +24,9 @@ The **UCRT64** environment in [MSYS2](https://www.msys2.org/) is the practical w
   For GStreamer and `gi` provided by MSYS2 system packages, a venv with access to those packages is often used, e.g.  
   `python3 -m venv --system-site-packages .venv`  
   so PyPI packages (e.g. PySide6) live in the venv while `gi`/GStreamer stay consistent with the UCRT64 install.
-- Activate the venv and install the project:  
-  `python -m pip install -e .` (and any extras you need).
+- Activate the venv and install the project, including the **media** extra so `PyGObject` is available to the `pip` resolver:  
+  `python -m pip install -e ".[media]"`  
+  (The native GStreamer + GObject stack still comes from MSYS2; the extra only pulls the Python bindings.)
 - **Always** run `python main.py` from a shell where the UCRT64 `python` is first on `PATH` (typically the UCRT64 MSYS2 terminal, after activation).
 
 ## What this document is not
