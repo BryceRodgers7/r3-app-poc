@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+from app.core.recording_state import RecordingState, make_recording_state_machine
+from app.core.state_machine import StateMachine
 from app.media.recorder import Recorder
 
 
 class RecordingManager:
-    """Track recorder instances by feed identifier."""
+    """Track recorder instances by feed identifier and the global recording state."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        recording_state: StateMachine[RecordingState] | None = None,
+    ) -> None:
         self._recorders: dict[str, Recorder] = {}
+        self.recording_state = (
+            recording_state if recording_state is not None else make_recording_state_machine()
+        )
 
     def register(self, feed_id: str, recorder: Recorder) -> None:
         """Register a recorder for a feed."""

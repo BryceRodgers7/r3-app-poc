@@ -7,6 +7,8 @@ from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
 from app.core.health_events import default_log as default_health_log
 from app.core.playback_controller import PlaybackController
+from app.core.recording_state import RecordingState
+from app.core.session_state import SessionState
 from app.core.telemetry import TelemetryHub
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import MultiFeedOutputRenderer
@@ -74,15 +76,26 @@ class ApplicationCoordinator:
         if session_paths is None:
             self.operator_controller.signals.status_message.emit("No active session; cannot record.")
             return
+        recording_sm = self._recording_manager.recording_state
+        session_sm = self._session_manager.get_active_session_state()
         if self._recording_manager.is_any_recording():
+            recording_sm.transition_to(RecordingState.STOPPING_RECORDING)
             for runtime in self._feed_runtimes.values():
                 runtime.pipeline_manager.disable_file_recording()
+            recording_sm.transition_to(RecordingState.FINALIZING)
+            recording_sm.transition_to(RecordingState.NOT_RECORDING)
+            if session_sm is not None and session_sm.state == SessionState.RECORDING:
+                session_sm.transition_to(SessionState.STOPPED)
             self.operator_controller.refresh_recording_state()
             self.program_controller.refresh_recording_state()
             self.operator_controller.signals.status_message.emit("Game recording stopped.")
             return
+        recording_sm.transition_to(RecordingState.STARTING_RECORDING)
         for runtime in self._feed_runtimes.values():
             runtime.pipeline_manager.enable_file_recording(session_paths, feed_id=runtime.feed.feed_id)
+        recording_sm.transition_to(RecordingState.RECORDING)
+        if session_sm is not None and session_sm.state == SessionState.CREATED:
+            session_sm.transition_to(SessionState.RECORDING)
         self.operator_controller.refresh_recording_state()
         self.program_controller.refresh_recording_state()
         self.operator_controller.signals.status_message.emit("Game recording started.")
