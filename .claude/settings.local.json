@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest tests.test_telemetry -v)",
+      "Bash(python -m unittest discover -s tests -v)",
+      "Bash(python -m unittest discover -s tests)",
+      "Bash(python -c \"from app.core.application_coordinator import ApplicationCoordinator, build_default_application_coordinator; from app.core.telemetry import TelemetryHub; print\\('imports OK'\\); hub = TelemetryHub\\(\\); m = hub.register\\('feed_main', 'Main'\\); m.tick_source\\(\\); m.tick_preview\\(\\); print\\('snapshot:', hub.snapshot\\(\\)[0]\\)\")"
+    ]
+  }
+}

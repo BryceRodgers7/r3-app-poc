@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from app.core.models import AudioChunk, AudioFormat, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
+from app.core.telemetry import FeedMetrics
 from app.media.frame_overlay import render_frame_overlay
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
@@ -60,6 +61,7 @@ class PipelineManager:
         self._recording_running = False
         self._replay_running = False
         self._frame_callback: Callable[[MediaFrame], None] | None = None
+        self._feed_metrics: FeedMetrics | None = None
 
         self._Gst: Any | None = None
         self._GstVideo: Any | None = None
@@ -213,6 +215,10 @@ class PipelineManager:
     def set_live_sample_callback(self, callback: Callable[[FrameOverlayInfo], None]) -> None:
         """Register the controller callback for live-preview frame metadata."""
         self._live_sample_callback = callback
+
+    def set_feed_metrics(self, metrics: FeedMetrics | None) -> None:
+        """Attach a `FeedMetrics` instance for per-branch FPS counting."""
+        self._feed_metrics = metrics
 
     def set_video_window_handle(self, window_handle: int) -> None:
         """Attach the active embedded video sink to a Qt-owned native child window."""
@@ -997,11 +1003,16 @@ class PipelineManager:
 
         sample = sink.emit("pull-sample")
         frame = self._sample_to_media_frame(sample)
-        if frame is not None and self._preview_running:
-            if self._frame_callback is not None:
-                self._frame_callback(frame)
-            if self._live_sample_callback is not None:
-                self._live_sample_callback(FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id))
+        if frame is not None:
+            if self._feed_metrics is not None:
+                self._feed_metrics.tick_source()
+                if self._preview_running:
+                    self._feed_metrics.tick_preview()
+            if self._preview_running:
+                if self._frame_callback is not None:
+                    self._frame_callback(frame)
+                if self._live_sample_callback is not None:
+                    self._live_sample_callback(FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id))
         return Gst.FlowReturn.OK
 
     def _on_record_sample(self, sink: Any) -> Any:
@@ -1011,6 +1022,8 @@ class PipelineManager:
         sample = sink.emit("pull-sample")
         frame = self._sample_to_media_frame(sample)
         if frame is not None and self._recording_running:
+            if self._feed_metrics is not None:
+                self._feed_metrics.tick_recording()
             self._recorder.write_frame(frame)
         return Gst.FlowReturn.OK
 

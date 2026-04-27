@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.config.settings import AppSettings
 from app.core.feed_registry import FeedRegistry
 from app.core.playback_controller import PlaybackController
+from app.core.telemetry import TelemetryHub
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
@@ -28,6 +29,7 @@ class ApplicationCoordinator:
         feed_runtimes: dict[str, FeedRuntime],
         recording_manager: RecordingManager,
         replay_store_manager: ReplayStoreManager,
+        telemetry_hub: TelemetryHub,
         operator_renderer: MultiFeedOutputRenderer,
         program_renderer: MultiFeedOutputRenderer,
     ) -> None:
@@ -37,6 +39,7 @@ class ApplicationCoordinator:
         self._feed_runtimes = feed_runtimes
         self._recording_manager = recording_manager
         self._replay_store_manager = replay_store_manager
+        self.telemetry_hub = telemetry_hub
         self.operator_renderer = operator_renderer
         self.program_renderer = program_renderer
 
@@ -100,10 +103,12 @@ class ApplicationCoordinator:
             runtime.start(session_paths)
         self.operator_controller.initialize(session_paths.session_id)
         self.program_controller.initialize(session_paths.session_id)
+        self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
 
     def shutdown(self) -> None:
         """Stop playback sessions and feed runtimes."""
+        self.telemetry_hub.stop()
         self.operator_controller.shutdown()
         self.program_controller.shutdown()
         for runtime in self._feed_runtimes.values():
@@ -124,6 +129,7 @@ def build_default_application_coordinator(
     feed_registry = FeedRegistry.build_default(settings)
     recording_manager = RecordingManager()
     replay_store_manager = ReplayStoreManager()
+    telemetry_hub = TelemetryHub()
     feed_runtimes: dict[str, FeedRuntime] = {}
 
     for feed in feed_registry.get_enabled_feeds():
@@ -144,6 +150,8 @@ def build_default_application_coordinator(
             audio_enabled=settings.enable_embedded_audio,
             live_audio_monitor_enabled=settings.live_audio_monitor_enabled,
         )
+        feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
+        pipeline_manager.set_feed_metrics(feed_metrics)
         runtime = FeedRuntime(
             feed=feed,
             source=source,
@@ -162,6 +170,23 @@ def build_default_application_coordinator(
         feed_runtimes=feed_runtimes,
         recording_manager=recording_manager,
         replay_store_manager=replay_store_manager,
+        telemetry_hub=telemetry_hub,
         operator_renderer=operator_renderer,
         program_renderer=program_renderer,
     )
+
+
+def _qt_periodic_registrar(interval_seconds: float, callback) -> "callable":
+    """`QTimer`-backed periodic registrar for `TelemetryHub.start()`."""
+    from PySide6.QtCore import QTimer
+
+    timer = QTimer()
+    timer.setInterval(int(interval_seconds * 1000))
+    timer.timeout.connect(callback)
+    timer.start()
+
+    def cancel() -> None:
+        timer.stop()
+        timer.timeout.disconnect(callback)
+
+    return cancel
