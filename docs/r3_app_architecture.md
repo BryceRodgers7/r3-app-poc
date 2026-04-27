@@ -7,6 +7,9 @@ This document defines the target production architecture for a Windows desktop m
 **Important:**  
 This is the authoritative architecture document. Do not treat any unstated media, storage, timing, or replay behavior as an implementation detail. The decisions below are part of the design.
 
+**Status:**  
+This document describes the **target** production architecture. The current codebase does not yet conform to it — notably, today's replay storage uses JPEG thumbs plus short muxed segments, frames are pushed through Python on the hot path, and the active recording container is MP4. Those are explicitly forbidden by this document and are tracked as gaps to close in the phased plan in §18. For a description of the current code's object graph, see `ARCHITECTURE.md`.
+
 ---
 
 # 0. Executive Summary
@@ -219,7 +222,7 @@ Responsibilities:
 - Own shared `SessionClock`.
 - Own `RecordingManager`.
 - Own replay index/query services for active recording segments.
-- Own operator playback controller.
+- Own operator and program playback controllers (program is live-only; operator has full transport).
 - Coordinate startup/shutdown.
 - Surface health state to UI.
 
@@ -605,9 +608,12 @@ last_keyframe_pts_ns
 frame_count_estimate
 size_bytes
 state: writing | complete | dirty | corrupt | quarantined
+pts_to_session_offset_ns
 created_at
 finalized_at
 ```
+
+Each segment carries its own `pts_to_session_offset_ns`. The feed clock is allowed to jump across a reconnect — a new segment is started with a fresh offset. The feed timeline is therefore not stored as a separate table; it is a runtime view computed from segments (see §14.1).
 
 ## 6.4 Metadata storage
 
@@ -691,8 +697,10 @@ tags
 notes
 created_at
 
-source_segments
+source_segments_by_feed: { feed_id -> [segment_id, ...] }
 ```
+
+The marker's truth is the time range. `source_segments_by_feed` is a per-feed cache of which segments cover that range, recorded at marker-creation time so the post-session processor can locate source media without re-querying. A play crossing a segment edge on one feed but not another is handled naturally — each feed's list is independent. Clip cuts at export time are timestamp-based seek + trim inside those segments, not segment-aligned.
 
 Do not immediately create a physical video file for every play unless requested.
 
@@ -701,6 +709,29 @@ Reason:
 - Clip creation should be instant.
 - Export can happen later.
 - Multiple export formats/angles may be generated from the same metadata.
+
+## 6.8 Retention and cleanup
+
+The live recording app **never** deletes anything on disk. Cleanup is a separate, manually invoked operation (a flag on the post-session processor or a dedicated CLI), never an automatic action during a session.
+
+Config:
+
+```toml
+[retention]
+keep_source_segments_days = 14
+keep_processed_exports_days = 90
+keep_quarantine_days = 7
+```
+
+Rules:
+
+- The cleanup operation is idempotent.
+- Cleanup may only delete from sessions other than the one currently being processed.
+- Cleanup never deletes from a session in state `RECORDING`, `STOPPED`, or `DIRTY` (see §10.6).
+- Disk-pressure warnings (§11.3) remain visible to the operator, but degraded mode never deletes recording media.
+- Quarantined segments expire on the shortest clock; they exist for postmortem only.
+
+This is intentional for the volunteer-operator use case: nothing the operator does during a game can lose footage, and the league/tournament organizer has one explicit knob to manage disk space between events.
 
 ---
 
@@ -892,6 +923,18 @@ The system must:
 5. Keep feeds aligned during slow motion/pause/resume.
 6. Surface degraded status if one feed cannot participate.
 
+## 8.7 Late join and reconnect
+
+A feed may join after recording has already started, or drop and reconnect mid-game (a camera plugged in late, a flaky NDI source). The model must handle both without special cases at the replay layer.
+
+Rules:
+
+- Each segment carries its own `pts_to_session_offset_ns` (§6.3). A reconnect starts a new segment with a freshly computed offset; the feed clock is allowed to jump.
+- A late-joining feed's first segment defines its `first_seen_session_time_ns` on the `Feed` row (§14.3).
+- A disconnect ends the currently-writing segment as `dirty` if it cannot be cleanly finalized; recovery rules (§10.6, §11) apply.
+- The replay layer never asks "is this feed connected right now?" — it asks "which completed segments cover `[t1, t2]` for this feed?" Gaps are a query result, not a special state.
+- Replay over a range where a feed had not yet joined or was disconnected returns no media for that feed in that range; §15.5 (missing media behavior) handles the rest.
+
 ---
 
 # 9. Audio Strategy
@@ -1040,6 +1083,38 @@ Rules:
 - Feed failure must not crash entire session.
 - Post-session processing must not run while the recording application is active.
 
+## 10.6 Session state model
+
+The session has its own state machine, separate from the per-recording state machine in §10.3. The session state is what the post-session processor and the recovery flow on next launch read.
+
+```text
+CREATED         # session folder + sqlite exist, no recording yet
+RECORDING       # at least one feed actively recording
+STOPPED         # operator pressed End Game; finalization in progress
+FINALIZED       # all per-feed segments closed, manifest written, sqlite committed
+DIRTY           # crashed or hard-killed mid-session; not yet recovered or discarded
+ARCHIVED        # post-session processor has produced deliverables
+```
+
+Transitions:
+
+```text
+CREATED  → RECORDING            (operator starts game recording)
+RECORDING → STOPPED             (operator ends game)
+STOPPED  → FINALIZED            (last segment closed, manifest written) — automatic
+RECORDING/STOPPED → DIRTY       (crash or hard-kill; detected on next launch)
+DIRTY    → FINALIZED            (operator chose Resume → finalize completes)
+DIRTY    → CREATED              (operator chose Discard, leaving an empty shell session)
+FINALIZED → ARCHIVED            (post-session processor success)
+```
+
+Rules:
+
+- The post-session processor refuses any session whose state is not `FINALIZED` or `ARCHIVED`.
+- The operator UI must surface session state plainly. "Game ready for export" maps to `FINALIZED`/`ARCHIVED`; "Game in progress" maps to `RECORDING`/`STOPPED`. The volunteer operator must be able to tell at a glance whether it is safe to walk away.
+- The transition `RECORDING/STOPPED → DIRTY` is detected by the absence of a `finalized_at` timestamp on the session row at next launch — there is no separate heartbeat needed.
+- Cleanup (§6.8) refuses any session in `RECORDING`, `STOPPED`, or `DIRTY`.
+
 ---
 
 # 11. Failure Handling and Degraded Operation
@@ -1088,6 +1163,22 @@ The operator UI must surface:
 - session not safely recording
 
 Do not bury these only in logs.
+
+## 11.4 Session-level recovery flow
+
+On application startup, if any session is in state `DIRTY` (see §10.6), the operator UI **must** present a recovery prompt as the only initial screen and block all media UI until the operator chooses.
+
+Recovery prompt options:
+
+- **Resume** (default highlighted): scan `recording/{feed_id}/` for incomplete segments, mark partial files `quarantined`, rebuild the in-memory index from completed segments only, continue with new segment numbering, transition the session back into `RECORDING`. Replay coverage during the resumed session uses the surviving completed segments; the gap caused by the crash shows up as missing media (§15.5).
+- **End and finalize**: do not resume recording; close the session into `FINALIZED` so the post-session processor can run against whatever was successfully captured.
+- **Discard**: transition the session to `CREATED` (empty shell), leaving its source segments on disk for retention rules (§6.8) to handle later.
+
+Rules:
+
+- Auto-resume without operator confirmation is forbidden — the cause of the crash (disk full, broken camera, OS update) often persists, and a silent retry loop is worse than a visible prompt.
+- Partial segments are never repaired in-place. Quarantine and move on. Repair tooling, if any, is offline-only.
+- The recovery prompt does not violate the rule "replay unavailable when not RECORDING" (§10.4); the prompt blocks the media UI entirely until a new session state is chosen.
 
 ---
 
@@ -1215,6 +1306,11 @@ segment_duration_seconds = 4
 codec = "prores" # prores | dnxhr | mjpeg
 container = "mov" # mov | mxf | mkv | ts
 
+[retention]
+keep_source_segments_days = 14
+keep_processed_exports_days = 90
+keep_quarantine_days = 7
+
 [post_processing]
 enabled = true
 mode = "manual_after_app_shutdown"
@@ -1277,7 +1373,6 @@ Minimum durable entities:
 ```text
 Session
 Feed
-FeedTimeline
 Segment
 Recording
 PlayMarker
@@ -1286,6 +1381,8 @@ ExportArtifact
 HealthEvent
 MetricSample
 ```
+
+`FeedTimeline` is **not** a durable entity. It is a runtime-computed view of `(feed_id, [available_intervals])` derived from the `Segment` table on demand (see §8.7). Replay queries operate against `Segment` directly; there is no separate timeline table to keep in sync.
 
 ## 14.2 Session
 
@@ -1438,11 +1535,28 @@ Jump to live must:
 - stop replay playback
 - return operator view to live source
 - keep recording unaffected
+
+## 15.7 Replay seek granularity
+
+Replay start and end points are **frame-accurate inside any completed segment**, not snapped to segment boundaries.
+
+Reason:
+
+- The active recording codecs mandated in §5.2 (ProRes, DNxHR, MJPEG) are intra-frame. Every frame is effectively a keyframe, so the decoder can begin output at any frame inside a completed segment.
+- The only segment-boundary constraint is **finalization**: the currently-writing segment is not safely readable until it is closed. Replay coverage is therefore `[recording_start, end_of_latest_finalized_segment]`, not `[recording_start, now]`.
+- With the default `segment_duration_seconds = 4`, the operator view "live edge" of replay lags wall-clock live by 0–4 seconds. The UI must surface this as `latest_replayable_session_time_ns` (§12.1) and not pretend replay extends to the present moment.
+
+Implications:
+
+- Instant-replay shortcuts (e.g. "last 60 seconds") compute `end = latest_replayable_session_time_ns`, not `end = now`.
+- Jump-to-live (§15.6) returns the operator view to the live source pipeline, not to the latest replayable timestamp — these two times are not the same.
+- If an inter-frame codec is ever introduced as a fallback (§5.6), seek granularity collapses to the keyframe interval and segment boundaries must be forced keyframes. The replay query API does not change; only the achievable seek precision does.
+
 ---
 
 # 16. Testing and Validation Strategy
 
-## 17.1 Synthetic feed generator
+## 16.1 Synthetic feed generator
 
 A production refactor must include a deterministic synthetic feed mode.
 
@@ -1462,7 +1576,7 @@ Reason:
 - Allows replay correctness tests.
 - Allows testing without cameras.
 
-## 17.2 Required test scenarios
+## 16.2 Required test scenarios
 
 Test:
 
@@ -1491,7 +1605,7 @@ Test:
 23. Post-session processor creates long-form MP4 files after shutdown.
 24. Post-session processor creates short play MP4 files from play metadata after shutdown.
 
-## 17.3 Performance acceptance tests
+## 16.3 Performance acceptance tests
 
 Define hardware-specific acceptance tests.
 
@@ -1508,7 +1622,7 @@ replay time-to-first-frame < 500 ms
 no unbounded memory growth
 ```
 
-## 17.4 Regression rule
+## 16.4 Regression rule
 
 Before changing media pipeline behavior:
 
@@ -1525,7 +1639,7 @@ Before changing media pipeline behavior:
 
 These rules are mandatory when using Cursor, Claude Code, or other AI coding tools.
 
-## 18.1 Do not rewrite everything
+## 17.1 Do not rewrite everything
 
 Never ask the AI to:
 
@@ -1535,7 +1649,7 @@ Rewrite the entire app to match this architecture.
 
 Instead use vertical slices.
 
-## 18.2 Required AI workflow
+## 17.2 Required AI workflow
 
 For each phase:
 
@@ -1548,7 +1662,7 @@ For each phase:
 7. Commit.
 8. Continue.
 
-## 18.3 Guardrails for AI
+## 17.3 Guardrails for AI
 
 Every implementation prompt should include:
 
@@ -1562,7 +1676,7 @@ Do not remove existing working fallback modes unless explicitly asked.
 Preserve current behavior unless the phase requires changing it.
 ```
 
-## 18.4 Recommended branch strategy
+## 17.4 Recommended branch strategy
 
 ```text
 main
@@ -1727,6 +1841,10 @@ Exit criteria:
 - Segment lookup by timestamp works.
 - Replay queries use completed segments only and expose the latest replayable time.
 - Crash recovery can detect incomplete segments.
+
+Transitional note:
+
+- The current code's single `replay_buffer_seconds` setting (a fixed rolling-window duration over JPEG thumbs + short muxed segments) is replaced by `segment_duration_seconds` plus a segment-availability query. The UI's "rewind 10s" / "rewind 30s" shortcuts become convenience time ranges (§15.3) rather than buffer-size limits. `replay_buffer_seconds` should be removed from `AppSettings` once the new path is in place.
 
 ---
 
@@ -1959,7 +2077,7 @@ Do not violate these without explicitly updating this architecture document.
 Use this prompt at the start of each coding session:
 
 ```text
-Read docs/architecture/production-replay-architecture.md. Treat it as authoritative.
+Read docs/r3_app_architecture.md. Treat it as authoritative.
 
 Do not implement anything yet. First:
 1. Summarize the relevant requirements from the document.
