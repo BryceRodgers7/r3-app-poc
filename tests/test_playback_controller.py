@@ -12,6 +12,7 @@ from PySide6.QtTest import QTest
 
 from app.core.models import FeedDefinition, FrameOverlayInfo, MediaFrame, PlaybackMode, SessionPaths
 from app.core.playback_controller import PlaybackController
+from app.core.recording_state import RecordingState
 from app.media.feed_runtime import FeedRuntime
 from app.media.muxed_writer import MuxedWriterInfo
 from app.media.output_renderer import OutputRenderer
@@ -213,7 +214,15 @@ class PlaybackControllerTests(unittest.TestCase):
         self.replay_store.stop()
         self._temp_dir.cleanup()
 
+    def _force_recording_state(self) -> None:
+        """Drive the recording state machine into RECORDING so replay
+        actions are not rejected by the §10.4 / §15.2 guard added in
+        slice 2.C."""
+        self.recording_manager.recording_state.force(RecordingState.RECORDING)
+        self.controller.refresh_recording_state()
+
     def test_replay_timer_advances_and_pause_freezes(self) -> None:
+        self._force_recording_state()
         self.controller.rewind_10_seconds()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
         self.assertTrue(self.controller._replay_timer.isActive())
@@ -235,6 +244,7 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertEqual(paused_t1, paused_t2)
 
     def test_replay_rate_changes_progression_speed(self) -> None:
+        self._force_recording_state()
         self.controller.rewind_10_seconds()
         self.controller.set_playback_rate(0.5)
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
@@ -304,6 +314,8 @@ class PlaybackControllerTests(unittest.TestCase):
         self.addCleanup(controller.shutdown)
         self.addCleanup(replay_b.stop)
 
+        self.recording_manager.recording_state.force(RecordingState.RECORDING)
+        controller.refresh_recording_state()
         n_before = len(renderer.frames)
         controller.pause_playback()
         new_frames = renderer.frames[n_before:]
@@ -313,6 +325,30 @@ class PlaybackControllerTests(unittest.TestCase):
     def test_refresh_recording_state_emits(self) -> None:
         self.controller.refresh_recording_state()
         self.assertFalse(self.controller.get_state().is_recording)
+
+    def test_rewind_rejected_when_recording_not_active(self) -> None:
+        # No _force_recording_state() — recording state is NOT_RECORDING.
+        # Rewind must be a no-op and not switch into REPLAY.
+        before_mode = self.controller.get_state().current_playback_mode
+        self.controller.rewind_10_seconds()
+        self.assertEqual(self.controller.get_state().current_playback_mode, before_mode)
+
+    def test_pause_rejected_when_recording_not_active(self) -> None:
+        before_mode = self.controller.get_state().current_playback_mode
+        self.controller.pause_playback()
+        self.assertEqual(self.controller.get_state().current_playback_mode, before_mode)
+
+    def test_recording_stop_mid_replay_snaps_back_to_live(self) -> None:
+        from app.core.replay_state import ReplayState
+
+        self._force_recording_state()
+        self.controller.rewind_10_seconds()
+        self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
+        # Now simulate the operator stopping recording while replay is active.
+        self.recording_manager.recording_state.force(RecordingState.NOT_RECORDING)
+        self.controller.refresh_recording_state()
+        self.assertEqual(self.controller.replay_state.state, ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
+        self.assertNotEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
 
 
 if __name__ == "__main__":

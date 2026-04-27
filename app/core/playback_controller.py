@@ -11,6 +11,8 @@ from PySide6.QtCore import QTimer
 
 from app.core.app_state import UiState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
+from app.core.recording_state import RecordingState
+from app.core.replay_state import ACTIVE_REPLAY_STATES, ReplayState, make_replay_state_machine
 from app.core.signals import AppSignals
 from app.core.telemetry import time_block
 from app.media.feed_runtime import FeedRuntime
@@ -67,6 +69,11 @@ class PlaybackController:
         self._overlay_timer = QTimer(self.signals)
         self._overlay_timer.setInterval(250)
         self._overlay_timer.timeout.connect(self._on_overlay_timer_tick)
+        # Operator-only replay state machine. The program controller leaves
+        # this None and continues to behave purely on `live_only`.
+        self.replay_state = (
+            None if live_only else make_replay_state_machine(role=session_role)
+        )
 
     def initialize(self, session_id: str) -> None:
         """Activate the controller for started feed runtimes."""
@@ -94,6 +101,9 @@ class PlaybackController:
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
+        if not self._replay_actions_allowed():
+            self._emit_state("Replay unavailable: start game recording first.")
+            return
         with self._lock:
             self._stop_replay_clock_locked()
             if self._state.current_playback_mode == PlaybackMode.REPLAY and self._playback_timestamp is not None:
@@ -109,6 +119,8 @@ class PlaybackController:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()
                 return
+            assert self.replay_state is not None
+            self.replay_state.transition_to(ReplayState.PAUSED)
             self._playback_timestamp = base_timestamp
             self._playback_rate = 0.0
             self._display_replay_ref = pause_ref
@@ -123,6 +135,9 @@ class PlaybackController:
         """Move the viewed output back by ten seconds without stopping ingest."""
         if self._live_only:
             self._emit_state("This output is locked to live.")
+            return
+        if not self._replay_actions_allowed():
+            self._emit_state("Replay unavailable: start game recording first.")
             return
         with self._lock:
             if not self._replay_buffer.is_running():
@@ -145,13 +160,18 @@ class PlaybackController:
                 self._emit_state()
                 return
 
+            assert self.replay_state is not None
+            self.replay_state.transition_to(ReplayState.SEEKING)
             target_timestamp = max(oldest_timestamp, base_timestamp - 10.0)
             with time_block("replay_seek"):
                 replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
             if replay_ref is None:
                 self._state.error_message = "Replay frame is not available yet."
+                # Fall back to live so we don't strand the machine in SEEKING.
+                self.replay_state.transition_to(ReplayState.LIVE_WHILE_RECORDING)
                 self._emit_state()
                 return
+            self.replay_state.transition_to(ReplayState.REPLAYING)
             self._playback_timestamp = target_timestamp
             self._playback_rate = 1.0
             self._display_replay_ref = replay_ref
@@ -167,6 +187,12 @@ class PlaybackController:
         """Return the viewed output to the live edge."""
         with self._lock:
             self._stop_replay_clock_locked()
+            if self.replay_state is not None and self.replay_state.state in ACTIVE_REPLAY_STATES:
+                self.replay_state.transition_to(ReplayState.JUMPING_TO_LIVE)
+                if self._recording_manager.recording_state.state == RecordingState.RECORDING:
+                    self.replay_state.transition_to(ReplayState.LIVE_WHILE_RECORDING)
+                else:
+                    self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
             self._playback_timestamp = self._latest_live_timestamp
             self._playback_rate = 1.0
             self._display_replay_ref = None
@@ -186,14 +212,25 @@ class PlaybackController:
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
+        if not self._replay_actions_allowed():
+            self._emit_state("Replay unavailable: start game recording first.")
+            return
         if self.get_state().current_playback_mode == PlaybackMode.LIVE:
             self.rewind_10_seconds()
         with self._lock:
+            assert self.replay_state is not None
             self._playback_rate = max(0.0, playback_rate)
             if self._playback_rate == 0.0:
+                self.replay_state.transition_to(ReplayState.PAUSED)
                 self._state.current_playback_mode = PlaybackMode.PAUSED
                 self._stop_replay_clock_locked()
             else:
+                target = (
+                    ReplayState.SLOW_MOTION
+                    if self._playback_rate < 1.0
+                    else ReplayState.REPLAYING
+                )
+                self.replay_state.transition_to(target)
                 self._state.current_playback_mode = PlaybackMode.REPLAY
                 if self._playback_timestamp is not None:
                     self._start_replay_clock_locked(self._playback_timestamp)
@@ -307,6 +344,54 @@ class PlaybackController:
             self._state.is_recording = self._recording_manager.is_any_recording()
         else:
             self._state.is_recording = self._recording_manager.is_recording(self._primary_feed_id)
+        self._sync_replay_state_with_recording_locked()
+
+    def _sync_replay_state_with_recording_locked(self) -> None:
+        """Mirror long-recording transitions into the replay state machine.
+
+        - Enter `LIVE_WHILE_RECORDING` when long recording starts.
+        - Snap any active replay back to live and then to
+          `REPLAY_UNAVAILABLE_NOT_RECORDING` when long recording stops.
+        """
+        if self.replay_state is None:
+            return
+        recording_active = (
+            self._recording_manager.recording_state.state == RecordingState.RECORDING
+        )
+        current = self.replay_state.state
+        if recording_active:
+            if current == ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING:
+                self.replay_state.transition_to(ReplayState.LIVE_WHILE_RECORDING)
+            return
+        # Recording is not active.
+        if current in ACTIVE_REPLAY_STATES:
+            self.replay_state.transition_to(ReplayState.JUMPING_TO_LIVE)
+            self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
+            self._stop_replay_clock_locked()
+            self._playback_timestamp = self._latest_live_timestamp
+            self._playback_rate = 1.0
+            self._display_replay_ref = None
+            self._state.current_playback_mode = (
+                PlaybackMode.LIVE
+                if self._state.source_connected
+                else PlaybackMode.SOURCE_LOST
+            )
+        elif current == ReplayState.LIVE_WHILE_RECORDING:
+            self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
+
+    def _replay_actions_allowed(self) -> bool:
+        """Return True when replay transport is permitted by recording state.
+
+        Per §10.4 / §15.2: replay is bound to long recording. Until the
+        operator presses Start Game Recording the rolling buffer still fills,
+        but transport actions (pause / rewind / slow / jump-to-live) are
+        rejected by the doc's contract and surfaced to the operator.
+        """
+        if self.replay_state is None:
+            return False
+        return (
+            self._recording_manager.recording_state.state == RecordingState.RECORDING
+        )
 
     def _emit_state(self, status_message: str | None = None) -> None:
         self.signals.state_changed.emit(self._state)
