@@ -1723,20 +1723,22 @@ Exit criteria:
 
 ## Phase 1 – Observability and Metrics
 
+**Status: ✅ Complete** (slices 1.A through 1.E).
+
 Goal:
 
 - Add measurement before major refactors.
 
 Tasks:
 
-- Add per-feed FPS metrics.
-- Add dropped-frame counters where available.
-- Add GStreamer bus logging.
-- Add disk throughput metric.
-- Add replay seek timing.
-- Add segment write timing.
-- Add visible diagnostics panel or debug log output.
-- Add health events.
+- Add per-feed FPS metrics. *(1.A)*
+- Add dropped-frame counters where available. *(deferred — depends on `qos` bus messages, slated for Phase 2.A)*
+- Add GStreamer bus logging. *(1.B)*
+- Add disk throughput metric. *(1.C)*
+- Add replay seek timing. *(1.D)*
+- Add segment write timing. *(1.D)*
+- Add visible diagnostics panel or debug log output. *(1.E)*
+- Add health events. *(1.E)*
 
 Do not:
 
@@ -1744,12 +1746,20 @@ Do not:
 - Change replay storage.
 - Change UI behavior except diagnostics.
 
-Exit criteria:
+Exit criteria (all met):
 
-- Operator can see/log feed health.
-- Replay requests produce timing logs.
-- Segment writes are logged.
-- Disk free/throughput is visible.
+- Operator can see/log feed health. *(diagnostics widget + `logs/health_events.jsonl`)*
+- Replay requests produce timing logs. *(`replay_seek` latency sampler)*
+- Segment writes are logged. *(`segment_write_video` / `segment_write_audio`)*
+- Disk free/throughput is visible. *(5s disk log line + diagnostics widget)*
+
+Slices delivered:
+
+- **1.A — Per-feed FPS counters.** New `app/core/telemetry.py` (`RateCounter`, `FeedMetrics`, `TelemetryHub`). 1Hz log line per feed. Counters tick at the three `appsink` seams in `pipeline_manager.py` (preview, record, replay-write).
+- **1.B — Unified GStreamer bus logging.** New `app/media/gst_bus_log.py`. Bus filter expanded from `ERROR | EOS` to `ERROR | WARNING | INFO | EOS`. Every bus log line tagged with `feed_id` and `pipeline_role` (`live` / `replay` / `replay-audio`).
+- **1.C — Disk metrics.** `DiskSampler` + `DiskSnapshot`. Sustained-write MB/s estimated from the change in `shutil.disk_usage(...).free` between samples; emitted on a 5s cadence, surfaced in the diagnostics widget.
+- **1.D — Write/seek timing.** `LatencySampler`, `LatencyRegistry`, and a `time_block(name)` context manager. Wraps `MuxedMediaWriter.write_frame` / `write_audio_chunk` (`segment_write_*`) and the operator-initiated `rewind_10_seconds` lookup (`replay_seek`). Roll-ups (count / avg / p95 / max) flushed by the hub each tick.
+- **1.E — Health events + diagnostics widget.** New `app/core/health_events.py` with append-only JSONL persistence under `<session>/logs/health_events.jsonl`. Hub auto-emits `feed_lost` after 3 consecutive zero-source-fps samples and `disk_low` below 5% free, with paired `feed_recovered` / `disk_recovered` on recovery. New `app/ui/diagnostics_widget.py` mounted on the operator window only.
 
 ---
 
@@ -1777,6 +1787,51 @@ Exit criteria:
 - Start/stop recording transitions are explicit.
 - Replay/live transitions are explicit.
 - Feed disconnect can be represented cleanly.
+
+### Slices
+
+Phase 2 lands in four slices. Each is independently revertable; each commits separately. The work touches `app/core/`, `app/media/feed_runtime.py`, `app/storage/session_manager.py`, and the two UI widgets — no media-pipeline shape change.
+
+**Naming note before starting:** the existing `app/core/app_state.py` dataclass `AppState` collides with the doc's top-level `AppState` enum (§10.1). Slice 2.A renames the dataclass to `UiState` (it really is per-output Qt UI state) so the enum can claim the `AppState` name in 2.D.
+
+**2.A — State-machine framework + `FeedState`**
+
+- New `app/core/state_machine.py` — small generic `StateMachine[E]` with: declared transitions table, current state, `transition_to(new)` that rejects illegal moves, emits a `health_event(category="invalid_transition")`, and returns the resulting state. No threading-model change beyond a single internal lock.
+- `FeedState` enum from §10.2 (`DISABLED`, `CONNECTING`, `LIVE`, `DEGRADED`, `DISCONNECTED`, `RECONNECTING`, `FAILED`).
+- One `StateMachine[FeedState]` per `FeedRuntime`. The existing `is_started` / `is_connected` booleans become read-throughs over the state machine.
+- Bus-logger hook: `gst_bus_log` upgrades a sustained `WARNING` to a `DEGRADED` transition; an `ERROR` triggers `DISCONNECTED`. The 1.E `feed_lost` emission is rerouted so it flows from the state machine instead of the telemetry hub's zero-fps streak (the streak heuristic stays as a fallback for sources that never raise bus errors).
+- Pulls in the Phase 1 deferred item — `qos` (dropped-buffer) bus messages — by adding them to the bus filter and counting them per feed; sustained drops drive `LIVE → DEGRADED`.
+- Rename `app/core/app_state.py:AppState` → `UiState` in this slice, so the new top-level enum can take the name in 2.D without a noisy rename commit later.
+- Tests: `StateMachine` helper, `FeedState` transition table, `qos`-driven degraded transition.
+
+**2.B — `RecordingState` + `SessionState`**
+
+- `RecordingState` enum from §10.3 (`NOT_RECORDING`, `STARTING_RECORDING`, `RECORDING`, `STOPPING_RECORDING`, `FINALIZING`, `RECORDING_ERROR`). One global `StateMachine[RecordingState]` owned by `RecordingManager`.
+- `SessionState` enum from §10.6 (`CREATED`, `RECORDING`, `STOPPED`, `FINALIZED`, `DIRTY`, `ARCHIVED`). One global `StateMachine[SessionState]` owned by `SessionManager`.
+- `ApplicationCoordinator.toggle_long_session_recording` and the per-feed start/stop drive `RecordingState`. `SessionManager.start_new_session` / `close()` drive `SessionState`.
+- Persist current `SessionState` to `<session>/session.json` on every transition. The presence of a session whose persisted state is `RECORDING` or `STOPPED` (no `finalized_at`) is the marker §10.6 / §11.4 will use to detect `DIRTY` on next launch — but the recovery prompt UI itself is later phase work.
+- Tests: both transition tables, file persistence, idempotency of `STOPPED → FINALIZED`.
+
+**2.C — `ReplayState` (replaces/extends `PlaybackMode`)**
+
+- `ReplayState` enum from §10.4 (`REPLAY_UNAVAILABLE_NOT_RECORDING`, `LIVE_WHILE_RECORDING`, `REPLAY_AVAILABLE`, `SEEKING`, `REPLAYING`, `PAUSED`, `SLOW_MOTION`, `JUMPING_TO_LIVE`, `REPLAY_DEGRADED`).
+- One `StateMachine[ReplayState]` per `PlaybackController` (operator only — program is permanently `LIVE_WHILE_RECORDING` once recording starts, and undefined otherwise).
+- Replace the controller's free-form `PlaybackMode` checks in `pause_playback`, `rewind_10_seconds`, `set_playback_rate`, `jump_to_live` with explicit transitions.
+- **Behavior change worth flagging:** the doc requires replay actions to be rejected when `recording_state != RECORDING` (§10.4, §15.2). Current code allows rewind from a fresh session before the operator has started long recording. This slice enforces the doc's rule. Pre-Phase-4 the rolling replay buffer is still JPEG-backed and decoupled from recording, so the rejection is enforced by checking `RecordingState`, not by absence of segments. Worth socializing this with the volunteer-operator workflow before merging — the upside is the doc and code finally agree; the downside is a UX regression for the "review a play before formally pressing Record" case.
+- Tests: replay-state transitions, recording-required guard, `LIVE → REPLAY_*` only when recording is `RECORDING`.
+
+**2.D — Aggregate `AppState` + UI surfacing + invalid-transition logging**
+
+- `AppState` enum from §10.1 (`STARTING`, `IDLE`, `PREVIEWING`, `RECORDING`, `REPLAYING`, `PAUSED`, `SLOW_MOTION`, `DEGRADED`, `ERROR`, `SHUTTING_DOWN`). Computed by `ApplicationCoordinator` from the four sub-states.
+- Update `StatusBarWidget` to display `AppState` and `RecordingState`. Update `DiagnosticsWidget` to also show per-feed `FeedState` next to FPS, and current `ReplayState` for the operator controller.
+- Audit every rejected transition: each one becomes a `health_event(severity=warning, category="invalid_transition", metadata={"from": ..., "to": ..., "machine": ...})`. The diagnostics widget surfaces a count of recent invalid transitions.
+- Tests: aggregation logic for `AppState`, status-widget label rendering for each state, invalid-transition health event shape.
+
+### Out of scope for Phase 2
+
+- The §11.4 startup recovery prompt UI ("Resume / End and finalize / Discard"). 2.B persists enough state to *detect* `DIRTY` on next launch but does not act on it.
+- The `ARCHIVED` transition. That belongs to the Phase 8 post-session processor, not the live app.
+- Anything that touches the GStreamer pipeline shape, codec, container, or replay storage path. Phase 2 is a state-only refactor.
 
 ---
 
