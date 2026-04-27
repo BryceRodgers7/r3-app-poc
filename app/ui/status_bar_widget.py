@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QGridLayout, QLabel, QFrame, QWidget
 
-from app.core.app_state import AppState
+from app.core.app_state import UiState
 
 
 class StatusBarWidget(QFrame):
@@ -50,7 +50,7 @@ class StatusBarWidget(QFrame):
             """
         )
 
-    def update_state(self, state: AppState) -> None:
+    def update_state(self, state: UiState) -> None:
         """Refresh all labels from the latest application state."""
         if state.current_playback_mode.value == "REPLAY":
             self.mode_value.setText(f"REPLAY -{state.seconds_behind_live:.0f}s")

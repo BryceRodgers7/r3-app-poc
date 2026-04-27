@@ -6,8 +6,11 @@ from dataclasses import dataclass
 import logging
 import unittest
 
+from app.core import health_events
+from app.core.feed_state import FeedState, make_feed_state_machine
 from app.core.health_events import HealthEventLog
 from app.core.telemetry import (
+    DROPPED_BUFFERS_DEGRADED_THRESHOLD,
     DiskSampler,
     FeedMetrics,
     FEED_LOST_ZERO_SAMPLES,
@@ -450,6 +453,88 @@ class TelemetryHubHealthTests(unittest.TestCase):
         hub.set_disk_path("X:\\fake", sampler=sampler)
         hub._log_disk_snapshot()
         self.assertFalse(self.health_log.has_open_event(category="disk_low", feed_id=None))
+
+
+class TelemetryHubFeedStateTests(unittest.TestCase):
+    """Tests for hub-driven `FeedState` transitions (slice 2.A)."""
+
+    def setUp(self) -> None:
+        reset_latency_registry()
+        # Swap the process-wide log so hub + state-machine emissions land in
+        # one inspectable instance.
+        self._orig_log = health_events._DEFAULT_LOG
+        health_events._DEFAULT_LOG = HealthEventLog()
+        self.log = health_events._DEFAULT_LOG
+
+    def tearDown(self) -> None:
+        health_events._DEFAULT_LOG = self._orig_log
+
+    def test_streak_drives_state_machine_to_disconnected(self) -> None:
+        hub = TelemetryHub(health_log=self.log)
+        hub.register("cam_a", "Cam A")
+        sm = make_feed_state_machine("cam_a", "Cam A")
+        sm.transition_to(FeedState.CONNECTING)
+        sm.transition_to(FeedState.LIVE)
+        hub.register_feed_state("cam_a", sm)
+        for _ in range(FEED_LOST_ZERO_SAMPLES):
+            hub._log_all_snapshots()
+        self.assertIs(sm.state, FeedState.DISCONNECTED)
+        self.assertTrue(self.log.has_open_event(category="feed_lost", feed_id="cam_a"))
+
+    def test_dropped_buffers_drive_live_to_degraded(self) -> None:
+        clock = FakeClock()
+        hub = TelemetryHub(health_log=self.log)
+        metrics = hub.register("cam_a", "Cam A")
+        # Inject a clock-controlled internal counter so the test is deterministic.
+        metrics._dropped = RateCounter(window_seconds=1.0, clock=clock)
+        metrics._source = RateCounter(window_seconds=1.0, clock=clock)
+        sm = make_feed_state_machine("cam_a", "Cam A")
+        sm.transition_to(FeedState.CONNECTING)
+        sm.transition_to(FeedState.LIVE)
+        hub.register_feed_state("cam_a", sm)
+        # Source frames present (so we don't trip the zero-fps streak),
+        # plus enough QOS drops to exceed the threshold.
+        for _ in range(30):
+            metrics.tick_source()
+        for _ in range(int(DROPPED_BUFFERS_DEGRADED_THRESHOLD * 1.0) + 2):
+            metrics.tick_dropped()
+        hub._log_all_snapshots()
+        self.assertIs(sm.state, FeedState.DEGRADED)
+        self.assertTrue(self.log.has_open_event(category="feed_degraded", feed_id="cam_a"))
+
+    def test_drops_subside_returns_state_to_live(self) -> None:
+        clock = FakeClock()
+        hub = TelemetryHub(health_log=self.log)
+        metrics = hub.register("cam_a", "Cam A")
+        metrics._dropped = RateCounter(window_seconds=1.0, clock=clock)
+        metrics._source = RateCounter(window_seconds=1.0, clock=clock)
+        sm = make_feed_state_machine("cam_a", "Cam A")
+        sm.force(FeedState.LIVE)
+        hub.register_feed_state("cam_a", sm)
+        for _ in range(30):
+            metrics.tick_source()
+        for _ in range(5):
+            metrics.tick_dropped()
+        hub._log_all_snapshots()
+        self.assertIs(sm.state, FeedState.DEGRADED)
+        # Now drops subside: time advances, dropped counter empties.
+        clock.advance(2.0)
+        for _ in range(30):
+            metrics.tick_source()
+        hub._log_all_snapshots()
+        self.assertIs(sm.state, FeedState.LIVE)
+
+
+class FeedMetricsDroppedTests(unittest.TestCase):
+    def test_dropped_counter_independent(self) -> None:
+        clock = FakeClock()
+        m = FeedMetrics("cam_a", "A", window_seconds=1.0, clock=clock)
+        for _ in range(10):
+            m.tick_dropped()
+        snap = m.snapshot()
+        self.assertGreater(snap.dropped_per_sec, 0.0)
+        self.assertEqual(snap.preview_fps, 0.0)
+        self.assertEqual(snap.recording_fps, 0.0)
 
 
 class LatencySamplerTests(unittest.TestCase):

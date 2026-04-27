@@ -9,7 +9,7 @@ from collections.abc import Sequence
 
 from PySide6.QtCore import QTimer
 
-from app.core.app_state import AppState
+from app.core.app_state import UiState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
 from app.core.signals import AppSignals
 from app.core.telemetry import time_block
@@ -48,7 +48,7 @@ class PlaybackController:
         self._session_role = session_role
         self._live_only = live_only
         self.signals = AppSignals()
-        self._state = AppState(current_source_name=default_source_name)
+        self._state = UiState(current_source_name=default_source_name)
         self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
         self._latest_live_frame: MediaFrame | None = None
         self._latest_live_by_feed: dict[str, MediaFrame] = {}
@@ -228,7 +228,7 @@ class PlaybackController:
                 status_message = self._state.warning_message
         self._emit_state(status_message)
 
-    def get_state(self) -> AppState:
+    def get_state(self) -> UiState:
         """Return the current application state."""
         with self._lock:
             return self._state

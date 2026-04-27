@@ -15,7 +15,9 @@ from typing import Any
 
 import numpy as np
 
+from app.core.feed_state import FeedState
 from app.core.models import AudioChunk, AudioFormat, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
+from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
 from app.media.frame_overlay import render_frame_overlay
 from app.media.gst_bus_log import log_bus_message
@@ -63,6 +65,7 @@ class PipelineManager:
         self._replay_running = False
         self._frame_callback: Callable[[MediaFrame], None] | None = None
         self._feed_metrics: FeedMetrics | None = None
+        self._feed_state: StateMachine[FeedState] | None = None
 
         self._Gst: Any | None = None
         self._GstVideo: Any | None = None
@@ -220,6 +223,10 @@ class PipelineManager:
     def set_feed_metrics(self, metrics: FeedMetrics | None) -> None:
         """Attach a `FeedMetrics` instance for per-branch FPS counting."""
         self._feed_metrics = metrics
+
+    def set_feed_state(self, state_machine: StateMachine[FeedState] | None) -> None:
+        """Attach the per-feed state machine driven by bus events."""
+        self._feed_state = state_machine
 
     def set_video_window_handle(self, window_handle: int) -> None:
         """Attach the active embedded video sink to a Qt-owned native child window."""
@@ -866,6 +873,7 @@ class PipelineManager:
             | Gst.MessageType.WARNING
             | Gst.MessageType.INFO
             | Gst.MessageType.EOS
+            | Gst.MessageType.QOS
         )
         while not self._stop_event.is_set():
             if self._poll_bus_for_messages(
@@ -924,11 +932,28 @@ class PipelineManager:
                 summary=summary,
                 details=details,
             )
+            if self._feed_state is not None and pipeline_role == "live":
+                # ERROR on the live ingest pipeline means we lost the source.
+                # Replay/replay-audio errors are non-fatal for the feed itself.
+                self._feed_state.transition_to(FeedState.DISCONNECTED)
             if fatal:
                 placeholder = details or summary
                 self._preview_output.show_placeholder_message(f"GStreamer error: {placeholder}")
                 self._stop_event.set()
                 return True
+            return False
+
+        if mtype == Gst.MessageType.QOS:
+            # QOS messages indicate dropped buffers somewhere downstream.
+            # Count them on the feed metrics; sustained drops drive the state
+            # machine to DEGRADED via the telemetry hub's evaluation path.
+            if self._feed_metrics is not None and pipeline_role == "live":
+                self._feed_metrics.tick_dropped()
+            log_bus_message(
+                feed_id=feed_id,
+                pipeline_role=pipeline_role,
+                type_name="QOS",
+            )
             return False
 
         if mtype == Gst.MessageType.WARNING:

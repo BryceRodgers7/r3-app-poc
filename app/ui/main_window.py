@@ -11,7 +11,7 @@ from app.config.settings import AppSettings
 
 if TYPE_CHECKING:
     from app.core.application_coordinator import ApplicationCoordinator
-from app.core.app_state import AppState
+from app.core.app_state import UiState
 from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.output_renderer import MultiFeedOutputRenderer
@@ -105,7 +105,7 @@ class MainWindow(QMainWindow):
         self._controller.signals.state_changed.connect(self._render_state)
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
 
-    def _render_state(self, state: AppState) -> None:
+    def _render_state(self, state: UiState) -> None:
         self.status_widget.update_state(state)
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,

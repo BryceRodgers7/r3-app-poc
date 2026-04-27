@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.config.settings import AppSettings
 from app.core.feed_registry import FeedRegistry
+from app.core.feed_state import make_feed_state_machine
 from app.core.health_events import default_log as default_health_log
 from app.core.playback_controller import PlaybackController
 from app.core.telemetry import TelemetryHub
@@ -159,12 +160,16 @@ def build_default_application_coordinator(
         )
         feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
         pipeline_manager.set_feed_metrics(feed_metrics)
+        feed_state = make_feed_state_machine(feed.feed_id, feed.display_name)
+        pipeline_manager.set_feed_state(feed_state)
+        telemetry_hub.register_feed_state(feed.feed_id, feed_state)
         runtime = FeedRuntime(
             feed=feed,
             source=source,
             pipeline_manager=pipeline_manager,
             recorder=recorder,
             replay_store=replay_store,
+            feed_state=feed_state,
         )
         feed_runtimes[feed.feed_id] = runtime
         recording_manager.register(feed.feed_id, recorder)

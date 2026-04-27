@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from app.core.feed_state import FeedState, make_feed_state_machine
 from app.core.models import FeedDefinition, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
+from app.core.state_machine import StateMachine
 from app.media.pipeline_manager import PipelineManager
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayStore
@@ -21,12 +23,16 @@ class FeedRuntime:
         pipeline_manager: PipelineManager,
         recorder: Recorder,
         replay_store: ReplayStore,
+        feed_state: StateMachine[FeedState] | None = None,
     ) -> None:
         self.feed = feed
         self.source = source
         self.pipeline_manager = pipeline_manager
         self.recorder = recorder
         self.replay_store = replay_store
+        self.feed_state = feed_state if feed_state is not None else make_feed_state_machine(
+            feed.feed_id, feed.display_name
+        )
         self._live_frame_listeners: list[Callable[[MediaFrame], None]] = []
         self._live_overlay_listeners: list[Callable[[FrameOverlayInfo], None]] = []
         self._latest_live_frame: MediaFrame | None = None
@@ -37,15 +43,21 @@ class FeedRuntime:
         """Start the feed ingest pipeline and persistence services."""
         self.pipeline_manager.set_frame_callback(self._on_live_frame)
         self.pipeline_manager.set_live_sample_callback(self._on_live_overlay)
+        self.feed_state.transition_to(FeedState.CONNECTING)
         connected = self.pipeline_manager.connect_source()
         self.pipeline_manager.start_replay_buffer(session_paths, feed_id=self.feed.feed_id)
         self.pipeline_manager.start_preview()
         self._started = True
+        if not connected:
+            # Source factory already failed. Mark disconnected; LIVE will be
+            # entered later when first frame arrives via on_live_frame.
+            self.feed_state.transition_to(FeedState.DISCONNECTED)
         return connected
 
     def stop(self) -> None:
         """Stop the feed runtime."""
         self._started = False
+        self.feed_state.transition_to(FeedState.DISABLED)
         self.pipeline_manager.stop_all()
 
     def is_started(self) -> bool:
@@ -53,8 +65,8 @@ class FeedRuntime:
         return self._started
 
     def is_connected(self) -> bool:
-        """Return whether the source is currently connected."""
-        return self.pipeline_manager.is_source_connected()
+        """Return whether the source is currently delivering frames."""
+        return self.feed_state.state in {FeedState.LIVE, FeedState.DEGRADED}
 
     def get_source_name(self) -> str:
         """Return the current source display name."""
@@ -88,6 +100,17 @@ class FeedRuntime:
         listener(self._latest_live_overlay)
 
     def _on_live_frame(self, frame: MediaFrame) -> None:
+        if self.feed_state.state in {
+            FeedState.CONNECTING,
+            FeedState.RECONNECTING,
+            FeedState.DEGRADED,
+            FeedState.DISCONNECTED,
+        }:
+            # A frame arrived; promote toward LIVE. DISCONNECTED must hop
+            # through RECONNECTING per the §10.2 transition table.
+            if self.feed_state.state == FeedState.DISCONNECTED:
+                self.feed_state.transition_to(FeedState.RECONNECTING)
+            self.feed_state.transition_to(FeedState.LIVE)
         self._latest_live_frame = frame
         for listener in list(self._live_frame_listeners):
             listener(frame)

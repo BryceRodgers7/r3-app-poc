@@ -19,12 +19,15 @@ import threading
 import time
 from typing import Any, Optional
 
+from app.core.feed_state import FeedState
 from app.core.health_events import HealthEventLog, HealthSeverity, default_log
+from app.core.state_machine import StateMachine
 
 LOGGER = logging.getLogger(__name__)
 
 FEED_LOST_ZERO_SAMPLES = 3
 DISK_LOW_FRACTION = 0.05
+DROPPED_BUFFERS_DEGRADED_THRESHOLD = 1.0  # buffers/sec sustained → DEGRADED
 
 
 class RateCounter:
@@ -88,6 +91,7 @@ class FeedMetricsSnapshot:
     source_fps: float
     preview_fps: float
     recording_fps: float
+    dropped_per_sec: float = 0.0
 
 
 class FeedMetrics:
@@ -95,11 +99,13 @@ class FeedMetrics:
 
     `tick_source` fires at the head of the per-feed pipeline (one event per
     inbound frame, regardless of branch). `tick_preview` and `tick_recording`
-    fire on the respective tee branch sinks. `recording_fps` is expected to
-    be zero whenever the operator has not started long-form game recording.
+    fire on the respective tee branch sinks. `tick_dropped` fires once per
+    GStreamer QOS bus message on the live pipeline. `recording_fps` is
+    expected to be zero whenever the operator has not started long-form game
+    recording.
     """
 
-    __slots__ = ("feed_id", "display_name", "_source", "_preview", "_recording")
+    __slots__ = ("feed_id", "display_name", "_source", "_preview", "_recording", "_dropped")
 
     def __init__(
         self,
@@ -114,6 +120,7 @@ class FeedMetrics:
         self._source = RateCounter(window_seconds, clock=clock)
         self._preview = RateCounter(window_seconds, clock=clock)
         self._recording = RateCounter(window_seconds, clock=clock)
+        self._dropped = RateCounter(window_seconds, clock=clock)
 
     def tick_source(self) -> None:
         self._source.tick()
@@ -124,6 +131,9 @@ class FeedMetrics:
     def tick_recording(self) -> None:
         self._recording.tick()
 
+    def tick_dropped(self) -> None:
+        self._dropped.tick()
+
     def snapshot(self) -> FeedMetricsSnapshot:
         return FeedMetricsSnapshot(
             feed_id=self.feed_id,
@@ -131,6 +141,7 @@ class FeedMetrics:
             source_fps=self._source.rate(),
             preview_fps=self._preview.rate(),
             recording_fps=self._recording.rate(),
+            dropped_per_sec=self._dropped.rate(),
         )
 
 
@@ -380,6 +391,7 @@ class TelemetryHub:
         self._started = False
         self._health_log = health_log if health_log is not None else default_log()
         self._zero_fps_streak: dict[str, int] = {}
+        self._feed_states: dict[str, StateMachine[FeedState]] = {}
 
     def register(self, feed_id: str, display_name: str) -> FeedMetrics:
         """Create and store a `FeedMetrics` for `feed_id`."""
@@ -395,6 +407,17 @@ class TelemetryHub:
     def metrics_for(self, feed_id: str) -> Optional[FeedMetrics]:
         with self._lock:
             return self._feeds.get(feed_id)
+
+    def register_feed_state(
+        self, feed_id: str, state_machine: StateMachine[FeedState]
+    ) -> None:
+        """Attach a per-feed state machine so the hub can drive transitions."""
+        with self._lock:
+            self._feed_states[feed_id] = state_machine
+
+    def feed_state(self, feed_id: str) -> StateMachine[FeedState] | None:
+        with self._lock:
+            return self._feed_states.get(feed_id)
 
     def snapshot(self) -> list[FeedMetricsSnapshot]:
         """Snapshot every registered feed in registration order."""
@@ -485,30 +508,72 @@ class TelemetryHub:
             )
 
     def _evaluate_feed_health(self, snap: FeedMetricsSnapshot) -> None:
-        """Emit a health event when a feed appears lost (sustained zero fps)."""
+        """Drive the per-feed state machine from observed counters.
+
+        Two heuristics run here:
+          - sustained zero source-fps (`FEED_LOST_ZERO_SAMPLES`) → DISCONNECTED.
+            Acts as a fallback for sources that never raise a bus ERROR.
+          - sustained QOS drops (`DROPPED_BUFFERS_DEGRADED_THRESHOLD`/sec) →
+            DEGRADED.
+
+        Health events for `feed_lost` / `feed_recovered` / `feed_degraded`
+        are emitted by the state machine's `on_enter` hook (see
+        `feed_state.make_feed_state_machine`); the hub does not record them
+        directly.
+        """
+        feed_state = self.feed_state(snap.feed_id)
+
         if snap.source_fps == 0.0:
             streak = self._zero_fps_streak.get(snap.feed_id, 0) + 1
             self._zero_fps_streak[snap.feed_id] = streak
-            if streak == FEED_LOST_ZERO_SAMPLES and not self._health_log.has_open_event(
+            if streak == FEED_LOST_ZERO_SAMPLES:
+                if feed_state is not None:
+                    if feed_state.state in {FeedState.LIVE, FeedState.DEGRADED}:
+                        feed_state.transition_to(FeedState.DISCONNECTED)
+                elif not self._health_log.has_open_event(
+                    category="feed_lost", feed_id=snap.feed_id
+                ):
+                    # Legacy path for hubs without a registered state machine
+                    # (kept for tests and tooling that exercise the hub
+                    # directly).
+                    self._health_log.record(
+                        severity=HealthSeverity.WARNING,
+                        category="feed_lost",
+                        message=(
+                            f"No frames observed from {snap.display_name} "
+                            f"for {streak}s."
+                        ),
+                        feed_id=snap.feed_id,
+                    )
+            return
+
+        # source_fps > 0
+        if self._zero_fps_streak.get(snap.feed_id):
+            self._zero_fps_streak[snap.feed_id] = 0
+
+        if feed_state is None:
+            # Legacy recovery path (no state machine registered).
+            if self._health_log.has_open_event(
                 category="feed_lost", feed_id=snap.feed_id
             ):
                 self._health_log.record(
-                    severity=HealthSeverity.WARNING,
-                    category="feed_lost",
-                    message=f"No frames observed from {snap.display_name} for {streak}s.",
+                    severity=HealthSeverity.INFO,
+                    category="feed_recovered",
+                    message=f"Frames resumed from {snap.display_name}.",
                     feed_id=snap.feed_id,
                 )
+                self._health_log.clear_open_event(
+                    category="feed_lost", feed_id=snap.feed_id
+                )
+            return
+
+        # State-machine driven recovery + degradation evaluation.
+        if snap.dropped_per_sec >= DROPPED_BUFFERS_DEGRADED_THRESHOLD:
+            if feed_state.state == FeedState.LIVE:
+                feed_state.transition_to(FeedState.DEGRADED)
         else:
-            if self._zero_fps_streak.get(snap.feed_id):
-                self._zero_fps_streak[snap.feed_id] = 0
-                if self._health_log.has_open_event(category="feed_lost", feed_id=snap.feed_id):
-                    self._health_log.record(
-                        severity=HealthSeverity.INFO,
-                        category="feed_recovered",
-                        message=f"Frames resumed from {snap.display_name}.",
-                        feed_id=snap.feed_id,
-                    )
-                    self._health_log.clear_open_event(category="feed_lost", feed_id=snap.feed_id)
+            if feed_state.state == FeedState.DEGRADED:
+                feed_state.transition_to(FeedState.LIVE)
 
     def _log_disk_snapshot(self) -> None:
         """Sample disk usage and emit one INFO log line."""
