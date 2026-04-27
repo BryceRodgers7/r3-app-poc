@@ -8,16 +8,23 @@ without Qt or GStreamer present.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
+import math
 from pathlib import Path
 import shutil
 import threading
 import time
 from typing import Any, Optional
 
+from app.core.health_events import HealthEventLog, HealthSeverity, default_log
+
 LOGGER = logging.getLogger(__name__)
+
+FEED_LOST_ZERO_SAMPLES = 3
+DISK_LOW_FRACTION = 0.05
 
 
 class RateCounter:
@@ -128,6 +135,141 @@ class FeedMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class LatencySnapshot:
+    """Roll-up of one named latency sampler over the trailing window."""
+
+    name: str
+    count: int
+    avg_ms: float
+    max_ms: float
+    p95_ms: float
+
+
+class LatencySampler:
+    """Rolling-window latency aggregator for one named operation.
+
+    `record(duration_seconds)` adds a sample; `snapshot()` returns the count,
+    mean, max, and p95 over the trailing `window_seconds`. Thread-safe.
+    """
+
+    __slots__ = ("name", "_window", "_samples", "_lock", "_clock")
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        window_seconds: float = 5.0,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if not name:
+            raise ValueError("name must be non-empty")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        self.name = name
+        self._window = float(window_seconds)
+        self._samples: deque[tuple[float, float]] = deque()
+        self._lock = threading.Lock()
+        self._clock = clock or time.monotonic
+
+    def record(self, duration_seconds: float) -> None:
+        if duration_seconds < 0:
+            return
+        now = self._clock()
+        with self._lock:
+            self._samples.append((now, duration_seconds))
+            self._evict_locked(now)
+
+    def snapshot(self) -> LatencySnapshot:
+        now = self._clock()
+        with self._lock:
+            self._evict_locked(now)
+            if not self._samples:
+                return LatencySnapshot(name=self.name, count=0, avg_ms=0.0, max_ms=0.0, p95_ms=0.0)
+            durations = sorted(d for _, d in self._samples)
+        count = len(durations)
+        avg = sum(durations) / count
+        max_d = durations[-1]
+        p95_index = max(0, int(math.ceil(0.95 * count)) - 1)
+        p95 = durations[p95_index]
+        return LatencySnapshot(
+            name=self.name,
+            count=count,
+            avg_ms=avg * 1000.0,
+            max_ms=max_d * 1000.0,
+            p95_ms=p95 * 1000.0,
+        )
+
+    def reset(self) -> None:
+        with self._lock:
+            self._samples.clear()
+
+    def _evict_locked(self, now: float) -> None:
+        cutoff = now - self._window
+        samples = self._samples
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+
+
+class LatencyRegistry:
+    """Thread-safe registry of named latency samplers."""
+
+    def __init__(self, *, window_seconds: float = 5.0) -> None:
+        self._window = window_seconds
+        self._samplers: dict[str, LatencySampler] = {}
+        self._lock = threading.Lock()
+
+    def sampler(self, name: str) -> LatencySampler:
+        with self._lock:
+            existing = self._samplers.get(name)
+            if existing is not None:
+                return existing
+            sampler = LatencySampler(name, window_seconds=self._window)
+            self._samplers[name] = sampler
+            return sampler
+
+    def snapshots(self) -> list[LatencySnapshot]:
+        with self._lock:
+            samplers = list(self._samplers.values())
+        return [s.snapshot() for s in samplers]
+
+    def reset(self) -> None:
+        with self._lock:
+            self._samplers.clear()
+
+
+_LATENCY_REGISTRY = LatencyRegistry()
+
+
+def record_latency(name: str, duration_seconds: float) -> None:
+    """Record one latency sample under `name` in the global registry."""
+    _LATENCY_REGISTRY.sampler(name).record(duration_seconds)
+
+
+def latency_snapshots() -> list[LatencySnapshot]:
+    """Snapshot every named latency sampler in the global registry."""
+    return _LATENCY_REGISTRY.snapshots()
+
+
+def reset_latency_registry() -> None:
+    """Drop all global latency samplers. For test isolation."""
+    _LATENCY_REGISTRY.reset()
+
+
+@contextmanager
+def time_block(name: str) -> Iterator[None]:
+    """Time the body and record under `name` in the global registry.
+
+        with time_block("segment_write_video"):
+            writer.push_buffer(buf)
+    """
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        record_latency(name, time.monotonic() - start)
+
+
+@dataclass(frozen=True, slots=True)
 class DiskSnapshot:
     """Read-only view of disk capacity and recent write rate."""
 
@@ -222,6 +364,7 @@ class TelemetryHub:
         *,
         log_interval_seconds: float = 1.0,
         disk_interval_seconds: float = 5.0,
+        health_log: HealthEventLog | None = None,
     ) -> None:
         if log_interval_seconds <= 0:
             raise ValueError("log_interval_seconds must be positive")
@@ -235,6 +378,8 @@ class TelemetryHub:
         self._lock = threading.Lock()
         self._stop_callbacks: list[Callable[[], None]] = []
         self._started = False
+        self._health_log = health_log if health_log is not None else default_log()
+        self._zero_fps_streak: dict[str, int] = {}
 
     def register(self, feed_id: str, display_name: str) -> FeedMetrics:
         """Create and store a `FeedMetrics` for `feed_id`."""
@@ -317,7 +462,7 @@ class TelemetryHub:
                 LOGGER.debug("telemetry cancel raised", exc_info=True)
 
     def _log_all_snapshots(self) -> None:
-        """Emit one INFO log line per registered feed."""
+        """Emit periodic INFO log lines for feeds and latency samplers."""
         for snap in self.snapshot():
             LOGGER.info(
                 "telemetry feed_id=%s source_fps=%.2f preview_fps=%.2f recording_fps=%.2f",
@@ -326,6 +471,44 @@ class TelemetryHub:
                 snap.preview_fps,
                 snap.recording_fps,
             )
+            self._evaluate_feed_health(snap)
+        for lat in latency_snapshots():
+            if lat.count == 0:
+                continue
+            LOGGER.info(
+                "telemetry latency name=%s count=%d avg_ms=%.2f p95_ms=%.2f max_ms=%.2f",
+                lat.name,
+                lat.count,
+                lat.avg_ms,
+                lat.p95_ms,
+                lat.max_ms,
+            )
+
+    def _evaluate_feed_health(self, snap: FeedMetricsSnapshot) -> None:
+        """Emit a health event when a feed appears lost (sustained zero fps)."""
+        if snap.source_fps == 0.0:
+            streak = self._zero_fps_streak.get(snap.feed_id, 0) + 1
+            self._zero_fps_streak[snap.feed_id] = streak
+            if streak == FEED_LOST_ZERO_SAMPLES and not self._health_log.has_open_event(
+                category="feed_lost", feed_id=snap.feed_id
+            ):
+                self._health_log.record(
+                    severity=HealthSeverity.WARNING,
+                    category="feed_lost",
+                    message=f"No frames observed from {snap.display_name} for {streak}s.",
+                    feed_id=snap.feed_id,
+                )
+        else:
+            if self._zero_fps_streak.get(snap.feed_id):
+                self._zero_fps_streak[snap.feed_id] = 0
+                if self._health_log.has_open_event(category="feed_lost", feed_id=snap.feed_id):
+                    self._health_log.record(
+                        severity=HealthSeverity.INFO,
+                        category="feed_recovered",
+                        message=f"Frames resumed from {snap.display_name}.",
+                        feed_id=snap.feed_id,
+                    )
+                    self._health_log.clear_open_event(category="feed_lost", feed_id=snap.feed_id)
 
     def _log_disk_snapshot(self) -> None:
         """Sample disk usage and emit one INFO log line."""
@@ -347,3 +530,32 @@ class TelemetryHub:
             total_gb,
             snap.write_mb_s_estimate,
         )
+        self._evaluate_disk_health(snap)
+
+    def _evaluate_disk_health(self, snap: DiskSnapshot) -> None:
+        """Emit a health event when free disk space drops below the threshold."""
+        if snap.total_bytes <= 0:
+            return
+        fraction_free = snap.free_bytes / snap.total_bytes
+        if fraction_free < DISK_LOW_FRACTION:
+            if not self._health_log.has_open_event(category="disk_low", feed_id=None):
+                self._health_log.record(
+                    severity=HealthSeverity.WARNING,
+                    category="disk_low",
+                    message=(
+                        f"Disk free space is {fraction_free * 100:.1f}% on {snap.path}."
+                    ),
+                    metadata={
+                        "path": snap.path,
+                        "free_bytes": snap.free_bytes,
+                        "total_bytes": snap.total_bytes,
+                    },
+                )
+        elif self._health_log.has_open_event(category="disk_low", feed_id=None):
+            self._health_log.record(
+                severity=HealthSeverity.INFO,
+                category="disk_recovered",
+                message=f"Disk free space recovered to {fraction_free * 100:.1f}%.",
+                metadata={"path": snap.path},
+            )
+            self._health_log.clear_open_event(category="disk_low", feed_id=None)

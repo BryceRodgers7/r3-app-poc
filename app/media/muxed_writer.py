@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from app.core.models import AudioChunk, AudioFormat, MediaFrame
+from app.core.telemetry import time_block
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,55 +75,57 @@ class MuxedMediaWriter:
 
     def write_frame(self, frame: MediaFrame) -> None:
         """Push one video frame into the muxed output."""
-        if self._pipeline is None:
-            self._open(frame)
-            self._flush_pending_audio()
-        if self._video_appsrc is None:
-            return
+        with time_block("segment_write_video"):
+            if self._pipeline is None:
+                self._open(frame)
+                self._flush_pending_audio()
+            if self._video_appsrc is None:
+                return
 
-        Gst = self._Gst
-        assert Gst is not None
+            Gst = self._Gst
+            assert Gst is not None
 
-        frame_array = np.ascontiguousarray(frame.image_bgr)
-        gst_buffer = Gst.Buffer.new_allocate(None, frame_array.nbytes, None)
-        gst_buffer.fill(0, frame_array.tobytes())
-        if self._video_start_timestamp is None:
-            self._video_start_timestamp = frame.timestamp
-        running_timestamp = max(0.0, frame.timestamp - self._video_start_timestamp)
-        gst_buffer.pts = int(running_timestamp * Gst.SECOND)
-        gst_buffer.dts = gst_buffer.pts
-        gst_buffer.duration = int(Gst.SECOND / self._fps_hint)
-        flow_return = self._video_appsrc.emit("push-buffer", gst_buffer)
-        if flow_return != Gst.FlowReturn.OK:
-            raise RuntimeError(f"GStreamer video writer push failed: {flow_return}")
-        self._video_frame_count += 1
+            frame_array = np.ascontiguousarray(frame.image_bgr)
+            gst_buffer = Gst.Buffer.new_allocate(None, frame_array.nbytes, None)
+            gst_buffer.fill(0, frame_array.tobytes())
+            if self._video_start_timestamp is None:
+                self._video_start_timestamp = frame.timestamp
+            running_timestamp = max(0.0, frame.timestamp - self._video_start_timestamp)
+            gst_buffer.pts = int(running_timestamp * Gst.SECOND)
+            gst_buffer.dts = gst_buffer.pts
+            gst_buffer.duration = int(Gst.SECOND / self._fps_hint)
+            flow_return = self._video_appsrc.emit("push-buffer", gst_buffer)
+            if flow_return != Gst.FlowReturn.OK:
+                raise RuntimeError(f"GStreamer video writer push failed: {flow_return}")
+            self._video_frame_count += 1
 
     def write_audio_chunk(self, chunk: AudioChunk) -> None:
         """Push one PCM audio chunk into the muxed output."""
-        if self._pipeline is None:
-            self._audio_format = chunk.format
-            self._pending_audio_chunks.append(chunk)
-            while len(self._pending_audio_chunks) > 128:
-                self._pending_audio_chunks.pop(0)
-            return
-        if self._audio_appsrc is None:
-            return
+        with time_block("segment_write_audio"):
+            if self._pipeline is None:
+                self._audio_format = chunk.format
+                self._pending_audio_chunks.append(chunk)
+                while len(self._pending_audio_chunks) > 128:
+                    self._pending_audio_chunks.pop(0)
+                return
+            if self._audio_appsrc is None:
+                return
 
-        Gst = self._Gst
-        assert Gst is not None
+            Gst = self._Gst
+            assert Gst is not None
 
-        gst_buffer = Gst.Buffer.new_allocate(None, len(chunk.data), None)
-        gst_buffer.fill(0, chunk.data)
-        if self._audio_start_timestamp is None:
-            self._audio_start_timestamp = chunk.timestamp
-        running_timestamp = max(0.0, chunk.timestamp - self._audio_start_timestamp)
-        gst_buffer.pts = int(running_timestamp * Gst.SECOND)
-        gst_buffer.dts = gst_buffer.pts
-        gst_buffer.duration = int(chunk.duration_seconds * Gst.SECOND)
-        flow_return = self._audio_appsrc.emit("push-buffer", gst_buffer)
-        if flow_return != Gst.FlowReturn.OK:
-            raise RuntimeError(f"GStreamer audio writer push failed: {flow_return}")
-        self._audio_bytes += len(chunk.data)
+            gst_buffer = Gst.Buffer.new_allocate(None, len(chunk.data), None)
+            gst_buffer.fill(0, chunk.data)
+            if self._audio_start_timestamp is None:
+                self._audio_start_timestamp = chunk.timestamp
+            running_timestamp = max(0.0, chunk.timestamp - self._audio_start_timestamp)
+            gst_buffer.pts = int(running_timestamp * Gst.SECOND)
+            gst_buffer.dts = gst_buffer.pts
+            gst_buffer.duration = int(chunk.duration_seconds * Gst.SECOND)
+            flow_return = self._audio_appsrc.emit("push-buffer", gst_buffer)
+            if flow_return != Gst.FlowReturn.OK:
+                raise RuntimeError(f"GStreamer audio writer push failed: {flow_return}")
+            self._audio_bytes += len(chunk.data)
 
     def _flush_pending_audio(self) -> None:
         pending = list(self._pending_audio_chunks)

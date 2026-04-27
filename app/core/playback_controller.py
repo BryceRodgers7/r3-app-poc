@@ -12,6 +12,7 @@ from PySide6.QtCore import QTimer
 from app.core.app_state import AppState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
 from app.core.signals import AppSignals
+from app.core.telemetry import time_block
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import MultiFeedOutputRenderer, OutputRenderer
 from app.media.recording_manager import RecordingManager
@@ -145,7 +146,8 @@ class PlaybackController:
                 return
 
             target_timestamp = max(oldest_timestamp, base_timestamp - 10.0)
-            replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
+            with time_block("replay_seek"):
+                replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
             if replay_ref is None:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()

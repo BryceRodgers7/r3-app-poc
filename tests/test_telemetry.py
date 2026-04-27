@@ -6,7 +6,20 @@ from dataclasses import dataclass
 import logging
 import unittest
 
-from app.core.telemetry import DiskSampler, FeedMetrics, RateCounter, TelemetryHub
+from app.core.health_events import HealthEventLog
+from app.core.telemetry import (
+    DiskSampler,
+    FeedMetrics,
+    FEED_LOST_ZERO_SAMPLES,
+    LatencyRegistry,
+    LatencySampler,
+    RateCounter,
+    TelemetryHub,
+    latency_snapshots,
+    record_latency,
+    reset_latency_registry,
+    time_block,
+)
 
 
 class FakeClock:
@@ -150,6 +163,9 @@ class TelemetryHubTests(unittest.TestCase):
         hub.stop()
         self.assertEqual(cancel_calls, [1])
 
+    def setUp(self) -> None:
+        reset_latency_registry()
+
     def test_log_all_snapshots_emits_one_line_per_feed(self) -> None:
         hub = TelemetryHub()
         hub.register("cam_a", "A")
@@ -159,6 +175,29 @@ class TelemetryHubTests(unittest.TestCase):
         self.assertEqual(len(captured.records), 2)
         self.assertIn("feed_id=cam_a", captured.output[0])
         self.assertIn("feed_id=cam_b", captured.output[1])
+
+    def test_log_all_snapshots_includes_non_empty_latency_samplers(self) -> None:
+        hub = TelemetryHub()
+        hub.register("cam_a", "A")
+        record_latency("segment_write_video", 0.0021)
+        record_latency("segment_write_video", 0.0034)
+        with self.assertLogs("app.core.telemetry", level="INFO") as captured:
+            hub._log_all_snapshots()
+        latency_lines = [line for line in captured.output if "latency" in line]
+        self.assertEqual(len(latency_lines), 1)
+        self.assertIn("name=segment_write_video", latency_lines[0])
+        self.assertIn("count=2", latency_lines[0])
+
+    def test_log_all_snapshots_skips_empty_latency_samplers(self) -> None:
+        hub = TelemetryHub()
+        hub.register("cam_a", "A")
+        # Touch a sampler without recording anything.
+        from app.core.telemetry import _LATENCY_REGISTRY
+        _LATENCY_REGISTRY.sampler("never_called")
+        with self.assertLogs("app.core.telemetry", level="INFO") as captured:
+            hub._log_all_snapshots()
+        latency_lines = [line for line in captured.output if "latency" in line]
+        self.assertEqual(latency_lines, [])
 
 
 @dataclass
@@ -342,6 +381,162 @@ class TelemetryHubDiskTests(unittest.TestCase):
         hub = TelemetryHub()
         hub.start(registrar)
         self.assertEqual(intervals, [1.0])
+
+
+class TelemetryHubHealthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_latency_registry()
+        self.health_log = HealthEventLog()
+
+    def test_feed_lost_emitted_after_streak_threshold(self) -> None:
+        hub = TelemetryHub(health_log=self.health_log)
+        hub.register("cam_a", "Cam A")
+        # Tick three zero-fps log cycles in a row.
+        for _ in range(FEED_LOST_ZERO_SAMPLES):
+            hub._log_all_snapshots()
+        self.assertTrue(
+            self.health_log.has_open_event(category="feed_lost", feed_id="cam_a")
+        )
+
+    def test_feed_lost_not_emitted_below_threshold(self) -> None:
+        hub = TelemetryHub(health_log=self.health_log)
+        hub.register("cam_a", "Cam A")
+        for _ in range(FEED_LOST_ZERO_SAMPLES - 1):
+            hub._log_all_snapshots()
+        self.assertFalse(
+            self.health_log.has_open_event(category="feed_lost", feed_id="cam_a")
+        )
+
+    def test_feed_lost_not_re_emitted_while_open(self) -> None:
+        hub = TelemetryHub(health_log=self.health_log)
+        hub.register("cam_a", "Cam A")
+        for _ in range(FEED_LOST_ZERO_SAMPLES + 5):
+            hub._log_all_snapshots()
+        # The log should hold exactly one feed_lost record (no spam).
+        feed_lost_events = [
+            e for (fid, cat), e in self.health_log._last_categories.items()
+            if cat == "feed_lost"
+        ]
+        self.assertEqual(len(feed_lost_events), 1)
+
+    def test_feed_recovery_emits_recovered_event(self) -> None:
+        clock = FakeClock()
+        hub = TelemetryHub(health_log=self.health_log)
+        hub.register("cam_a", "Cam A")
+        for _ in range(FEED_LOST_ZERO_SAMPLES):
+            hub._log_all_snapshots()
+        # Now feed comes back: tick the source counter and re-snapshot.
+        metrics = hub.metrics_for("cam_a")
+        assert metrics is not None
+        for _ in range(20):
+            metrics.tick_source()
+        hub._log_all_snapshots()
+        self.assertFalse(
+            self.health_log.has_open_event(category="feed_lost", feed_id="cam_a")
+        )
+
+    def test_disk_low_emits_when_fraction_below_threshold(self) -> None:
+        usage = _FakeDiskUsageFn([_FakeDiskUsage(total=1000, used=970, free=30)])
+        sampler = DiskSampler("X:\\fake", disk_usage_fn=usage)
+        hub = TelemetryHub(health_log=self.health_log)
+        hub.set_disk_path("X:\\fake", sampler=sampler)
+        hub._log_disk_snapshot()
+        self.assertTrue(self.health_log.has_open_event(category="disk_low", feed_id=None))
+
+    def test_disk_low_silent_when_above_threshold(self) -> None:
+        usage = _FakeDiskUsageFn([_FakeDiskUsage(total=1000, used=200, free=800)])
+        sampler = DiskSampler("X:\\fake", disk_usage_fn=usage)
+        hub = TelemetryHub(health_log=self.health_log)
+        hub.set_disk_path("X:\\fake", sampler=sampler)
+        hub._log_disk_snapshot()
+        self.assertFalse(self.health_log.has_open_event(category="disk_low", feed_id=None))
+
+
+class LatencySamplerTests(unittest.TestCase):
+    def test_empty_sampler_reports_zero_count(self) -> None:
+        clock = FakeClock()
+        sampler = LatencySampler("seek", window_seconds=2.0, clock=clock)
+        snap = sampler.snapshot()
+        self.assertEqual(snap.count, 0)
+        self.assertEqual(snap.avg_ms, 0.0)
+        self.assertEqual(snap.max_ms, 0.0)
+        self.assertEqual(snap.p95_ms, 0.0)
+
+    def test_records_within_window_compute_avg_max_p95(self) -> None:
+        clock = FakeClock()
+        sampler = LatencySampler("seek", window_seconds=10.0, clock=clock)
+        # 10 samples: 1ms, 2ms, ..., 10ms
+        for ms in range(1, 11):
+            sampler.record(ms / 1000.0)
+            clock.advance(0.1)
+        snap = sampler.snapshot()
+        self.assertEqual(snap.count, 10)
+        self.assertAlmostEqual(snap.avg_ms, 5.5, places=4)
+        self.assertAlmostEqual(snap.max_ms, 10.0, places=4)
+        # ceil(0.95 * 10) - 1 = 9 → the 10th sorted value, which is 10ms.
+        self.assertAlmostEqual(snap.p95_ms, 10.0, places=4)
+
+    def test_old_samples_evicted(self) -> None:
+        clock = FakeClock()
+        sampler = LatencySampler("seek", window_seconds=2.0, clock=clock)
+        sampler.record(0.005)
+        clock.advance(10.0)
+        snap = sampler.snapshot()
+        self.assertEqual(snap.count, 0)
+
+    def test_negative_durations_ignored(self) -> None:
+        sampler = LatencySampler("seek", window_seconds=2.0)
+        sampler.record(-0.1)
+        self.assertEqual(sampler.snapshot().count, 0)
+
+    def test_invalid_construction_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            LatencySampler("")
+        with self.assertRaises(ValueError):
+            LatencySampler("x", window_seconds=0)
+
+    def test_reset_clears_samples(self) -> None:
+        sampler = LatencySampler("seek", window_seconds=2.0)
+        sampler.record(0.005)
+        sampler.reset()
+        self.assertEqual(sampler.snapshot().count, 0)
+
+
+class LatencyRegistryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_latency_registry()
+
+    def test_record_latency_creates_sampler_on_first_call(self) -> None:
+        record_latency("seek", 0.002)
+        snaps = {s.name: s for s in latency_snapshots()}
+        self.assertIn("seek", snaps)
+        self.assertEqual(snaps["seek"].count, 1)
+
+    def test_repeat_record_under_same_name_aggregates(self) -> None:
+        for _ in range(5):
+            record_latency("seek", 0.001)
+        snap = next(s for s in latency_snapshots() if s.name == "seek")
+        self.assertEqual(snap.count, 5)
+
+    def test_reset_drops_all_samplers(self) -> None:
+        record_latency("a", 0.001)
+        record_latency("b", 0.001)
+        reset_latency_registry()
+        self.assertEqual(latency_snapshots(), [])
+
+    def test_time_block_records_under_name(self) -> None:
+        with time_block("segment_write_video"):
+            pass
+        snaps = {s.name: s for s in latency_snapshots()}
+        self.assertIn("segment_write_video", snaps)
+        self.assertEqual(snaps["segment_write_video"].count, 1)
+
+    def test_time_block_records_even_on_exception(self) -> None:
+        with self.assertRaises(RuntimeError):
+            with time_block("segment_write_video"):
+                raise RuntimeError("boom")
+        snaps = {s.name: s for s in latency_snapshots()}
+        self.assertEqual(snaps["segment_write_video"].count, 1)
 
 
 if __name__ == "__main__":

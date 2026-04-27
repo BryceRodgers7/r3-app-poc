@@ -16,6 +16,7 @@ from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.ui.controls_widget import ControlsWidget
+from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.status_bar_widget import StatusBarWidget
 
@@ -60,6 +61,16 @@ class MainWindow(QMainWindow):
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
 
+        self.diagnostics_widget: DiagnosticsWidget | None = None
+        if (
+            show_controls
+            and application_coordinator is not None
+            and application_coordinator.telemetry_hub is not None
+        ):
+            self.diagnostics_widget = DiagnosticsWidget(
+                application_coordinator.telemetry_hub, self
+            )
+
         central_widget = QWidget(self)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -68,6 +79,8 @@ class MainWindow(QMainWindow):
         if self.controls_widget is not None:
             layout.addWidget(self.controls_widget)
         layout.addWidget(self.status_widget)
+        if self.diagnostics_widget is not None:
+            layout.addWidget(self.diagnostics_widget)
         self.setCentralWidget(central_widget)
 
         self._wire_events()

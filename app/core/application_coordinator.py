@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.config.settings import AppSettings
 from app.core.feed_registry import FeedRegistry
+from app.core.health_events import default_log as default_health_log
 from app.core.playback_controller import PlaybackController
 from app.core.telemetry import TelemetryHub
 from app.media.feed_runtime import FeedRuntime
@@ -99,6 +100,10 @@ class ApplicationCoordinator:
         if self._session_started:
             return
         session_paths = self._session_manager.start_new_session(self.feed_registry.build_session_label())
+        default_health_log().open(
+            session_paths.root_dir / "logs" / "health_events.jsonl",
+            session_paths.session_id,
+        )
         for runtime in self._feed_runtimes.values():
             runtime.start(session_paths)
         self.operator_controller.initialize(session_paths.session_id)
@@ -117,6 +122,7 @@ class ApplicationCoordinator:
         self._recording_manager.stop_all()
         self._replay_store_manager.stop_all()
         self._session_manager.close()
+        default_health_log().close()
 
 
 def build_default_application_coordinator(
