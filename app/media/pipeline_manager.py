@@ -18,6 +18,7 @@ import numpy as np
 from app.core.models import AudioChunk, AudioFormat, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
 from app.core.telemetry import FeedMetrics
 from app.media.frame_overlay import render_frame_overlay
+from app.media.gst_bus_log import log_bus_message
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
@@ -860,13 +861,18 @@ class PipelineManager:
         Gst = self._Gst
         assert Gst is not None
 
-        interesting_messages = Gst.MessageType.ERROR | Gst.MessageType.EOS
+        interesting_messages = (
+            Gst.MessageType.ERROR
+            | Gst.MessageType.WARNING
+            | Gst.MessageType.INFO
+            | Gst.MessageType.EOS
+        )
         while not self._stop_event.is_set():
             if self._poll_bus_for_messages(
                 self._bus,
                 interesting_messages,
                 int(Gst.SECOND / 20),
-                pipeline_name="live",
+                pipeline_role="live",
                 fatal=True,
             ):
                 break
@@ -874,7 +880,7 @@ class PipelineManager:
                 self._replay_bus,
                 interesting_messages,
                 0,
-                pipeline_name="replay",
+                pipeline_role="replay",
                 fatal=False,
             ):
                 break
@@ -882,7 +888,7 @@ class PipelineManager:
                 self._replay_audio_bus,
                 interesting_messages,
                 0,
-                pipeline_name="replay-audio",
+                pipeline_role="replay-audio",
                 fatal=False,
             ):
                 break
@@ -893,7 +899,7 @@ class PipelineManager:
         interesting_messages: Any,
         timeout_ns: int,
         *,
-        pipeline_name: str,
+        pipeline_role: str,
         fatal: bool,
     ) -> bool:
         if bus is None:
@@ -903,18 +909,56 @@ class PipelineManager:
         if message is None:
             return False
 
-        if message.type == self._Gst.MessageType.ERROR:
+        Gst = self._Gst
+        feed_id = self._source.get_feed_id()
+        mtype = message.type
+
+        if mtype == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
-            details = debug or str(error)
-            LOGGER.error("%s GStreamer error: %s", pipeline_name, details)
+            summary = str(error)
+            details = debug or ""
+            log_bus_message(
+                feed_id=feed_id,
+                pipeline_role=pipeline_role,
+                type_name="ERROR",
+                summary=summary,
+                details=details,
+            )
             if fatal:
-                self._preview_output.show_placeholder_message(f"GStreamer error: {details}")
+                placeholder = details or summary
+                self._preview_output.show_placeholder_message(f"GStreamer error: {placeholder}")
                 self._stop_event.set()
                 return True
             return False
 
-        if message.type == self._Gst.MessageType.EOS:
-            LOGGER.info("%s GStreamer pipeline reached EOS", pipeline_name)
+        if mtype == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            log_bus_message(
+                feed_id=feed_id,
+                pipeline_role=pipeline_role,
+                type_name="WARNING",
+                summary=str(warn),
+                details=debug or "",
+            )
+            return False
+
+        if mtype == Gst.MessageType.INFO:
+            info, debug = message.parse_info()
+            log_bus_message(
+                feed_id=feed_id,
+                pipeline_role=pipeline_role,
+                type_name="INFO",
+                summary=str(info),
+                details=debug or "",
+            )
+            return False
+
+        if mtype == Gst.MessageType.EOS:
+            log_bus_message(
+                feed_id=feed_id,
+                pipeline_role=pipeline_role,
+                type_name="EOS",
+            )
             if fatal:
                 self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
                 self._stop_event.set()
