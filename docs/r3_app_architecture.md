@@ -10,6 +10,9 @@ This is the authoritative architecture document. Do not treat any unstated media
 **Status:**  
 This document describes the **target** production architecture. The current codebase does not yet conform to it — notably, today's replay storage uses JPEG thumbs plus short muxed segments, frames are pushed through Python on the hot path, and the active recording container is MP4. Those are explicitly forbidden by this document and are tracked as gaps to close in the phased plan in §18. For a description of the current code's object graph, see `ARCHITECTURE.md`.
 
+**Source surface:**  
+Production deployments use **NDI cameras only** (`kind = "ndi"`). A synthetic test source (`kind = "synthetic"`) exists for development on machines without NDI hardware and is intentionally never productionized — it is the dev-time fallback the §17.3 guardrail protects, not a parallel production path. USB / OpenCV / GStreamer-camera ingest paths from earlier proof-of-concept work were removed in Phase 2.5; they were a prototype convenience and never an architectural target.
+
 ---
 
 # 0. Executive Summary
@@ -1341,8 +1344,8 @@ log_gstreamer_bus = true
 [[feeds]]
 id = "feed_001"
 name = "Main Camera"
-kind = "ndi" # ndi | camera | test
-source = "Camera 1"
+kind = "ndi" # ndi | synthetic
+ndi_name = "HOSTNAME (Camera 1)"
 enabled = true
 role = "primary"
 
@@ -1350,9 +1353,16 @@ role = "primary"
 id = "feed_002"
 name = "Angle 2"
 kind = "ndi"
-source = "Camera 2"
+ndi_name = "HOSTNAME (Camera 2)"
 enabled = true
 role = "secondary"
+
+# Dev-only synthetic fallback (no NDI hardware required). Comment out for prod.
+# [[feeds]]
+# id = "feed_dev"
+# name = "Synthetic Test Pattern"
+# kind = "synthetic"
+# enabled = true
 ```
 
 Config rules:
@@ -1360,6 +1370,7 @@ Config rules:
 - Every feed must have a stable ID.
 - Feed IDs must not depend on device order.
 - Defaults must be explicit.
+- `kind` accepts only `"ndi"` (production) or `"synthetic"` (dev). Any other value is a hard config error.
 - Production mode must not silently fall back to synthetic test source unless configured.
 
 ---
@@ -1808,6 +1819,45 @@ Slices delivered:
 
 ---
 
+## Phase 2.5 – Narrow Source Surface to Production Targets
+
+Goal:
+
+- Remove the USB-camera / OpenCV / GStreamer-camera ingest paths that were a proof-of-concept convenience and are not architectural targets. Leave NDI as the production source and a synthetic test source as the dev-time fallback. Phase 3's "one feed" decision is unambiguous after this slice.
+
+This is a single slice; no sub-slicing needed. ~150 LOC delta, one commit.
+
+Tasks:
+
+- Delete `app/media/gstreamer_camera_source.py` and any `gst-camera`-specific code path in `pipeline_manager.py`.
+- Strip the OpenCV `cv2.VideoCapture` / DSHOW / MSMF logic from `app/media/test_source.py`. Keep the synthetic frame generator (deterministic timestamped test frames).
+- Simplify `app/media/source_factory.py` to dispatch on `kind = "ndi"` or `kind = "synthetic"` only. Any other `kind` value (including the legacy `"auto"`) is a hard config error with a clear message — no silent fallback.
+- Remove `test_camera_index`, `default_source_kind`, and `camera_index` (per-feed) from `AppSettings`. The remaining feed fields are `feed_id`, `display_name`, `kind`, `ndi_name`, `enabled`.
+- Update `app_settings.toml.example` to show only NDI feed rows plus a commented-out synthetic row for dev.
+- Update the README to drop webcam-capture guidance and point new contributors at the synthetic source for camera-less dev.
+- Update `ARCHITECTURE.md` to note USB ingest is removed.
+- Strip USB-specific test cases from `tests/test_test_source.py` and simplify `tests/test_source_factory.py`. Synthetic-source tests stay.
+
+Do not:
+
+- Touch the NDI ingest path (that's Phase 3.A's job).
+- Touch state machines, telemetry, replay, or recording.
+- Add a deprecation shim that maps `kind = "auto"` to `kind = "synthetic"`. A hard config error is the right break.
+
+Exit criteria:
+
+- Repo contains no references to `cv2.VideoCapture`, `CAP_DSHOW`, `CAP_MSMF`, `ksvideosrc`, `v4l2src`, `gstreamer_camera_source`, or `camera_index`.
+- Synthetic source still works for dev (`python main.py` against a config with `kind = "synthetic"`).
+- All previously passing tests pass after rewrite. Total test count drops by however many USB-specific cases existed.
+- `app_settings.toml` files using `kind = "auto"` produce a clear startup error pointing at the new schema.
+
+Notes:
+
+- This is a **config-breaking change** for any dev environment that has `kind = "auto"` in its working `app_settings.toml`. The fix is one line per row. The example file is updated to make that obvious.
+- After 2.5 the synthetic source remains on the `python_push` path; that's intentional. Phase 3 is about the production native path, not about hardening the dev fallback.
+
+---
+
 ## Phase 3 – Native GStreamer Data Path for One Feed
 
 Goal:
@@ -1841,16 +1891,16 @@ Exit criteria:
 
 ### Slices
 
-Phase 3 is the first phase that touches real media flow. The current pipeline pushes Python-side `MediaFrame` (NumPy BGR) into GStreamer via `appsrc`; Phase 3's job is to replace that hot path with a native GStreamer source on at least one feed while preserving everything else. Three slices:
+Phase 3 is the first phase that touches real media flow. The current pipeline pushes Python-side `MediaFrame` (NumPy BGR) into GStreamer via `appsrc`; Phase 3's job is to replace that hot path with a native GStreamer source on the production feed kind (NDI) while preserving the synthetic dev fallback. Phase 2.5 narrowed the source surface to NDI + synthetic, so 3.A's "one feed" target is unambiguous: NDI.
 
-**3.A — Native source contract + camera source converted**
+**3.A — Native source contract + NDI converted**
 
 - Extend `SourceInterface` with a `pipeline_mode` declaration: `python_push` (current) or `native`. Native sources expose a builder method that returns a configured `Gst.Bin` ready to be linked into the per-feed `tee`, instead of `read_frame()`-based Python push.
 - `PipelineManager` learns to build the per-feed graph in either mode. The `tee` + branch structure is the same; only the head changes.
-- Convert the camera source (`gstreamer_camera_source.py`) to a true native bin using `ksvideosrc` (Windows) or `v4l2src` (Linux), with `videoconvert` + `videoscale` + `capsfilter` to normalize to the operator-configured `target_frame_*`/`target_fps`. The OpenCV / synthetic test path (`test_source.py`) keeps `pipeline_mode=python_push` and remains the fallback.
+- Convert NDI ingest (`ndi_receiver.py`) to a true native bin using `ndisrc` from `gst-plugins-rs` (already installed in current NDI deployments per `docs/NDI_SETUP.md`). Configure with the existing `ndi_name` and add `videoconvert` + `videoscale` + `capsfilter` to normalize to the operator-configured `target_frame_*` / `target_fps`. The synthetic test source (`test_source.py`) keeps `pipeline_mode=python_push` — it is the dev fallback by design.
 - Add `pipeline_mode` to `FeedMetricsSnapshot` and surface it in the diagnostics widget so the operator can see at a glance whether each feed is on the native or transitional path.
 - Add a `python_frames_per_sec` counter on `FeedMetrics` for sources still pushing through Python; native feeds report `0.0`.
-- Tests: native-bin construction unit-testable without a real camera (use `videotestsrc` as a stand-in); pipeline-mode declaration round-trips through the source factory; diagnostics widget renders the new field.
+- Tests: native-bin construction unit-testable without an NDI source (use `videotestsrc` as a stand-in for the bin's downstream side); pipeline-mode declaration round-trips through the source factory; diagnostics widget renders the new field.
 
 **3.B — Explicit per-branch queue policies + queue-depth metrics**
 
@@ -1866,10 +1916,6 @@ Phase 3 is the first phase that touches real media flow. The current pipeline pu
 - Smoke-test exit criteria: a manual checklist embedded in the diagnostics widget when `mode = "production"` (from §13 config) and any feed reports `python_push`. This is just a visible warning; nothing is enforced beyond a log line.
 - Document the Phase 3 verdict in `ARCHITECTURE.md`: which feeds are native, which still aren't, and what's blocking the rest.
 - Tests: banner rendering for each pipeline mode; warning emitted only in production mode.
-
-### Open question for 3.A
-
-Native NDI ingest is supplied by `gst-plugins-rs` (`ndisrc`). The current code already routes NDI through a per-feed `NDIReceiver` that pushes frames into GStreamer from Python — the conversion to native is conceptually identical to the camera source, but the runtime dependency (`gst-plugins-rs` + NewTek NDI runtime) is heavier. Decision deferred to 3.A: either convert NDI in 3.A alongside camera (one slice, two source types) or leave NDI on `python_push` until a follow-on slice. The phased plan as written treats one source as "Phase 3 done" and the rest as a Phase-3-bis cleanup; that bias is intentional given the doc's "do not convert all feeds at once" guardrail.
 
 ### Out of scope for Phase 3
 
