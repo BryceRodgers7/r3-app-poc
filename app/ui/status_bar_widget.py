@@ -12,6 +12,7 @@ class StatusBarWidget(QFrame):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.app_state_value = QLabel("-")
         self.mode_value = QLabel("-")
         self.recording_value = QLabel("-")
         self.source_value = QLabel("-")
@@ -26,6 +27,7 @@ class StatusBarWidget(QFrame):
         layout.setVerticalSpacing(8)
 
         labels = (
+            ("App State", self.app_state_value),
             ("Mode", self.mode_value),
             ("Recording", self.recording_value),
             ("Source", self.source_value),
@@ -49,6 +51,10 @@ class StatusBarWidget(QFrame):
             }
             """
         )
+
+    def set_app_state_summary(self, app_state: str, recording_state: str) -> None:
+        """Set the §10.1 top-level state and §10.3 recording-state strings."""
+        self.app_state_value.setText(f"{app_state}  (rec: {recording_state})")
 
     def update_state(self, state: UiState) -> None:
         """Refresh all labels from the latest application state."""

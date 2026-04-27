@@ -66,6 +66,7 @@ class HealthEventLog:
         self._path: Path | None = None
         self._file: Any = None
         self._last_categories: dict[tuple[str | None, str], int] = {}
+        self._category_counts: dict[str, int] = {}
 
     def open(self, path: Path, session_id: str) -> None:
         """Begin appending to `path`. Creates parent dirs if needed."""
@@ -113,6 +114,7 @@ class HealthEventLog:
                 except OSError:
                     LOGGER.exception("health event log write failed")
             self._last_categories[(feed_id, category)] = event.id
+            self._category_counts[category] = self._category_counts.get(category, 0) + 1
         log_level = {
             HealthSeverity.INFO.value: logging.INFO,
             HealthSeverity.WARNING.value: logging.WARNING,
@@ -128,6 +130,11 @@ class HealthEventLog:
             message,
         )
         return event
+
+    def category_count(self, category: str) -> int:
+        """Return the lifetime count of events recorded under `category`."""
+        with self._lock:
+            return self._category_counts.get(category, 0)
 
     def has_open_event(self, *, category: str, feed_id: str | None) -> bool:
         """Return whether `(feed_id, category)` already has an event recorded.

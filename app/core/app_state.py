@@ -1,10 +1,8 @@
 """Per-output UI state surfaced by `PlaybackController` and rendered in Qt.
 
 This dataclass is *not* the top-level application state machine — that is
-the `AppState` enum in §10.1, scheduled for slice 2.D. To keep the namespace
-clean for that enum, the dataclass is named `UiState`. The legacy
-`AppState` symbol remains as a deprecated alias so nothing external breaks
-during the transition.
+the `AppState` enum in `app.core.application_state` (§10.1). The dataclass
+is named `UiState` to keep the `AppState` name available for the enum.
 """
 
 from __future__ import annotations
@@ -33,6 +31,3 @@ class UiState:
     playback_overlay: PlaybackOverlayInfo = field(default_factory=PlaybackOverlayInfo)
 
 
-# Deprecated alias so ad-hoc importers do not break mid-transition.
-# Slice 2.D re-binds `AppState` to the §10.1 enum; remove this alias then.
-AppState = UiState

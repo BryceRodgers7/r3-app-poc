@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.config.settings import AppSettings
+from app.core.application_state import AppState, compute_app_state
 from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
 from app.core.health_events import default_log as default_health_log
@@ -69,6 +70,24 @@ class ApplicationCoordinator:
             live_only=True,
         )
         self._session_started = False
+        self._shutting_down = False
+
+    def get_app_state(self) -> AppState:
+        """Aggregate the four sub-state machines into the top-level `AppState`."""
+        feed_states = [
+            runtime.feed_state.state for runtime in self._feed_runtimes.values()
+        ]
+        replay_state = (
+            self.operator_controller.replay_state.state
+            if self.operator_controller.replay_state is not None
+            else None
+        )
+        return compute_app_state(
+            feed_states=feed_states,
+            recording_state=self._recording_manager.recording_state.state,
+            replay_state=replay_state,
+            shutting_down=self._shutting_down,
+        )
 
     def toggle_long_session_recording(self) -> None:
         """Start or stop game-length recording on every feed (operator control)."""
@@ -128,6 +147,7 @@ class ApplicationCoordinator:
 
     def shutdown(self) -> None:
         """Stop playback sessions and feed runtimes."""
+        self._shutting_down = True
         self.telemetry_hub.stop()
         self.operator_controller.shutdown()
         self.program_controller.shutdown()

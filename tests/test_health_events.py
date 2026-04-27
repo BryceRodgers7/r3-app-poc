@@ -83,6 +83,21 @@ class HealthEventLogTests(unittest.TestCase):
         ]
         self.assertEqual(ids, [1, 2, 3, 4, 5])
 
+    def test_category_count_tracks_all_records(self) -> None:
+        log = HealthEventLog()
+        log.record(severity="warning", category="invalid_transition", message="m1")
+        log.record(severity="warning", category="invalid_transition", message="m2")
+        log.record(severity="info", category="other", message="m3")
+        self.assertEqual(log.category_count("invalid_transition"), 2)
+        self.assertEqual(log.category_count("other"), 1)
+        self.assertEqual(log.category_count("never_recorded"), 0)
+
+    def test_category_count_persists_across_clear_open_event(self) -> None:
+        log = HealthEventLog()
+        log.record(severity="warning", category="feed_lost", message="x", feed_id="cam_a")
+        log.clear_open_event(category="feed_lost", feed_id="cam_a")
+        self.assertEqual(log.category_count("feed_lost"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

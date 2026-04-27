@@ -68,7 +68,9 @@ class MainWindow(QMainWindow):
             and application_coordinator.telemetry_hub is not None
         ):
             self.diagnostics_widget = DiagnosticsWidget(
-                application_coordinator.telemetry_hub, self
+                application_coordinator.telemetry_hub,
+                self,
+                coordinator=application_coordinator,
             )
 
         central_widget = QWidget(self)
@@ -107,6 +109,11 @@ class MainWindow(QMainWindow):
 
     def _render_state(self, state: UiState) -> None:
         self.status_widget.update_state(state)
+        if self._application_coordinator is not None:
+            self.status_widget.set_app_state_summary(
+                self._application_coordinator.get_app_state().value,
+                self._application_coordinator._recording_manager.recording_state.state.value,
+            )
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,
             PlaybackMode.PAUSED,
