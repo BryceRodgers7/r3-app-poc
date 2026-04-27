@@ -103,6 +103,7 @@ class ApplicationCoordinator:
             runtime.start(session_paths)
         self.operator_controller.initialize(session_paths.session_id)
         self.program_controller.initialize(session_paths.session_id)
+        self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
 
