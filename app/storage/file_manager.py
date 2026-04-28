@@ -34,12 +34,19 @@ class FileManager:
         return f"session_{next_value:03d}"
 
     def create_session_paths(self, session_id: str) -> SessionPaths:
-        """Create and return the folder layout for a new session."""
+        """Create and return the folder layout for a new session.
+
+        Slice 4.E: also computes the per-session `quarantine` directory
+        under `<root>/quarantine`. The directory is *not* created here —
+        the recovery code creates it on demand only when a corrupt
+        segment is moved into it.
+        """
         self.ensure_base_directories()
         root_dir = self._settings.sessions_root / session_id
         recording_dir = root_dir / "recording"
         rolling_dir = root_dir / "rolling"
         clips_dir = root_dir / "clips"
+        quarantine_dir = root_dir / "quarantine"
 
         for path in (root_dir, recording_dir, rolling_dir, clips_dir):
             path.mkdir(parents=True, exist_ok=True)
@@ -50,6 +57,27 @@ class FileManager:
             recording_dir=recording_dir,
             rolling_dir=rolling_dir,
             clips_dir=clips_dir,
+            quarantine_dir=quarantine_dir,
+        )
+
+    def session_root(self, session_id: str) -> Path:
+        """Return the on-disk root directory for an existing session."""
+        return self._settings.sessions_root / session_id
+
+    def session_paths_for_existing(self, session_id: str) -> SessionPaths:
+        """Build a `SessionPaths` for a previously-created session.
+
+        Used by recovery code that needs to address a session's
+        directories without recreating them.
+        """
+        root_dir = self.session_root(session_id)
+        return SessionPaths(
+            session_id=session_id,
+            root_dir=root_dir,
+            recording_dir=root_dir / "recording",
+            rolling_dir=root_dir / "rolling",
+            clips_dir=root_dir / "clips",
+            quarantine_dir=root_dir / "quarantine",
         )
 
     def ensure_feed_paths(self, session_paths: SessionPaths, feed_id: str) -> FeedPaths:

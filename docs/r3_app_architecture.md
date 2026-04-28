@@ -2081,12 +2081,20 @@ Split into two parts during execution; the data layer was committed cleanly, the
 
 **Exit criteria for 4.D:** the legacy classes (`ReplayBuffer`, `MuxedMediaWriter`, `Recorder`, `ReplayStoreManager`) are gone; `PlaybackController` compiles and runs against `RecordingSegmentReplayStore`; the live preview path and `splitmuxsink` recording branch are unaffected.
 
-**4.E — Crash recovery + startup segment scan**
+**4.E — Crash recovery + startup segment scan — ✅ committed**
 
-- On `SessionManager.start_new_session`, scan all *prior* session directories' `recording/<feed_id>/` for incomplete segments. Validate each segment file: open via `gst-discoverer` (or equivalent), confirm duration, frame count, container integrity. Quarantine corrupt files per §6.5 (move to `<session>/quarantine/`).
-- For prior sessions whose `session.json` state is `RECORDING` or `STOPPED` without a `finalized_at`, transition to `DIRTY` per §10.6. (The §11.4 recovery-prompt UI is still deferred — this slice just does the *marking* so the prompt has something to react to when it lands.)
-- Rebuild the `SegmentIndex` from on-disk segments + SQLite metadata for any session the operator opens for replay or post-session export.
-- Tests: startup scan against a fixture session containing a mix of complete / partial / corrupt segments; dirty-session detection from a `session.json` missing `finalized_at`.
+- ✅ New `app/storage/session_recovery.py` with three entry points:
+  - `mark_dirty_sessions(sessions_root)` walks `<sessions_root>/session_*/session.json`. Manifests with `state ∈ {recording, stopped}` and a missing `finalized_at` are atomically rewritten with `state = "dirty"` (`finalized_at` stays null — that's the §11.4 prompt's marker). Idempotent: re-runs are no-ops.
+  - `validate_session_segments(session_paths, db, *, validator=...)` walks `recording/<feed_id>/segment_*.mkv`, runs each through a configurable `SegmentValidator` (default = `cv2.VideoCapture` open + frame-count + first-frame read), and reconciles against SQLite. Three cases: valid file + complete row (no-op), invalid file + any row (move to `<session>/quarantine/<feed_id>/`, update DB row to `quarantined` and re-point `file_path`), valid file + no row (insert as `dirty` with best-effort PTS metadata derived from cv2 duration). Quarantine collisions get a `.recovered_NNN.` suffix so re-runs don't lose data.
+  - `load_segment_index_for_session(db, session_id)` returns a populated `SegmentIndex` from SQLite, filtered to `complete` and `dirty` rows (quarantined/corrupt rows are excluded so they never surface in replay queries).
+- ✅ `SessionPaths` / `FeedPaths` extended with `quarantine_dir`. The directory is created lazily by the recovery code only when something actually needs quarantining, so happy-path sessions don't accumulate empty directories. `FileManager.session_paths_for_existing(session_id)` returns the layout for an already-created session without re-creating it.
+- ✅ `MetadataDb` gained `get_segment_by_path`, `update_segment_state`, `update_segment_file_path`, and `all_session_ids` so the recovery pass can mutate row state without rewriting them.
+- ✅ `ApplicationCoordinator.initialize` now calls `mark_dirty_sessions` and `validate_session_segments` before creating the new session. Recovery runs synchronously on app launch; the cost is bounded by the number of prior sessions on disk and dominated by `cv2.VideoCapture` open latency. With cv2 unavailable, the validator falls back to "treat all files as valid" so a stripped-down install doesn't quarantine real recordings.
+- ✅ 15 new tests covering: `mark_dirty_sessions` against `recording`/`stopped`/`finalized`/already-`dirty`/`recording`-with-`finalized_at`/no-manifest fixtures, `validate_session_segments` against corrupt + valid + already-cataloged + non-segment files + quarantine collisions + missing `recording/`, and `load_segment_index_for_session` filtering. Validator is injectable so the tests don't need a real cv2/FFmpeg toolchain.
+
+**§11.4 recovery prompt UI remains deferred.** This slice records the data that prompt will need; the actual "Resume / End and finalize / Discard" dialog is its own slice.
+
+**Exit criteria for 4.E:** an unclean shutdown leaves `session.json` in `dirty` state on disk; corrupt segments end up in `<session>/quarantine/<feed_id>/`; in-progress (no DB row) segments that survived the crash get a `dirty` SQLite row so they're addressable by future tooling; the next launch sees the dirty state without crashing.
 
 ### Out of scope for Phase 4 (deferred)
 

@@ -159,12 +159,19 @@ class FeedDefinition:
 
 @dataclass(slots=True, frozen=True)
 class FeedPaths:
-    """Filesystem locations associated with one feed inside a session."""
+    """Filesystem locations associated with one feed inside a session.
+
+    Slice 4.E added `quarantine_dir`: corrupt segment files are moved here
+    by the startup recovery pass (§6.5). The directory is created lazily
+    by the recovery code only when something actually needs quarantining,
+    so happy-path sessions don't accumulate empty directories.
+    """
 
     feed_id: str
     recording_dir: Path
     rolling_dir: Path
     clips_dir: Path
+    quarantine_dir: Path
 
 
 @dataclass(slots=True)
@@ -176,15 +183,26 @@ class SessionPaths:
     recording_dir: Path
     rolling_dir: Path
     clips_dir: Path
+    quarantine_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        # Ergonomic default for test fixtures that don't pass an explicit
+        # quarantine_dir: derive `<root>/quarantine`. Production code goes
+        # through `FileManager.create_session_paths` which sets it
+        # explicitly.
+        if self.quarantine_dir is None:
+            self.quarantine_dir = self.root_dir / "quarantine"
 
     def get_feed_paths(self, feed_id: str) -> FeedPaths:
         """Return the per-feed directories used inside the session tree."""
         safe_feed_id = feed_id.strip() or "default"
+        assert self.quarantine_dir is not None  # set by __post_init__
         return FeedPaths(
             feed_id=safe_feed_id,
             recording_dir=self.recording_dir / safe_feed_id,
             rolling_dir=self.rolling_dir / safe_feed_id,
             clips_dir=self.clips_dir / safe_feed_id,
+            quarantine_dir=self.quarantine_dir / safe_feed_id,
         )
 
 

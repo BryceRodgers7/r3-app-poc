@@ -156,6 +156,54 @@ class MetadataDb:
             ).fetchall()
         return [_row_to_segment(row) for row in rows]
 
+    def get_segment_by_path(self, file_path: str) -> Segment | None:
+        """Return the segment row whose `file_path` matches, or `None`.
+
+        Slice 4.E uses this so the startup recovery pass can correlate
+        on-disk segment files with their persisted metadata.
+        """
+        connection = self.connect()
+        with self._write_lock:
+            row = connection.execute(
+                "SELECT * FROM segments WHERE file_path = ? LIMIT 1",
+                (file_path,),
+            ).fetchone()
+        return _row_to_segment(row) if row is not None else None
+
+    def update_segment_state(self, segment_id: int, state: str) -> None:
+        """Mutate the `state` column for a segment row (slice 4.E recovery)."""
+        connection = self.connect()
+        with self._write_lock:
+            connection.execute(
+                "UPDATE segments SET state = ? WHERE segment_id = ?",
+                (state, segment_id),
+            )
+            connection.commit()
+
+    def update_segment_file_path(self, segment_id: int, file_path: str) -> None:
+        """Mutate the `file_path` column for a segment row.
+
+        Slice 4.E: when a corrupt file is moved into the quarantine
+        subtree, we update the row to point at the new location so
+        replay queries don't return a stale path.
+        """
+        connection = self.connect()
+        with self._write_lock:
+            connection.execute(
+                "UPDATE segments SET file_path = ? WHERE segment_id = ?",
+                (file_path, segment_id),
+            )
+            connection.commit()
+
+    def all_session_ids(self) -> list[str]:
+        """Return every recorded `session_id` in the database, oldest first."""
+        connection = self.connect()
+        with self._write_lock:
+            rows = connection.execute(
+                "SELECT session_id FROM sessions ORDER BY started_at"
+            ).fetchall()
+        return [str(row["session_id"]) for row in rows]
+
     def close(self) -> None:
         """Close the active database connection."""
         if self._connection is not None:

@@ -21,6 +21,10 @@ from app.media.preview_output import PreviewOutput
 from app.media.recording_manager import RecordingManager
 from app.media.source_factory import build_source_for_feed
 from app.storage.session_manager import SessionManager
+from app.storage.session_recovery import (
+    mark_dirty_sessions,
+    validate_session_segments,
+)
 
 
 class ApplicationCoordinator:
@@ -176,6 +180,13 @@ class ApplicationCoordinator:
         """Start storage, ingest, and playback sessions."""
         if self._session_started:
             return
+        # Slice 4.E: scan prior sessions for crash-recovery before
+        # creating the new one. Marks unfinished sessions DIRTY (§10.6)
+        # and validates/quarantines their segment files (§6.5). Runs
+        # synchronously; the cost is bounded by the number of prior
+        # sessions on disk and is dominated by `cv2.VideoCapture` open
+        # latency.
+        self._run_startup_recovery()
         session_paths = self._session_manager.start_new_session(self.feed_registry.build_session_label())
         default_health_log().open(
             session_paths.root_dir / "logs" / "health_events.jsonl",
@@ -188,6 +199,21 @@ class ApplicationCoordinator:
         self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
+
+    def _run_startup_recovery(self) -> None:
+        """Mark dirty sessions and validate their segments before starting up."""
+        sessions_root = self._settings.sessions_root
+        report = mark_dirty_sessions(sessions_root)
+        if report.dirty_sessions_marked:
+            # Validate segments for each newly-marked dirty session so
+            # corrupt files end up in quarantine before the new session
+            # adopts the disk.
+            from app.storage.file_manager import FileManager
+            file_manager = FileManager(self._settings)
+            db = self._session_manager.get_metadata_db()
+            for session_id in report.dirty_sessions_marked:
+                session_paths = file_manager.session_paths_for_existing(session_id)
+                validate_session_segments(session_paths, db)
 
     def shutdown(self) -> None:
         """Stop playback sessions and feed runtimes."""
