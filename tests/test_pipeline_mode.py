@@ -21,9 +21,7 @@ class PipelineModeDefaultsTests(unittest.TestCase):
         )
         self.assertIs(source.pipeline_mode, PipelineMode.PYTHON_PUSH)
 
-    def test_ndi_receiver_currently_declares_python_push(self) -> None:
-        # 3.A.2 will flip NDI to NATIVE; until then it stays python_push and
-        # this test pins the current shape so the flip is visible in diff.
+    def test_ndi_receiver_declares_native_after_3a2(self) -> None:
         source = NDIReceiver(
             source_name="NDI",
             feed_id="feed_ndi",
@@ -32,9 +30,36 @@ class PipelineModeDefaultsTests(unittest.TestCase):
             frame_height=360,
             target_fps=30.0,
         )
-        self.assertIs(source.pipeline_mode, PipelineMode.PYTHON_PUSH)
+        self.assertIs(source.pipeline_mode, PipelineMode.NATIVE)
 
-    def test_default_build_native_bin_returns_none(self) -> None:
+    def test_ndi_receiver_read_frame_returns_none_when_native(self) -> None:
+        # Native sources never deliver frames into Python; PipelineManager
+        # consumes them via the bin's video src ghost pad instead.
+        source = NDIReceiver(
+            source_name="NDI",
+            feed_id="feed_ndi",
+            ndi_name="Sender",
+            frame_width=640,
+            frame_height=360,
+            target_fps=30.0,
+        )
+        self.assertIsNone(source.read_frame())
+
+    def test_ndi_receiver_build_native_chain_returns_none_before_connect(self) -> None:
+        # build_native_chain should only return a chain after connect_source
+        # verified the runtime dependency. That keeps the NATIVE contract honest.
+        source = NDIReceiver(
+            source_name="NDI",
+            feed_id="feed_ndi",
+            ndi_name="Sender",
+            frame_width=640,
+            frame_height=360,
+            target_fps=30.0,
+        )
+        # No connect_source() called -> chain should not be produced.
+        self.assertIsNone(source.build_native_chain(gst_module=object()))
+
+    def test_default_build_native_chain_returns_none(self) -> None:
         source = TestSource(
             source_name="Dev",
             feed_id="feed_dev",
@@ -42,7 +67,7 @@ class PipelineModeDefaultsTests(unittest.TestCase):
             frame_height=36,
             target_fps=15.0,
         )
-        self.assertIsNone(source.build_native_bin(gst_module=None))
+        self.assertIsNone(source.build_native_chain(gst_module=None))
 
     def test_subclass_can_override_pipeline_mode(self) -> None:
         class _NativeFake(SourceInterface):

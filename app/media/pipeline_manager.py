@@ -21,6 +21,7 @@ from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
 from app.media.frame_overlay import render_frame_overlay
 from app.media.gst_bus_log import log_bus_message
+from app.media.source_interface import PipelineMode
 from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
@@ -72,6 +73,7 @@ class PipelineManager:
         self._pipeline: Any | None = None
         self._appsrc: Any | None = None
         self._audio_appsrc: Any | None = None
+        self._native_audio_src_pad: Any | None = None
         self._bus: Any | None = None
         self._replay_pipeline: Any | None = None
         self._replay_source: Any | None = None
@@ -379,31 +381,62 @@ class PipelineManager:
             self._frame_duration_ns = max(1, int(Gst.SECOND * fps_fraction.denominator / fps_fraction.numerator))
 
             pipeline = Gst.Pipeline.new("sports-replay-pipeline")
-            appsrc = self._make_element("appsrc", "source_appsrc")
-            source_convert = self._make_element("videoconvert", "source_convert")
             tee = self._make_element("tee", "source_tee")
-
-            appsrc.set_property("is-live", True)
-            appsrc.set_property("format", Gst.Format.TIME)
-            appsrc.set_property("block", True)
-            appsrc.set_property("do-timestamp", False)
-            appsrc.set_property(
-                "caps",
-                Gst.Caps.from_string(
-                    "video/x-raw,format=BGR,"
-                    f"width={width},height={height},"
-                    f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
-                ),
-            )
-
-            pipeline.add(appsrc)
-            pipeline.add(source_convert)
             pipeline.add(tee)
-            if not appsrc.link(source_convert) or not source_convert.link(tee):
-                raise RuntimeError("Failed to link the GStreamer source path.")
+
+            if self._source.pipeline_mode == PipelineMode.NATIVE:
+                chain = self._source.build_native_chain(Gst)
+                if chain is None:
+                    raise RuntimeError(
+                        f"Native source {self._source.get_feed_id()!r} did not "
+                        f"build an element chain; check `connect_source()` "
+                        f"succeeded and required plugins are installed."
+                    )
+                # Add each native source element to the parent pipeline,
+                # then run the source's static-link step now that they share
+                # a parent.
+                for element in chain["elements"]:
+                    pipeline.add(element)
+                if not self._source.link_native_chain_static():
+                    raise RuntimeError(
+                        "Native source failed to link its static element chain."
+                    )
+                video_src = chain["video_src_pad"]
+                tee_sink = tee.get_static_pad("sink")
+                if (
+                    video_src is None
+                    or tee_sink is None
+                    or video_src.link(tee_sink) != Gst.PadLinkReturn.OK
+                ):
+                    raise RuntimeError(
+                        "Failed to link the native video src pad into the video tee."
+                    )
+                self._native_audio_src_pad = chain["audio_src_pad"]
+                self._appsrc = None
+                self._attach_tee_sink_diag_probe(tee_sink)
+            else:
+                appsrc = self._make_element("appsrc", "source_appsrc")
+                source_convert = self._make_element("videoconvert", "source_convert")
+                appsrc.set_property("is-live", True)
+                appsrc.set_property("format", Gst.Format.TIME)
+                appsrc.set_property("block", True)
+                appsrc.set_property("do-timestamp", False)
+                appsrc.set_property(
+                    "caps",
+                    Gst.Caps.from_string(
+                        "video/x-raw,format=BGR,"
+                        f"width={width},height={height},"
+                        f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
+                    ),
+                )
+                pipeline.add(appsrc)
+                pipeline.add(source_convert)
+                if not appsrc.link(source_convert) or not source_convert.link(tee):
+                    raise RuntimeError("Failed to link the GStreamer source path.")
+                self._native_source_bin = None
+                self._appsrc = appsrc
 
             self._pipeline = pipeline
-            self._appsrc = appsrc
             self._bus = pipeline.get_bus()
             if self._bus is not None:
                 self._bus.enable_sync_message_emission()
@@ -430,6 +463,19 @@ class PipelineManager:
             state_change = pipeline.set_state(Gst.State.PLAYING)
             if state_change == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("Failed to move the GStreamer pipeline to PLAYING.")
+            LOGGER.info(
+                "diag: pipeline.set_state(PLAYING) returned %s", state_change
+            )
+            # Wait up to 5s for the pipeline to actually reach PLAYING. With
+            # a live source like ndisrc the transition is async and we want
+            # to know whether it ever completes.
+            wait_ret, current_state, pending = pipeline.get_state(5 * Gst.SECOND)
+            LOGGER.info(
+                "diag: pipeline state after wait: ret=%s current=%s pending=%s",
+                wait_ret,
+                current_state,
+                pending,
+            )
             if self._replay_pipeline is not None:
                 replay_state_change = self._replay_pipeline.set_state(Gst.State.READY)
                 if replay_state_change == Gst.StateChangeReturn.FAILURE:
@@ -456,6 +502,7 @@ class PipelineManager:
         valve.set_property("drop", True)
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
+        sink.set_property("async", False)
         sink.set_property("max-buffers", 1 if branch_name == "preview" else 8)
         if branch_name == "preview":
             sink.set_property("drop", True)
@@ -495,10 +542,28 @@ class PipelineManager:
         valve.set_property("drop", True)
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
+        # async=False prevents this sink from gating the pipeline's
+        # PAUSED→PLAYING transition on preroll. Without this, if any other
+        # sink in the pipeline (e.g. the audio chain when the source has no
+        # audio) never receives a preroll buffer, the whole pipeline stays
+        # in PAUSED forever and we get new-preroll signals instead of
+        # new-sample. See native-NDI debugging in slice 3.A.2.
+        sink.set_property("async", False)
         sink.set_property("drop", True)
         sink.set_property("max-buffers", 2)
         sink.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
-        sink.connect("new-sample", self._on_preview_sample)
+        handler_id = sink.connect("new-sample", self._on_preview_sample)
+        # Also hook new-preroll. If THIS fires but new-sample doesn't, the
+        # pipeline is stuck in PAUSED state (the preroll state) and never
+        # reaches PLAYING — appsinks deliver via new-preroll while paused.
+        preroll_id = sink.connect("new-preroll", self._on_preview_preroll)
+        LOGGER.info(
+            "diag: preview appsink configured emit-signals=%s "
+            "new-sample handler_id=%s new-preroll handler_id=%s",
+            sink.get_property("emit-signals"),
+            handler_id,
+            preroll_id,
+        )
 
         self._pipeline.add(queue)
         self._pipeline.add(valve)
@@ -513,6 +578,13 @@ class PipelineManager:
         if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"Failed to link tee output to the {branch_name} branch.")
 
+        # Diagnostic probes (Phase 3.A.2 debugging — remove once stable):
+        # log the first buffer to land at the preview branch's queue.sink and
+        # at the appsink's sink. If queue.sink fires but appsink.sink doesn't,
+        # the valve / videoconvert in this branch is stuck. If neither fires,
+        # the tee isn't fanning the bin's output to this branch.
+        self._add_branch_diag_probes(queue_sink_pad, sink)
+
         queue.sync_state_with_parent()
         valve.sync_state_with_parent()
         convert.sync_state_with_parent()
@@ -521,6 +593,71 @@ class PipelineManager:
         self._branch_valves[branch_name] = valve
         self._preview_sink = sink
         self._preview_sink_factory_name = "appsink-preview"
+
+    def _attach_tee_sink_diag_probe(self, tee_sink_pad: Any) -> None:
+        """Log the first buffer + the first caps event at the source tee's sink."""
+        Gst = self._Gst
+        assert Gst is not None
+        state = {"buffer_logged": False, "caps_logged": False}
+
+        def _probe(_pad: Any, info: Any, _user: Any) -> Any:
+            if (
+                not state["caps_logged"]
+                and info.type & Gst.PadProbeType.EVENT_DOWNSTREAM
+            ):
+                event = info.get_event()
+                if event is not None and event.type == Gst.EventType.CAPS:
+                    caps = event.parse_caps()
+                    LOGGER.info(
+                        "diag: tee.sink received caps event: %s",
+                        caps.to_string() if caps is not None else "<none>",
+                    )
+                    state["caps_logged"] = True
+            if not state["buffer_logged"] and info.type & Gst.PadProbeType.BUFFER:
+                LOGGER.info("diag: first buffer reached source_tee.sink")
+                state["buffer_logged"] = True
+            return Gst.PadProbeReturn.OK
+
+        try:
+            tee_sink_pad.add_probe(
+                Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM,
+                _probe,
+                None,
+            )
+        except Exception as exc:
+            LOGGER.warning("diag: failed to attach tee.sink probe: %s", exc)
+
+    def _add_branch_diag_probes(self, queue_sink_pad: Any, appsink: Any) -> None:
+        """Attach one-shot buffer probes to localize where data flow stops."""
+        Gst = self._Gst
+        assert Gst is not None
+        state = {"queue_sink_logged": False, "appsink_sink_logged": False}
+
+        def _probe_queue_sink(_pad: Any, _info: Any, _user: Any) -> Any:
+            if not state["queue_sink_logged"]:
+                LOGGER.info(
+                    "diag: first buffer reached preview queue.sink (tee fan-out OK)"
+                )
+                state["queue_sink_logged"] = True
+            return Gst.PadProbeReturn.OK
+
+        def _probe_appsink_sink(_pad: Any, _info: Any, _user: Any) -> Any:
+            if not state["appsink_sink_logged"]:
+                LOGGER.info(
+                    "diag: first buffer reached preview appsink.sink (branch chain OK)"
+                )
+                state["appsink_sink_logged"] = True
+            return Gst.PadProbeReturn.OK
+
+        try:
+            queue_sink_pad.add_probe(Gst.PadProbeType.BUFFER, _probe_queue_sink, None)
+            appsink_sink_pad = appsink.get_static_pad("sink")
+            if appsink_sink_pad is not None:
+                appsink_sink_pad.add_probe(
+                    Gst.PadProbeType.BUFFER, _probe_appsink_sink, None
+                )
+        except Exception as exc:
+            LOGGER.warning("diag: failed to attach branch buffer probes: %s", exc)
 
     def _build_audio_path_locked(self) -> None:
         assert self._pipeline is not None
@@ -534,34 +671,48 @@ class PipelineManager:
             return
 
         self._audio_format = audio_format
-        appsrc = self._make_element("appsrc", "audio_appsrc")
-        convert = self._make_element("audioconvert", "audio_convert")
-        resample = self._make_element("audioresample", "audio_resample")
         tee = self._make_element("tee", "audio_tee")
-
-        appsrc.set_property("is-live", True)
-        appsrc.set_property("format", Gst.Format.TIME)
-        appsrc.set_property("block", True)
-        appsrc.set_property("do-timestamp", False)
-        appsrc.set_property(
-            "caps",
-            Gst.Caps.from_string(
-                "audio/x-raw,"
-                f"format={audio_format.sample_format},"
-                f"rate={audio_format.sample_rate},"
-                f"channels={audio_format.channels},"
-                "layout=interleaved"
-            ),
-        )
-
-        self._pipeline.add(appsrc)
-        self._pipeline.add(convert)
-        self._pipeline.add(resample)
         self._pipeline.add(tee)
-        if not appsrc.link(convert) or not convert.link(resample) or not resample.link(tee):
-            raise RuntimeError("Failed to link the GStreamer audio source path.")
 
-        self._audio_appsrc = appsrc
+        if self._source.pipeline_mode == PipelineMode.NATIVE:
+            audio_src = self._native_audio_src_pad
+            audio_tee_sink = tee.get_static_pad("sink")
+            if (
+                audio_src is None
+                or audio_tee_sink is None
+                or audio_src.link(audio_tee_sink) != Gst.PadLinkReturn.OK
+            ):
+                raise RuntimeError(
+                    "Failed to link the native audio src pad into the audio tee."
+                )
+            self._audio_appsrc = None
+        else:
+            appsrc = self._make_element("appsrc", "audio_appsrc")
+            convert = self._make_element("audioconvert", "audio_convert")
+            resample = self._make_element("audioresample", "audio_resample")
+
+            appsrc.set_property("is-live", True)
+            appsrc.set_property("format", Gst.Format.TIME)
+            appsrc.set_property("block", True)
+            appsrc.set_property("do-timestamp", False)
+            appsrc.set_property(
+                "caps",
+                Gst.Caps.from_string(
+                    "audio/x-raw,"
+                    f"format={audio_format.sample_format},"
+                    f"rate={audio_format.sample_rate},"
+                    f"channels={audio_format.channels},"
+                    "layout=interleaved"
+                ),
+            )
+
+            self._pipeline.add(appsrc)
+            self._pipeline.add(convert)
+            self._pipeline.add(resample)
+            if not appsrc.link(convert) or not convert.link(resample) or not resample.link(tee):
+                raise RuntimeError("Failed to link the GStreamer audio source path.")
+            self._audio_appsrc = appsrc
+
         self._add_live_audio_branch()
         self._add_audio_appsink_branch("record", self._on_record_audio_sample)
         self._add_audio_appsink_branch("replay", self._on_replay_audio_sample)
@@ -579,6 +730,12 @@ class PipelineManager:
 
         valve.set_property("drop", True)
         self._set_property_if_supported(sink, "sync", False)
+        # async=False: don't gate the parent pipeline's PAUSED→PLAYING
+        # transition on this audio sink prerolling. With NDI sources that
+        # have no audio (e.g. Screen Capture), the audio chain has no
+        # upstream data and would otherwise hold the pipeline in PAUSED
+        # forever.
+        self._set_property_if_supported(sink, "async", False)
 
         self._pipeline.add(queue)
         self._pipeline.add(valve)
@@ -609,6 +766,7 @@ class PipelineManager:
         valve.set_property("drop", True)
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
+        sink.set_property("async", False)
         sink.set_property("max-buffers", 32)
         sink.connect("new-sample", sample_handler)
 
@@ -776,20 +934,24 @@ class PipelineManager:
                 return
 
             self._stop_event.clear()
-            self._frame_feed_thread = threading.Thread(
-                target=self._feed_appsrc_loop,
-                name="gst-appsrc-feed",
-                daemon=True,
-            )
-            self._frame_feed_thread.start()
 
-            if self._audio_appsrc is not None and self._audio_feed_thread is None:
-                self._audio_feed_thread = threading.Thread(
-                    target=self._feed_audio_appsrc_loop,
-                    name="gst-audio-appsrc-feed",
+            # Native sources stream frames directly through GStreamer; the
+            # appsrc feed loop is only needed for python_push sources.
+            if self._source.pipeline_mode == PipelineMode.PYTHON_PUSH:
+                self._frame_feed_thread = threading.Thread(
+                    target=self._feed_appsrc_loop,
+                    name="gst-appsrc-feed",
                     daemon=True,
                 )
-                self._audio_feed_thread.start()
+                self._frame_feed_thread.start()
+
+                if self._audio_appsrc is not None and self._audio_feed_thread is None:
+                    self._audio_feed_thread = threading.Thread(
+                        target=self._feed_audio_appsrc_loop,
+                        name="gst-audio-appsrc-feed",
+                        daemon=True,
+                    )
+                    self._audio_feed_thread.start()
 
             self._bus_thread = threading.Thread(
                 target=self._monitor_bus_loop,
@@ -1071,13 +1233,47 @@ class PipelineManager:
 
         return Gst.PadProbeReturn.OK
 
+    def _on_preview_preroll(self, sink: Any) -> Any:
+        Gst = self._Gst
+        assert Gst is not None
+        if not getattr(self, "_first_preview_preroll_logged", False):
+            LOGGER.info(
+                "diag: preview new-preroll fired — pipeline is in PAUSED, "
+                "not PLAYING (this means set_state(PLAYING) hasn't completed)"
+            )
+            self._first_preview_preroll_logged = True
+        try:
+            sink.emit("pull-preroll")
+        except Exception:
+            pass
+        return Gst.FlowReturn.OK
+
     def _on_preview_sample(self, sink: Any) -> Any:
         Gst = self._Gst
         assert Gst is not None
 
-        sample = sink.emit("pull-sample")
-        frame = self._sample_to_media_frame(sample)
-        if frame is not None:
+        if not getattr(self, "_first_preview_sample_logged", False):
+            LOGGER.info("diag: _on_preview_sample first invocation")
+            self._first_preview_sample_logged = True
+
+        try:
+            sample = sink.emit("pull-sample")
+            if sample is None:
+                if not getattr(self, "_warned_pull_sample_none", False):
+                    LOGGER.warning(
+                        "diag: preview new-sample fired but pull-sample returned None"
+                    )
+                    self._warned_pull_sample_none = True
+                return Gst.FlowReturn.OK
+            frame = self._sample_to_media_frame(sample)
+            if frame is None:
+                if not getattr(self, "_warned_frame_none", False):
+                    LOGGER.warning(
+                        "diag: preview pull-sample returned a sample but "
+                        "_sample_to_media_frame produced None"
+                    )
+                    self._warned_frame_none = True
+                return Gst.FlowReturn.OK
             if self._feed_metrics is not None:
                 self._feed_metrics.tick_source()
                 if self._preview_running:
@@ -1086,7 +1282,13 @@ class PipelineManager:
                 if self._frame_callback is not None:
                     self._frame_callback(frame)
                 if self._live_sample_callback is not None:
-                    self._live_sample_callback(FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id))
+                    self._live_sample_callback(
+                        FrameOverlayInfo.from_media_frame(frame, feed_id=frame.feed_id)
+                    )
+        except Exception:
+            if not getattr(self, "_warned_preview_handler", False):
+                LOGGER.exception("diag: _on_preview_sample raised")
+                self._warned_preview_handler = True
         return Gst.FlowReturn.OK
 
     def _on_record_sample(self, sink: Any) -> Any:

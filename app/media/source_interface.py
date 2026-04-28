@@ -65,16 +65,35 @@ class SourceInterface(ABC):
         """
         return PipelineMode.PYTHON_PUSH
 
-    def build_native_bin(self, gst_module: object) -> object | None:
-        """Build a configured `Gst.Bin` for this source.
+    def build_native_chain(self, gst_module: object) -> dict | None:
+        """Build a native GStreamer element chain for this source.
 
         Only meaningful for `pipeline_mode == NATIVE` sources. The returned
-        bin must expose a single video src ghost pad emitting `BGR` raw
-        video at the source's negotiated frame size and rate. Default
-        implementation returns `None` — `PipelineManager` falls back to the
-        Python-push appsrc head.
+        dict must contain::
+
+            {
+                "elements": [Gst.Element, ...],   # caller adds each to its pipeline
+                "video_src_pad": Gst.Pad,         # BGR raw video src pad
+                "audio_src_pad": Gst.Pad,         # PCM audio src pad
+            }
+
+        After the caller adds the elements to its pipeline, it must call
+        `link_native_chain_static()` so the source can complete inter-element
+        links that require shared parentage.
+
+        Default implementation returns `None` — sources in `python_push`
+        mode never need this and `PipelineManager` falls back to its
+        appsrc-based head.
         """
         return None
+
+    def link_native_chain_static(self) -> bool:
+        """Complete static-side links after caller adds the chain elements.
+
+        Default implementation returns `False` (not applicable). Native
+        sources override.
+        """
+        return False
 
     @abstractmethod
     def read_frame(self) -> MediaFrame | None:
