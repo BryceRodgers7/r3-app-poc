@@ -102,5 +102,73 @@ class PipelineModeDefaultsTests(unittest.TestCase):
         self.assertIs(_NativeFake().pipeline_mode, PipelineMode.NATIVE)
 
 
+class VideoWidgetRenderModeTests(unittest.TestCase):
+    """Slice 3.A.3: `VideoWidget` toggles the right surface per render mode."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PySide6.QtWidgets import QApplication
+        cls._app = QApplication.instance() or QApplication([])
+
+    def test_set_video_surface_visible_qimage_mode_shows_label(self) -> None:
+        from app.ui.video_widget import VideoWidget
+        widget = VideoWidget()
+        widget.set_render_mode("qimage")
+        widget.set_video_surface_visible(True)
+        self.assertIs(widget._surface_stack.currentWidget(), widget._frame_label)
+
+    def test_set_video_surface_visible_native_mode_shows_native_surface(self) -> None:
+        from app.ui.video_widget import VideoWidget
+        widget = VideoWidget()
+        widget.set_render_mode("native")
+        widget.set_video_surface_visible(True)
+        self.assertIs(widget._surface_stack.currentWidget(), widget._live_surface)
+
+    def test_disabled_falls_back_to_label_regardless_of_mode(self) -> None:
+        from app.ui.video_widget import VideoWidget
+        widget = VideoWidget()
+        widget.set_render_mode("native")
+        widget.set_video_surface_visible(False)
+        self.assertIs(widget._surface_stack.currentWidget(), widget._frame_label)
+
+    def test_unknown_render_mode_rejected(self) -> None:
+        from app.ui.video_widget import VideoWidget
+        widget = VideoWidget()
+        with self.assertRaises(ValueError):
+            widget.set_render_mode("opengl")
+
+
+class PipelineManagerNativeWindowBindingTests(unittest.TestCase):
+    """Slice 3.A.3: per-window handle setters route to the right sink."""
+
+    def test_set_native_preview_window_handle_rejects_bad_role(self) -> None:
+        from unittest.mock import MagicMock
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._pipeline_lock = __import__("threading").Lock()
+        pm._operator_window_handle = None
+        pm._program_window_handle = None
+        pm._operator_preview_sink = None
+        pm._program_preview_sink = None
+        with self.assertRaises(ValueError):
+            pm.set_native_preview_window_handle("third-monitor", 12345)
+
+    def test_set_native_preview_window_handle_stores_when_sink_missing(self) -> None:
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._pipeline_lock = __import__("threading").Lock()
+        pm._operator_window_handle = None
+        pm._program_window_handle = None
+        pm._operator_preview_sink = None
+        pm._program_preview_sink = None
+        # No sink yet — should just store the handle without raising.
+        pm.set_native_preview_window_handle("operator", 0xABCD)
+        pm.set_native_preview_window_handle("program", 0x1234)
+        self.assertEqual(pm._operator_window_handle, 0xABCD)
+        self.assertEqual(pm._program_window_handle, 0x1234)
+
+
 if __name__ == "__main__":
     unittest.main()

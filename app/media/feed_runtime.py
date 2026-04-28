@@ -99,23 +99,33 @@ class FeedRuntime:
         self._live_overlay_listeners.append(listener)
         listener(self._latest_live_overlay)
 
-    def _on_live_frame(self, frame: MediaFrame) -> None:
+    def _promote_feed_state_on_arrival(self) -> None:
+        """Run the CONNECTING/RECONNECTING/etc → LIVE transition once data flows.
+
+        Called from both `_on_live_frame` (python_push sources) and
+        `_on_live_overlay` (native sources, which never deliver pixel data
+        into Python). This keeps `FeedState` accurate regardless of which
+        callback path the source uses.
+        """
         if self.feed_state.state in {
             FeedState.CONNECTING,
             FeedState.RECONNECTING,
             FeedState.DEGRADED,
             FeedState.DISCONNECTED,
         }:
-            # A frame arrived; promote toward LIVE. DISCONNECTED must hop
-            # through RECONNECTING per the §10.2 transition table.
             if self.feed_state.state == FeedState.DISCONNECTED:
+                # DISCONNECTED must hop through RECONNECTING per §10.2.
                 self.feed_state.transition_to(FeedState.RECONNECTING)
             self.feed_state.transition_to(FeedState.LIVE)
+
+    def _on_live_frame(self, frame: MediaFrame) -> None:
+        self._promote_feed_state_on_arrival()
         self._latest_live_frame = frame
         for listener in list(self._live_frame_listeners):
             listener(frame)
 
     def _on_live_overlay(self, frame_overlay: FrameOverlayInfo) -> None:
+        self._promote_feed_state_on_arrival()
         self._latest_live_overlay = frame_overlay
         for listener in list(self._live_overlay_listeners):
             listener(frame_overlay)

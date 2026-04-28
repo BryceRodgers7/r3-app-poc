@@ -12,6 +12,7 @@ from app.core.recording_state import RecordingState
 from app.core.session_state import SessionState
 from app.core.telemetry import TelemetryHub
 from app.media.feed_runtime import FeedRuntime
+from app.media.source_interface import PipelineMode
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
@@ -71,6 +72,33 @@ class ApplicationCoordinator:
         )
         self._session_started = False
         self._shutting_down = False
+
+    def get_feed_pipeline_mode(self, feed_id: str) -> PipelineMode:
+        """Return the configured ingest pipeline mode for `feed_id`.
+
+        Returns `PYTHON_PUSH` if the feed is not registered (safe default
+        — unknown feeds shouldn't accidentally trigger native rendering).
+        """
+        runtime = self._feed_runtimes.get(feed_id)
+        if runtime is None:
+            return PipelineMode.PYTHON_PUSH
+        return runtime.source.pipeline_mode
+
+    def bind_native_preview_window_handle(
+        self, role: str, feed_id: str, window_handle: int
+    ) -> None:
+        """Bind a Qt window handle to the per-feed native preview sink.
+
+        `role` is `"operator"` or `"program"`. No-op when the feed's source
+        runs in `python_push` mode (those sources render via the legacy
+        QImage path and don't have native preview sinks to bind).
+        """
+        runtime = self._feed_runtimes.get(feed_id)
+        if runtime is None:
+            return
+        if runtime.source.pipeline_mode != PipelineMode.NATIVE:
+            return
+        runtime.pipeline_manager.set_native_preview_window_handle(role, window_handle)
 
     def get_app_state(self) -> AppState:
         """Aggregate the four sub-state machines into the top-level `AppState`."""

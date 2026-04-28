@@ -1862,7 +1862,34 @@ Notes:
 
 ## Phase 3 – Native GStreamer Data Path for One Feed
 
-**Status: 🟡 In progress.** 3.A.1 and 3.A.2 are complete; 3.A.3, 3.B, and 3.C remain.
+**Status: 🟡 In progress, partially blocked.** 3.A.1 and 3.A.2 are complete; 3.A.3 was attempted and reverted (see slice notes); 3.B and 3.C are **deferred until after Phase 4** for the reasons described in "Blocker discovered during 3.A.3 testing" below.
+
+### Blocker discovered during 3.A.3 testing (drives Phase 4 acceleration)
+
+While reliability-testing the post-3.A.2 baseline at 720p, the app deadlocked after ~12-13 frames on every launch (CPU near 0, threads stable, memory flat — classic deadlock signature, not throughput). Reproducible with both NDI and synthetic sources, so source-independent. Localized via a diagnostic disable of `pipeline_manager.start_replay_buffer`: with the rolling replay buffer disabled, live preview runs cleanly at 1080p; with it enabled, deadlock at ~12-13 frames every time.
+
+**Root cause:** `MuxedMediaWriter` (`app/media/muxed_writer.py`) is invoked from GStreamer streaming-thread signal handlers (`_on_replay_sample`, `_on_record_sample`). Its lazy `_open()` and per-segment rotation perform blocking `pipeline.set_state(...)` calls. Calling `set_state` from a signal handler that's part of the *outer* pipeline's data flow blocks the streaming thread, which blocks the source tee, which deadlocks the entire per-feed graph.
+
+This affects two paths today:
+
+- **Rolling replay buffer** (`_on_replay_sample` → `replay_buffer.append_frame` → `MuxedMediaWriter.write_frame` → `_open` on first call, segment rotation thereafter). Manifests as the 12-13-frame freeze on every launch with replay enabled.
+- **Long-form game recording** (`_on_record_sample` → `recorder.write_frame` → same `MuxedMediaWriter`). Manifests as a hard deadlock the moment the operator clicks "Start game recording."
+
+**Why Phase 4 fixes both:** §5.4 / §6.3 / Phase 4's task list specify replacing `MuxedMediaWriter` (Python-driven, lazy-opens its own pipeline, blocking) with native GStreamer muxers (`splitmuxsink` / `mp4mux` / etc.) wired directly into the per-feed tee branches as part of the same pipeline. No more `set_state` calls from signal handlers, no more deadlock. Phase 4 also obsoletes the rolling JPEG replay buffer entirely (replay reads from completed recording segments per §6.6 / §15.2).
+
+**Caveats currently in force in the working tree:**
+
+- A diagnostic early-return at the top of `pipeline_manager.start_replay_buffer` keeps the rolling replay buffer disabled. Reverting this re-introduces the 12-13-frame deadlock; do not revert until Phase 4 lands and the rolling buffer is removed entirely.
+- The "Start game recording" button still deadlocks the app on click. The button is left as-is (per operator preference) with the understanding that it must not be exercised until Phase 4 ships native recording. No guard installed.
+- Operator-side replay actions (rewind, pause, slow, jump-to-live) require recording to be `RECORDING` per §10.4; with recording broken, these are also exercised at the operator's risk.
+
+**Why 3.B and 3.C are deferred:**
+
+3.B (per-branch queue policies + queue-depth metrics) and 3.C (validation banner + Phase-3 readout) are designed around a working recording branch. With recording broken, neither slice can be meaningfully validated end-to-end. The right ordering is: ship Phase 4 → confirm recording works → resume 3.B / 3.C with that as the substrate.
+
+3.A.3 retry (native preview video sink) is also deferred until after Phase 4. The current symptoms may have been compounded by recording-branch resource contention; revisiting it after Phase 4 reduces concurrent unknowns.
+
+---
 
 Goal:
 
@@ -1897,7 +1924,7 @@ Exit criteria:
 
 Phase 3 is the first phase that touches real media flow. The current pipeline pushes Python-side `MediaFrame` (NumPy BGR) into GStreamer via `appsrc`; Phase 3's job is to replace that hot path with a native GStreamer source on the production feed kind (NDI) while preserving the synthetic dev fallback. Phase 2.5 narrowed the source surface to NDI + synthetic, so 3.A's "one feed" target is unambiguous: NDI.
 
-A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python on ingest* is necessary but not sufficient for end-to-end full-resolution operation. The current operator preview also pulls frames *into Python* via `_on_preview_sample` to render via `QImage`. At 1080p@30 that's ~180 MB/s through the GIL, which freezes the Qt event loop. Slice 3.A is therefore split into three sub-slices: ingest contract (3.A.1), native NDI ingest (3.A.2), and **native preview video sink** (3.A.3). All three are needed before the Python display ceiling lifts; the operator-configurable `target_frame_*` defaults in `app/config/settings.py` will stay at a Python-tractable size (720p@30) until 3.A.3 lands.
+A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python on ingest* is necessary but not sufficient for end-to-end full-resolution operation. The current operator preview also pulls frames *into Python* via `_on_preview_sample` to render via `QImage`. At 1080p@30 that's ~180 MB/s through the GIL, which freezes the Qt event loop. Slice 3.A is therefore split into three sub-slices: ingest contract (3.A.1), native NDI ingest (3.A.2), and **native preview video sink** (3.A.3). All three are needed before the Python display ceiling lifts; the operator-configurable `target_frame_*` defaults in `app/config/settings.py` stay at a Python-tractable size (720p@30) until a successful 3.A.3 implementation lands. 3.A.3's first attempt (d3d11videosink + per-window handle binding) was reverted — see the slice note below.
 
 **3.A.1 — Pipeline-mode contract + diagnostics** *(✅ Complete)*
 
@@ -1914,13 +1941,24 @@ A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python o
 
 **Limitation discovered, deferred to 3.A.3:** the **preview** path still pulls every frame into Python via the appsink+`new-sample` signal handler for QImage rendering. At full source resolution and rate (e.g. 2560×1440@60 from a desktop NDI sender) that drowns the GIL and freezes the Qt event loop. Mitigated for now by capping the source-side `videoscale`/`videorate` chain at the operator-configured `target_frame_*` defaults (720p@30); production-grade 1080p@30 needs 3.A.3.
 
-**3.A.3 — Native preview video sink**
+**3.A.3 — Native preview video sink** *(⚠️ Attempted, reverted — needs another approach)*
 
-- Replace the operator-window preview path's `appsink → numpy → QImage` round-trip with a native GStreamer video sink that renders directly into the operator window's native window handle. The infrastructure already exists for the replay path (`d3d11videosink` on Windows, with `_video_window_handle` and `_bind_video_sink_locked` machinery in `pipeline_manager.py`); 3.A.3 extends the same pattern to the live preview branch.
-- The preview branch becomes: `tee → queue (leaky-downstream) → videoconvert → d3d11videosink` (or platform equivalent), no appsink in the preview path. The recording and replay branches keep their appsinks (Python is still the writer until Phase 4 / native-muxed segmented recording lands — separate ceiling).
-- `FrameOverlayInfo` continues to flow to the operator's `PlaybackController` so UI overlays still update; the *pixel-burned* overlay disappears for native preview (acceptable — UI overlays are the operator-visible ones).
-- Once 3.A.3 lands, the `target_frame_*` defaults can be raised to 1920×1080@30. The end-to-end Python ceiling for 1080p will then be limited to the recording path, which Phase 4's segmented native muxers fix.
-- Tests: preview branch element shape (no appsink, native sink present); window-handle binding round-trips through the controller; the `FrameOverlayInfo` callback path still fires from non-appsink sources.
+The intended design: replace the operator-window preview path's `appsink → numpy → QImage` round-trip with a native GStreamer video sink (`d3d11videosink` on Windows) that renders directly into each VideoWidget's native window handle. Two sinks per feed (operator + program), bound via `GstVideoOverlay.set_window_handle()` to the per-window `WId()` returned by Qt. A buffer pad probe on `videoconvert.src` would tick metrics and synthesize `FrameOverlayInfo` so the operator's `PlaybackController` state machine still sees frame-arrival events. No pixel data into Python on the preview hot path.
+
+**What actually happened:** the implementation built (the bin shape was correct, tests passed), but on the user's hardware (Windows + PySide6 + gst-plugins-bad d3d11videosink) the binding misbehaved at runtime: a third "Direct3D11 renderer" top-level window appeared (sink falling back to creating its own window despite preemptive `set_window_handle()`), buffers froze in the per-branch tee within ~1 second, and Python eventually went unresponsive. Adding a `prepare-window-handle` sync-bus-message handler that explicitly recognized both per-window sinks (the canonical GstVideoOverlay protocol) did not change the symptoms.
+
+**State after revert:**
+
+- The actual native preview branch construction is bypassed: `pipeline_manager._add_preview_branch` always dispatches to `_add_python_push_preview_branch` regardless of source mode. Native sources still ingest natively (3.A.2 path) but their preview frames flow through the existing appsink + QImage path. `MainWindow.__init__` no longer calls `set_render_mode("native")` or `bind_native_preview_window_handle(...)`; every widget stays in the default `qimage` render mode.
+- All the surrounding infrastructure stays in place and tested: `_add_native_preview_branch`, `_on_native_preview_buffer_probe`, the per-window handle setters, `bind_native_preview_window_handle`, `get_feed_pipeline_mode`, `VideoWidget.set_render_mode`, the `_promote_feed_state_on_arrival` helper, the bus-sync-message extension, and the `pipeline_mode` / `python_frames_per_sec` diagnostics. A future retry can flip the one-line dispatch in `_add_preview_branch` back without redoing the wiring.
+
+**Consequence:** the live-preview Python ceiling is unchanged. `target_frame_*` defaults remain at **1280×720@30** until a successful native-preview approach is found. Phase 4 (segmented native muxers) does *not* lift this ceiling — it fixes the recording-side Python ceiling, which is a separate path. End-to-end 1080p still requires both 3.A.3-equivalent (preview side) and Phase 4 (recording side) to land successfully.
+
+**Possible directions for a fresh 3.A.3 attempt** (in rough order of likely success):
+- Use `qmlglsink` from `gst-plugins-good`/`bad` and integrate via QML rather than raw `WId()` handle binding. Tighter pygobject/Qt integration.
+- Use `glimagesink` (or `autovideosink` letting it pick) in a single-window config (operator only) — sidesteps the multi-sink fan-out which may have contributed to the freeze.
+- Investigate whether the third-window symptom is gst-plugins-bad d3d11videosink-version-specific. A newer `gst-plugins-rs` `d3d12sink` may behave differently.
+- Throttle the appsink path with an explicit `videorate` to e.g. 15 fps and accept lower-fidelity preview while keeping recording at full rate. This is an architectural compromise (still Python-bound) but proven to work.
 
 **3.B — Explicit per-branch queue policies + queue-depth metrics**
 
@@ -1947,6 +1985,8 @@ A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python o
 
 ## Phase 4 – Segmented Recording Store + Active Replay Index
 
+**Status: 🔥 Accelerated.** Phase 4 was originally scheduled after Phase 3.B / 3.C, but a deadlock discovered during 3.A.3 reliability testing (see Phase 3 "Blocker discovered" note) makes Phase 4 the practical unblocker for the entire app: today the rolling replay buffer is disabled by a diagnostic early-return and the "Start game recording" button deadlocks the app on click. Both are caused by `MuxedMediaWriter`'s blocking `set_state(...)` calls being driven from streaming-thread signal handlers, and Phase 4's native segmented muxers replace that path entirely.
+
 Goal:
 
 - Replace JPEG/raw-frame replay storage with segmented encoded recording files that also serve as the in-session replay source.
@@ -1960,6 +2000,8 @@ Tasks:
 - Build in-memory timestamp index.
 - Implement replay eligibility queries over completed segments only.
 - Implement startup scan/recovery.
+- **Remove `MuxedMediaWriter`-driven segment writing entirely.** Use native GStreamer muxers (`splitmuxsink` for time-bounded segment files, or per-segment `filesink`s driven by pad-add events on a downstream branch) wired directly into the per-feed tee. No `pipeline.set_state(...)` calls from signal handlers; no lazy pipeline creation per segment. This is what unblocks the rolling-buffer and "Start game recording" deadlocks documented in Phase 3.
+- **Delete the rolling JPEG replay buffer.** `app/media/replay_buffer.py` (and its `ReplayStore` interface) is obsolete once segmented recording exists — replay reads from completed recording segments per §6.6 / §15.2. Removing it cleans up the diagnostic early-return in `start_replay_buffer` as a side effect.
 
 Do not:
 

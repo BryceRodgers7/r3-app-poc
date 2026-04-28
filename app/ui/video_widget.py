@@ -31,6 +31,10 @@ class VideoWidget(QWidget):
         self._frame_label.setStyleSheet("background-color: #101010; color: #f3f3f3;")
         self._current_image: QImage | None = None
         self._showing_video_surface = False
+        # `qimage` (legacy / python_push sources) renders frames into the
+        # QLabel via QImage. `native` (3.A.3+ native sources) lets a
+        # GStreamer video sink render directly into `_live_surface`.
+        self._render_mode: str = "qimage"
 
         self._surface_stack_host = QWidget(self)
         self._surface_stack_host.setObjectName("videoSurfaceHost")
@@ -128,10 +132,28 @@ class VideoWidget(QWidget):
         """Return the native child-window handle used by embedded video output."""
         return int(self._live_surface.winId())
 
+    def set_render_mode(self, mode: str) -> None:
+        """Set whether 'show video' should reveal the native surface or QImage label."""
+        if mode not in {"qimage", "native"}:
+            raise ValueError(f"Unsupported render mode: {mode!r}")
+        self._render_mode = mode
+        # If video is already meant to be visible, re-apply with the new mode.
+        if self._showing_video_surface:
+            self.set_video_surface_visible(True)
+
     def set_video_surface_visible(self, enabled: bool) -> None:
-        """Switch between active-frame mode and placeholder mode."""
+        """Switch between active-video mode and placeholder mode.
+
+        When `enabled` is True, the active widget depends on the configured
+        render mode: `qimage` keeps the legacy QLabel-with-pixmap path,
+        `native` switches to the `_live_surface` child window so a
+        GStreamer video sink can render directly into it.
+        """
         self._showing_video_surface = enabled
-        self._surface_stack.setCurrentWidget(self._frame_label)
+        if enabled and self._render_mode == "native":
+            self._surface_stack.setCurrentWidget(self._live_surface)
+        else:
+            self._surface_stack.setCurrentWidget(self._frame_label)
         self._update_display_resolution_overlay()
         self._layout_playback_overlay()
         self._stack_overlay_z_order()

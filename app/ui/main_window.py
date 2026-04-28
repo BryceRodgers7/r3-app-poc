@@ -49,6 +49,12 @@ class MainWindow(QMainWindow):
 
         enabled_feeds = [f for f in feeds if f.enabled]
         self.video_panel = MultiFeedVideoPanel(enabled_feeds, self)
+        # Slice 3.A.3 added per-feed native preview wiring here
+        # (set_render_mode("native") + bind_native_preview_window_handle).
+        # That path was reverted while we work the underlying d3d11videosink
+        # binding issue; until a fresh attempt lands, every widget stays in
+        # the default qimage render mode and renders frames via QImage from
+        # the python_push appsink path.
         for feed_id, widget in self.video_panel.widgets_by_feed_id.items():
             self._output_renderer.bind_feed_widget(feed_id, widget)
 

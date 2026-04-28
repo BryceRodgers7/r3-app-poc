@@ -87,6 +87,10 @@ class PipelineManager:
         self._audio_branch_valves: dict[str, Any] = {}
         self._preview_sink: Any | None = None
         self._preview_sink_factory_name: str | None = None
+        self._operator_preview_sink: Any | None = None
+        self._program_preview_sink: Any | None = None
+        self._operator_window_handle: int | None = None
+        self._program_window_handle: int | None = None
         self._replay_sink: Any | None = None
         self._replay_sink_factory_name: str | None = None
         self._preview_probe_pad: Any | None = None
@@ -141,6 +145,8 @@ class PipelineManager:
         self._recorder.end_long_recording()
 
     def start_replay_buffer(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
+        # temporary disable for diagnostic purposes
+        return
         """Start the rolling replay buffer branch."""
         self._replay_buffer.start(session_paths, feed_id=feed_id or self._source.get_feed_id())
         self._replay_running = True
@@ -239,6 +245,46 @@ class PipelineManager:
     def set_preview_window_handle(self, window_handle: int) -> None:
         """Backward-compatible wrapper for the shared video surface handle."""
         self.set_video_window_handle(window_handle)
+
+    def set_native_preview_window_handle(self, role: str, window_handle: int) -> None:
+        """Bind one of the per-window native preview sinks to a Qt window handle.
+
+        `role` must be `"operator"` or `"program"`. No-op for python_push
+        sources (their preview path uses an appsink and renders via QImage).
+        """
+        if role not in {"operator", "program"}:
+            raise ValueError(f"Unknown native preview window role: {role!r}")
+        with self._pipeline_lock:
+            if role == "operator":
+                self._operator_window_handle = int(window_handle)
+                sink = self._operator_preview_sink
+            else:
+                self._program_window_handle = int(window_handle)
+                sink = self._program_preview_sink
+            if sink is None:
+                # Pipeline not built yet (or not native) — handle stored
+                # for later; the binding happens once native preview
+                # branches exist. For native sources the binding is also
+                # performed at the end of `_build_pipeline`.
+                return
+            self._bind_named_video_sink_locked(sink, int(window_handle))
+
+    def _bind_named_video_sink_locked(self, sink: Any, window_handle: int) -> None:
+        """Bind one specific sink to a window handle via GstVideoOverlay."""
+        if sink is None or window_handle is None:
+            return
+        try:
+            sink.set_window_handle(window_handle)
+            return
+        except Exception:
+            pass
+        GstVideo = self._GstVideo
+        if GstVideo is None:
+            return
+        try:
+            GstVideo.VideoOverlay.set_window_handle(sink, window_handle)
+        except Exception:
+            LOGGER.exception("Failed to bind video sink to window handle")
 
     def refresh_active_video_output(self) -> None:
         """Ask the active embedded video sink to redraw into the current window."""
@@ -454,10 +500,21 @@ class PipelineManager:
 
             self._add_branch("preview", self._on_preview_sample)
             self._add_branch("record", self._on_record_sample)
-            self._add_branch("replay", self._on_replay_sample)
+            # self._add_branch("replay", self._on_replay_sample)
             self._build_audio_path_locked()
             self._build_replay_pipeline(width=width, height=height, fps_fraction=fps_fraction)
             self._build_replay_audio_pipeline()
+
+            # If window handles were registered before the pipeline was
+            # built, bind them to the freshly-created native preview sinks.
+            if self._operator_preview_sink is not None and self._operator_window_handle is not None:
+                self._bind_named_video_sink_locked(
+                    self._operator_preview_sink, self._operator_window_handle
+                )
+            if self._program_preview_sink is not None and self._program_window_handle is not None:
+                self._bind_named_video_sink_locked(
+                    self._program_preview_sink, self._program_window_handle
+                )
 
             state_change = pipeline.set_state(Gst.State.PLAYING)
             if state_change == Gst.StateChangeReturn.FAILURE:
@@ -516,6 +573,30 @@ class PipelineManager:
         self._branch_valves[branch_name] = valve
 
     def _add_preview_branch(self, branch_name: str) -> None:
+        # 3.A.3 attempted to use d3d11videosink + per-window handle binding
+        # for native sources. On Windows + PySide6 + gst-plugins-bad the
+        # binding was unreliable: a third "Direct3D11 renderer" top-level
+        # window kept appearing despite preemptive `set_window_handle()`
+        # calls and a `prepare-window-handle` sync-bus-message handler, and
+        # the preview branch's tee fan-out froze within seconds. Reverted
+        # to the python_push appsink path until a successful native-preview
+        # approach is found (see Phase 3 plan in
+        # `docs/r3_app_architecture.md`). The native preview branch
+        # (`_add_native_preview_branch`) and surrounding contracts
+        # (`set_render_mode`, `bind_native_preview_window_handle`,
+        # `set_native_preview_window_handle`, the
+        # `_promote_feed_state_on_arrival` helper, the `pipeline_mode`
+        # diagnostics) remain in place so the next attempt can flip this
+        # dispatch back without redoing the wiring.
+        self._add_python_push_preview_branch(branch_name)
+
+    def _add_python_push_preview_branch(self, branch_name: str) -> None:
+        """Legacy preview branch used by python_push (synthetic) sources.
+
+        Frames flow `tee → queue → valve → videoconvert → appsink`; the
+        appsink emits `new-sample` and `_on_preview_sample` reshapes the
+        buffer into a NumPy `MediaFrame` for QImage rendering.
+        """
         assert self._pipeline is not None
         Gst = self._Gst
         assert Gst is not None
@@ -529,9 +610,7 @@ class PipelineManager:
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
         # async=False prevents this sink from gating the pipeline's
-        # PAUSED→PLAYING transition on preroll. Required when the source
-        # has no audio (the audio chain has no upstream and would otherwise
-        # hold the pipeline in PAUSED forever).
+        # PAUSED→PLAYING transition on preroll.
         sink.set_property("async", False)
         sink.set_property("drop", True)
         sink.set_property("max-buffers", 2)
@@ -559,6 +638,138 @@ class PipelineManager:
         self._branch_valves[branch_name] = valve
         self._preview_sink = sink
         self._preview_sink_factory_name = "appsink-preview"
+
+    def _add_native_preview_branch(self, branch_name: str) -> None:
+        """Native preview branch (slice 3.A.3).
+
+        Frames flow `tee → queue → valve → videoconvert → preview_tee →
+        [operator d3d11videosink, program d3d11videosink]`. There is no
+        appsink on the preview path — frames never enter Python on the hot
+        path. A buffer pad probe on `videoconvert.src` ticks per-feed
+        metrics and synthesizes a `FrameOverlayInfo` so the operator's
+        `PlaybackController` state machine still sees frame-arrival events.
+        """
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", f"{branch_name}_queue")
+        valve = self._make_element("valve", f"{branch_name}_valve")
+        convert = self._make_element("videoconvert", f"{branch_name}_convert")
+        preview_tee = self._make_element("tee", f"{branch_name}_window_tee")
+        operator_sink, operator_factory = self._make_video_sink(
+            f"{branch_name}_operator_sink"
+        )
+        program_sink, program_factory = self._make_video_sink(
+            f"{branch_name}_program_sink"
+        )
+
+        valve.set_property("drop", True)
+        for sink in (operator_sink, program_sink):
+            self._set_property_if_supported(sink, "sync", False)
+            self._set_property_if_supported(sink, "async", False)
+            self._set_property_if_supported(sink, "force-aspect-ratio", True)
+
+        for element in (queue, valve, convert, preview_tee, operator_sink, program_sink):
+            self._pipeline.add(element)
+
+        if not (queue.link(valve) and valve.link(convert) and convert.link(preview_tee)):
+            raise RuntimeError(f"Failed to link the {branch_name} branch head.")
+
+        # Each window's sink consumes its own request-pad off the per-branch tee.
+        for sink, label in (
+            (operator_sink, "operator"),
+            (program_sink, "program"),
+        ):
+            sink_queue = self._make_element("queue", f"{branch_name}_{label}_queue")
+            self._pipeline.add(sink_queue)
+            if not sink_queue.link(sink):
+                raise RuntimeError(
+                    f"Failed to link the {label} preview queue to its video sink."
+                )
+            tee_pad = preview_tee.request_pad_simple("src_%u")
+            if tee_pad is None:
+                tee_pad = preview_tee.get_request_pad("src_%u")
+            sink_queue_sink_pad = sink_queue.get_static_pad("sink")
+            if (
+                tee_pad is None
+                or sink_queue_sink_pad is None
+                or tee_pad.link(sink_queue_sink_pad) != Gst.PadLinkReturn.OK
+            ):
+                raise RuntimeError(
+                    f"Failed to fan {label} preview branch off the per-branch tee."
+                )
+            sink_queue.sync_state_with_parent()
+            sink.sync_state_with_parent()
+
+        # Link the source tee → branch head.
+        source_tee_pad = self._request_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if source_tee_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(
+                f"Failed to link source tee output to the {branch_name} branch."
+            )
+
+        queue.sync_state_with_parent()
+        valve.sync_state_with_parent()
+        convert.sync_state_with_parent()
+        preview_tee.sync_state_with_parent()
+
+        # Buffer probe for metrics + state tracking. Runs on the streaming
+        # thread but does no pixel-data work — just a pts read and metric
+        # tick — so it doesn't block the GIL.
+        convert_src_pad = convert.get_static_pad("src")
+        if convert_src_pad is not None:
+            convert_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._on_native_preview_buffer_probe,
+                None,
+            )
+
+        self._branch_valves[branch_name] = valve
+        # `_preview_sink` is the operator-window sink — that's the one the
+        # legacy `_video_window_handle` setter binds to, mirroring the
+        # replay-sink convention.
+        self._preview_sink = operator_sink
+        self._preview_sink_factory_name = operator_factory
+        self._operator_preview_sink = operator_sink
+        self._program_preview_sink = program_sink
+
+    def _on_native_preview_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
+        """Buffer probe for native preview: ticks metrics + frame-overlay state.
+
+        Runs on the GStreamer streaming thread for every buffer that crosses
+        videoconvert.src. Deliberately does NO pixel-data work — pulls only
+        the buffer's PTS and feeds the existing `_live_sample_callback` so
+        the operator's `PlaybackController` keeps its state machine in sync.
+        """
+        Gst = self._Gst
+        if Gst is None:
+            return Gst.PadProbeReturn.OK if Gst is not None else 0
+        if self._feed_metrics is not None:
+            self._feed_metrics.tick_source()
+            if self._preview_running:
+                self._feed_metrics.tick_preview()
+        if self._preview_running and self._live_sample_callback is not None:
+            buffer = info.get_buffer()
+            pts_seconds: float | None = None
+            frame_id: int | None = None
+            if buffer is not None:
+                if buffer.pts != Gst.CLOCK_TIME_NONE:
+                    pts_seconds = float(buffer.pts) / float(Gst.SECOND)
+                if buffer.offset != Gst.BUFFER_OFFSET_NONE:
+                    frame_id = int(buffer.offset)
+            overlay = FrameOverlayInfo(
+                feed_id=self._source.get_feed_id(),
+                source_name=self._source.get_display_name(),
+                frame_id=frame_id,
+                capture_timestamp=pts_seconds if pts_seconds is not None else time.time(),
+            )
+            try:
+                self._live_sample_callback(overlay)
+            except Exception:
+                LOGGER.exception("native preview live_sample_callback raised")
+        return Gst.PadProbeReturn.OK
 
     def _build_audio_path_locked(self) -> None:
         assert self._pipeline is not None
@@ -1064,6 +1275,31 @@ class PipelineManager:
         structure = message.get_structure()
         if structure is None or structure.get_name() != "prepare-window-handle":
             return
+        # Native preview (slice 3.A.3): bind whichever per-window sink is
+        # asking for a window handle, matched against the stored per-role
+        # handles. This is the canonical GstVideoOverlay protocol — without
+        # it d3d11videosink creates its own top-level window.
+        if (
+            self._operator_preview_sink is not None
+            and message.src == self._operator_preview_sink
+            and self._operator_window_handle is not None
+        ):
+            with self._pipeline_lock:
+                self._bind_named_video_sink_locked(
+                    self._operator_preview_sink, self._operator_window_handle
+                )
+            return
+        if (
+            self._program_preview_sink is not None
+            and message.src == self._program_preview_sink
+            and self._program_window_handle is not None
+        ):
+            with self._pipeline_lock:
+                self._bind_named_video_sink_locked(
+                    self._program_preview_sink, self._program_window_handle
+                )
+            return
+        # Legacy / replay paths.
         if message.src == self._preview_sink and self._active_video_output == "live":
             with self._pipeline_lock:
                 self._bind_video_sink_locked(message.src)
