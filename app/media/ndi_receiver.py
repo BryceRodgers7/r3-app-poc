@@ -53,6 +53,8 @@ class NDIReceiver(SourceInterface):
         self._native_source: Any | None = None
         self._native_demux: Any | None = None
         self._native_video_convert: Any | None = None
+        self._native_video_scale: Any | None = None
+        self._native_video_rate: Any | None = None
         self._native_video_caps: Any | None = None
         self._native_audio_convert: Any | None = None
 
@@ -180,6 +182,17 @@ class NDIReceiver(SourceInterface):
             video_convert = Gst.ElementFactory.make(
                 "videoconvert", f"ndivconvert_{self._feed_id}"
             )
+            # videoscale + videorate downscale the source's native rate/size
+            # to the operator-configured target. Without these, NDI Tools
+            # Screen Capture pushes 2560x1440@60 BGR (~660 MB/s) at the
+            # appsink, which drowns the Python signal handler and freezes
+            # the Qt event loop.
+            video_scale = Gst.ElementFactory.make(
+                "videoscale", f"ndivscale_{self._feed_id}"
+            )
+            video_rate = Gst.ElementFactory.make(
+                "videorate", f"ndivrate_{self._feed_id}"
+            )
             video_caps = Gst.ElementFactory.make(
                 "capsfilter", f"ndivcaps_{self._feed_id}"
             )
@@ -191,7 +204,15 @@ class NDIReceiver(SourceInterface):
             LOGGER.warning(self._status_message)
             return None
 
-        elements = [source, demux, video_convert, video_caps, audio_convert]
+        elements = [
+            source,
+            demux,
+            video_convert,
+            video_scale,
+            video_rate,
+            video_caps,
+            audio_convert,
+        ]
         if any(element is None for element in elements):
             self._status_message = "NDI chain: at least one GStreamer element is missing."
             LOGGER.warning(self._status_message)
@@ -204,8 +225,14 @@ class NDIReceiver(SourceInterface):
             LOGGER.warning(self._status_message)
             return None
 
+        fps_fraction = Fraction(str(self._target_fps)).limit_denominator(1000)
         video_caps.set_property(
-            "caps", Gst.Caps.from_string("video/x-raw,format=BGR")
+            "caps",
+            Gst.Caps.from_string(
+                "video/x-raw,format=BGR,"
+                f"width={self._frame_width},height={self._frame_height},"
+                f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
+            ),
         )
 
         # Static-side links (ndisrc → demux, videoconvert → capsfilter). The
@@ -231,6 +258,8 @@ class NDIReceiver(SourceInterface):
         self._native_source = source
         self._native_demux = demux
         self._native_video_convert = video_convert
+        self._native_video_scale = video_scale
+        self._native_video_rate = video_rate
         self._native_video_caps = video_caps
         self._native_audio_convert = audio_convert
         return {
@@ -253,8 +282,12 @@ class NDIReceiver(SourceInterface):
         if not self._native_source.link(self._native_demux):
             self._status_message = "Failed to link ndisrc into ndisrcdemux."
             return False
-        if not self._native_video_convert.link(self._native_video_caps):
-            self._status_message = "Failed to link videoconvert into video capsfilter."
+        if not (
+            self._native_video_convert.link(self._native_video_scale)
+            and self._native_video_scale.link(self._native_video_rate)
+            and self._native_video_rate.link(self._native_video_caps)
+        ):
+            self._status_message = "Failed to link the NDI video chain."
             return False
         return True
 

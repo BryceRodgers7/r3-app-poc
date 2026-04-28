@@ -43,9 +43,16 @@ class AppSettings:
     default_source_name: str = "Test Source"
     default_source_kind: str = "synthetic"
     ndi_source_name: str | None = None
-    target_frame_width: int = 640
-    target_frame_height: int = 360
-    target_fps: float = 15.0
+    # Defaults chosen to keep the Python frame-callback path manageable.
+    # 1280x720x3 = ~2.7 MB/frame; at 30 fps that's ~81 MB/s through the
+    # GIL — comfortable for modern hardware. End-to-end 1080p requires
+    # bypassing Python on both the preview path (slice 3.A.3, native
+    # video sink) and the recording path (Phase 4, segmented native
+    # muxers). Until both land, raising these defaults will freeze the
+    # operator UI under load.
+    target_frame_width: int = 1280
+    target_frame_height: int = 720
+    target_fps: float = 30.0
     replay_buffer_jpeg_quality: int = 80
     recording_filename: str = "session_recording.mp4"
     recording_manifest_filename: str = "recording_manifest.json"

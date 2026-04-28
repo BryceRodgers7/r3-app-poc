@@ -1862,6 +1862,8 @@ Notes:
 
 ## Phase 3 – Native GStreamer Data Path for One Feed
 
+**Status: 🟡 In progress.** 3.A.1 and 3.A.2 are complete; 3.A.3, 3.B, and 3.C remain.
+
 Goal:
 
 - Prove the production data path on one feed.
@@ -1895,14 +1897,30 @@ Exit criteria:
 
 Phase 3 is the first phase that touches real media flow. The current pipeline pushes Python-side `MediaFrame` (NumPy BGR) into GStreamer via `appsrc`; Phase 3's job is to replace that hot path with a native GStreamer source on the production feed kind (NDI) while preserving the synthetic dev fallback. Phase 2.5 narrowed the source surface to NDI + synthetic, so 3.A's "one feed" target is unambiguous: NDI.
 
-**3.A — Native source contract + NDI converted**
+A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python on ingest* is necessary but not sufficient for end-to-end full-resolution operation. The current operator preview also pulls frames *into Python* via `_on_preview_sample` to render via `QImage`. At 1080p@30 that's ~180 MB/s through the GIL, which freezes the Qt event loop. Slice 3.A is therefore split into three sub-slices: ingest contract (3.A.1), native NDI ingest (3.A.2), and **native preview video sink** (3.A.3). All three are needed before the Python display ceiling lifts; the operator-configurable `target_frame_*` defaults in `app/config/settings.py` will stay at a Python-tractable size (720p@30) until 3.A.3 lands.
 
-- Extend `SourceInterface` with a `pipeline_mode` declaration: `python_push` (current) or `native`. Native sources expose a builder method that returns a configured `Gst.Bin` ready to be linked into the per-feed `tee`, instead of `read_frame()`-based Python push.
-- `PipelineManager` learns to build the per-feed graph in either mode. The `tee` + branch structure is the same; only the head changes.
-- Convert NDI ingest (`ndi_receiver.py`) to a true native bin using `ndisrc` from `gst-plugins-rs` (already installed in current NDI deployments per `docs/NDI_SETUP.md`). Configure with the existing `ndi_name` and add `videoconvert` + `videoscale` + `capsfilter` to normalize to the operator-configured `target_frame_*` / `target_fps`. The synthetic test source (`test_source.py`) keeps `pipeline_mode=python_push` — it is the dev fallback by design.
-- Add `pipeline_mode` to `FeedMetricsSnapshot` and surface it in the diagnostics widget so the operator can see at a glance whether each feed is on the native or transitional path.
-- Add a `python_frames_per_sec` counter on `FeedMetrics` for sources still pushing through Python; native feeds report `0.0`.
-- Tests: native-bin construction unit-testable without an NDI source (use `videotestsrc` as a stand-in for the bin's downstream side); pipeline-mode declaration round-trips through the source factory; diagnostics widget renders the new field.
+**3.A.1 — Pipeline-mode contract + diagnostics** *(✅ Complete)*
+
+- Extended `SourceInterface` with a `PipelineMode` declaration (`PYTHON_PUSH` / `NATIVE`).
+- `FeedMetricsSnapshot` exposes `pipeline_mode` and `python_frames_per_sec`; the diagnostics widget surfaces both, so the operator can see at a glance which feeds round-trip through Python.
+- The synthetic test source declares `PYTHON_PUSH` (it is the dev fallback by design and never goes to production).
+
+**3.A.2 — Native NDI ingest** *(✅ Complete)*
+
+- NDI ingest (`ndi_receiver.py`) is now a native GStreamer element chain: `ndisrc → ndisrcdemux → videoconvert → videoscale → videorate → capsfilter (BGR target_w × target_h @ target_fps)` with a separate `audioconvert` audio src pad.
+- `PipelineManager` consumes the chain via `source.build_native_chain(Gst)` + `source.link_native_chain_static()`, adds the elements directly to the parent pipeline (no `Gst.Bin` / ghost-pad encapsulation — that path was tried first and broke buffer flow on Windows + gst-plugins-rs despite working caps events), and links the returned video src pad to the source tee.
+- `async=False` is set on every appsink (preview / record / replay / audio_*) and the `wasapisink` so a missing audio stream (e.g. NDI Tools Screen Capture) doesn't keep the pipeline stuck in `PAUSED` waiting for preroll on the dangling audio chain.
+- `_feed_appsrc_loop` is skipped for native sources (no Python frame round-trip on ingest).
+
+**Limitation discovered, deferred to 3.A.3:** the **preview** path still pulls every frame into Python via the appsink+`new-sample` signal handler for QImage rendering. At full source resolution and rate (e.g. 2560×1440@60 from a desktop NDI sender) that drowns the GIL and freezes the Qt event loop. Mitigated for now by capping the source-side `videoscale`/`videorate` chain at the operator-configured `target_frame_*` defaults (720p@30); production-grade 1080p@30 needs 3.A.3.
+
+**3.A.3 — Native preview video sink**
+
+- Replace the operator-window preview path's `appsink → numpy → QImage` round-trip with a native GStreamer video sink that renders directly into the operator window's native window handle. The infrastructure already exists for the replay path (`d3d11videosink` on Windows, with `_video_window_handle` and `_bind_video_sink_locked` machinery in `pipeline_manager.py`); 3.A.3 extends the same pattern to the live preview branch.
+- The preview branch becomes: `tee → queue (leaky-downstream) → videoconvert → d3d11videosink` (or platform equivalent), no appsink in the preview path. The recording and replay branches keep their appsinks (Python is still the writer until Phase 4 / native-muxed segmented recording lands — separate ceiling).
+- `FrameOverlayInfo` continues to flow to the operator's `PlaybackController` so UI overlays still update; the *pixel-burned* overlay disappears for native preview (acceptable — UI overlays are the operator-visible ones).
+- Once 3.A.3 lands, the `target_frame_*` defaults can be raised to 1920×1080@30. The end-to-end Python ceiling for 1080p will then be limited to the recording path, which Phase 4's segmented native muxers fix.
+- Tests: preview branch element shape (no appsink, native sink present); window-handle binding round-trips through the controller; the `FrameOverlayInfo` callback path still fires from non-appsink sources.
 
 **3.B — Explicit per-branch queue policies + queue-depth metrics**
 
@@ -1916,7 +1934,7 @@ Phase 3 is the first phase that touches real media flow. The current pipeline pu
 
 - Add a startup log line and a diagnostics-widget banner per feed: `pipeline=native` (clean) or `pipeline=python_push (transitional)`. The banner surfaces the §17.3 guardrail visibly so refactor work doesn't accidentally regress feeds back to Python push.
 - Smoke-test exit criteria: a manual checklist embedded in the diagnostics widget when `mode = "production"` (from §13 config) and any feed reports `python_push`. This is just a visible warning; nothing is enforced beyond a log line.
-- Document the Phase 3 verdict in `ARCHITECTURE.md`: which feeds are native, which still aren't, and what's blocking the rest.
+- Document the Phase 3 verdict in `ARCHITECTURE.md`: which feeds are native, which still aren't, and what's blocking the rest. Confirm 3.A.3 has lifted the preview-path Python ceiling and that `target_frame_*` defaults can be raised to 1080p without freezing the operator UI.
 - Tests: banner rendering for each pipeline mode; warning emitted only in production mode.
 
 ### Out of scope for Phase 3

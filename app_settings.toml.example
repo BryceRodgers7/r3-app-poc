@@ -6,9 +6,12 @@ app_name = "Sports Replay POC"
 operator_window_title = "Sports Replay Operator"
 program_window_title = "Sports Replay Program"
 base_data_dir = "C:\\SportsReplay"
-target_frame_width = 640
-target_frame_height = 360
-target_fps = 15.0
+# Dev defaults at 720p@30. End-to-end 1080p needs slice 3.A.3 (native
+# preview sink) + Phase 4 (native segmented recording) to land first;
+# without those, raising these freezes the operator UI under load.
+target_frame_width = 1280
+target_frame_height = 720
+target_fps = 30.0
 replay_buffer_seconds = 120
 # recording_filename = "session_recording.mp4"
 # short_segments_subdir = "segments"
