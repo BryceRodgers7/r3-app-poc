@@ -18,7 +18,8 @@
       "Bash(python -m pytest tests/ --tb=short)",
       "Bash(python -m pytest tests/test_playback_controller.py -v --tb=short)",
       "Bash(python -m pytest tests/test_segment_decoder.py -v --tb=short)",
-      "Bash(python -m pytest tests/test_session_recovery.py -v --tb=short)"
+      "Bash(python -m pytest tests/test_session_recovery.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_queue_saturation.py -v --tb=short)"
     ]
   }
 }

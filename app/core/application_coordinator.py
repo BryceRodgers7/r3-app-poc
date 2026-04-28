@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from app.config.settings import AppSettings
+
+LOGGER = logging.getLogger(__name__)
 from app.core.application_state import AppState, compute_app_state
 from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
@@ -21,10 +25,6 @@ from app.media.preview_output import PreviewOutput
 from app.media.recording_manager import RecordingManager
 from app.media.source_factory import build_source_for_feed
 from app.storage.session_manager import SessionManager
-from app.storage.session_recovery import (
-    mark_dirty_sessions,
-    validate_session_segments,
-)
 
 
 class ApplicationCoordinator:
@@ -177,16 +177,16 @@ class ApplicationCoordinator:
         )
 
     def initialize(self) -> None:
-        """Start storage, ingest, and playback sessions."""
+        """Start storage, ingest, and playback sessions.
+
+        Crash-recovery scan + §11.4 dirty-session prompt run *before*
+        this method (in the application bootstrap) so the operator can
+        resolve each dirty session before a new one is created. By the
+        time `initialize` runs, all manifests on disk are in
+        `finalized` / `created` / `archived` states.
+        """
         if self._session_started:
             return
-        # Slice 4.E: scan prior sessions for crash-recovery before
-        # creating the new one. Marks unfinished sessions DIRTY (§10.6)
-        # and validates/quarantines their segment files (§6.5). Runs
-        # synchronously; the cost is bounded by the number of prior
-        # sessions on disk and is dominated by `cv2.VideoCapture` open
-        # latency.
-        self._run_startup_recovery()
         session_paths = self._session_manager.start_new_session(self.feed_registry.build_session_label())
         default_health_log().open(
             session_paths.root_dir / "logs" / "health_events.jsonl",
@@ -199,21 +199,6 @@ class ApplicationCoordinator:
         self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
-
-    def _run_startup_recovery(self) -> None:
-        """Mark dirty sessions and validate their segments before starting up."""
-        sessions_root = self._settings.sessions_root
-        report = mark_dirty_sessions(sessions_root)
-        if report.dirty_sessions_marked:
-            # Validate segments for each newly-marked dirty session so
-            # corrupt files end up in quarantine before the new session
-            # adopts the disk.
-            from app.storage.file_manager import FileManager
-            file_manager = FileManager(self._settings)
-            db = self._session_manager.get_metadata_db()
-            for session_id in report.dirty_sessions_marked:
-                session_paths = file_manager.session_paths_for_existing(session_id)
-                validate_session_segments(session_paths, db)
 
     def shutdown(self) -> None:
         """Stop playback sessions and feed runtimes."""
@@ -241,6 +226,10 @@ def build_default_application_coordinator(
     segment_index = SegmentIndex()
     feed_runtimes: dict[str, FeedRuntime] = {}
 
+    # Slice 3.B: tell the telemetry hub how to drive saturation-based
+    # transitions before any feed registers a sampler.
+    telemetry_hub.register_recording_state(recording_manager.recording_state)
+
     for feed in feed_registry.get_enabled_feeds():
         source = build_source_for_feed(settings, feed)
         preview_output = PreviewOutput()
@@ -260,6 +249,31 @@ def build_default_application_coordinator(
         feed_state = make_feed_state_machine(feed.feed_id, feed.display_name)
         pipeline_manager.set_feed_state(feed_state)
         telemetry_hub.register_feed_state(feed.feed_id, feed_state)
+        # Slice 3.B: hub samples queue depths from this pipeline once
+        # per log tick; the bound-method captures the pipeline_manager.
+        telemetry_hub.register_queue_depth_sampler(
+            feed.feed_id, pipeline_manager.sample_queue_depths
+        )
+        # Slice 3.C: visible startup log line per feed. Production-mode
+        # warning is emitted by the diagnostics widget once the UI is
+        # up; the log line below is enough to make the transitional
+        # state visible from a tail of stdout/log file too.
+        mode = source.pipeline_mode.value
+        suffix = " (transitional)" if mode == "python_push" else " (clean)"
+        LOGGER.info(
+            "feed=%s pipeline=%s%s app_mode=%s",
+            feed.feed_id,
+            mode,
+            suffix,
+            settings.app_mode,
+        )
+        if settings.app_mode == "production" and mode == "python_push":
+            LOGGER.warning(
+                "feed=%s is using the transitional python_push pipeline "
+                "while app_mode=production; preview path is GIL-bound. "
+                "See Phase 3.A.3 in docs/r3_app_architecture.md.",
+                feed.feed_id,
+            )
         # Slice 4.B: each PipelineManager writes finalized segment rows
         # into the shared SQLite + in-memory index when its splitmuxsink
         # rotates files (or recording stops).

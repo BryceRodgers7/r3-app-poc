@@ -17,9 +17,14 @@ from app.core.models import (
 from app.core.session_state import SESSION_MANIFEST_FILENAME
 from app.storage.metadata_db import MetadataDb
 from app.storage.session_recovery import (
+    DirtySessionInfo,
+    RecoveryAction,
     SegmentValidationResult,
+    find_dirty_sessions,
     load_segment_index_for_session,
     mark_dirty_sessions,
+    resolve_dirty_session,
+    run_startup_scan,
     validate_session_segments,
 )
 
@@ -352,6 +357,158 @@ class LoadSegmentIndexForSessionTests(unittest.TestCase):
     def test_empty_session_returns_empty_index(self) -> None:
         index = load_segment_index_for_session(self.db, "session_001")
         self.assertEqual(index.feed_ids(), [])
+
+
+class FindDirtySessionsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.sessions_root = Path(self._temp_dir.name)
+
+    def tearDown(self) -> None:
+        self._temp_dir.cleanup()
+
+    def test_returns_only_dirty_sessions(self) -> None:
+        _write_manifest(
+            self.sessions_root / "session_001",
+            session_id="session_001",
+            state="dirty",
+            finalized_at=None,
+        )
+        _write_manifest(
+            self.sessions_root / "session_002",
+            session_id="session_002",
+            state="finalized",
+            finalized_at="2026-04-28T02:00:00+00:00",
+        )
+        _write_manifest(
+            self.sessions_root / "session_003",
+            session_id="session_003",
+            state="dirty",
+            finalized_at=None,
+        )
+        result = find_dirty_sessions(self.sessions_root)
+        self.assertEqual([info.session_id for info in result], ["session_001", "session_003"])
+        self.assertEqual(result[0].session_dir, self.sessions_root / "session_001")
+        self.assertEqual(result[0].state, "dirty")
+
+    def test_returns_empty_when_no_sessions(self) -> None:
+        self.assertEqual(find_dirty_sessions(self.sessions_root), [])
+
+    def test_returns_empty_when_root_does_not_exist(self) -> None:
+        self.assertEqual(find_dirty_sessions(self.sessions_root / "nope"), [])
+
+    def test_invalid_manifest_json_is_skipped(self) -> None:
+        session_dir = self.sessions_root / "session_004"
+        session_dir.mkdir()
+        (session_dir / "session.json").write_text("{not json", encoding="utf-8")
+        # Doesn't raise; just doesn't include the broken session.
+        self.assertEqual(find_dirty_sessions(self.sessions_root), [])
+
+
+class ResolveDirtySessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.sessions_root = Path(self._temp_dir.name)
+        _write_manifest(
+            self.sessions_root / "session_001",
+            session_id="session_001",
+            state="dirty",
+            finalized_at=None,
+        )
+
+    def tearDown(self) -> None:
+        self._temp_dir.cleanup()
+
+    def test_finalize_writes_finalized_state_and_stamps_timestamp(self) -> None:
+        resolve_dirty_session(self.sessions_root, "session_001", RecoveryAction.FINALIZE)
+        manifest = _read_manifest(self.sessions_root / "session_001")
+        self.assertEqual(manifest["state"], "finalized")
+        self.assertIsNotNone(manifest["finalized_at"])
+
+    def test_discard_writes_created_state_and_clears_timestamp(self) -> None:
+        resolve_dirty_session(self.sessions_root, "session_001", RecoveryAction.DISCARD)
+        manifest = _read_manifest(self.sessions_root / "session_001")
+        self.assertEqual(manifest["state"], "created")
+        self.assertIsNone(manifest["finalized_at"])
+
+    def test_resume_raises_not_implemented(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            resolve_dirty_session(
+                self.sessions_root, "session_001", RecoveryAction.RESUME
+            )
+
+    def test_missing_manifest_raises_file_not_found(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            resolve_dirty_session(
+                self.sessions_root, "session_999", RecoveryAction.FINALIZE
+            )
+
+
+class RunStartupScanTests(unittest.TestCase):
+    """End-to-end check that mark + validate run together correctly."""
+
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+        self.sessions_root = self.tmp / "sessions"
+        self.sessions_root.mkdir()
+        self.db = MetadataDb(self.tmp / "metadata.db")
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self._temp_dir.cleanup()
+
+    def test_marks_dirty_then_validates_segments(self) -> None:
+        # Seed a session that crashed mid-recording: state=recording,
+        # finalized_at=null, with one valid in-progress segment file.
+        session_dir = self.sessions_root / "session_001"
+        session_dir.mkdir()
+        _write_manifest(
+            session_dir,
+            session_id="session_001",
+            state="recording",
+            finalized_at=None,
+        )
+        feed_dir = session_dir / "recording" / "ndi_main"
+        feed_dir.mkdir(parents=True)
+        (feed_dir / "segment_00000.mkv").write_bytes(b"\0")
+        self.db.create_session(
+            session_id="session_001",
+            source_name="Test",
+            started_at="2026-04-28T00:00:00+00:00",
+        )
+        report = run_startup_scan(self.sessions_root, self.db)
+        # Session was marked dirty.
+        self.assertEqual(report.dirty_sessions_marked, ["session_001"])
+        manifest = _read_manifest(session_dir)
+        self.assertEqual(manifest["state"], "dirty")
+        # The segment validator (default cv2) probably rejects the
+        # zero-byte stub file → quarantined. Check the file moved.
+        original = feed_dir / "segment_00000.mkv"
+        quarantine = session_dir / "quarantine" / "ndi_main"
+        # Either the file is in quarantine OR (if cv2 reports valid for
+        # zero-byte) we have a dirty DB row. Both are fine; what matters
+        # is the original location is no longer authoritative.
+        if original.exists():
+            recovered = self.db.get_segment_by_path(str(original))
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered.state, SEGMENT_STATE_DIRTY)
+        else:
+            self.assertTrue((quarantine / "segment_00000.mkv").exists())
+
+    def test_no_dirty_sessions_returns_empty_report(self) -> None:
+        # Pre-existing finalized session — scan finds nothing to do.
+        session_dir = self.sessions_root / "session_001"
+        session_dir.mkdir()
+        _write_manifest(
+            session_dir,
+            session_id="session_001",
+            state="finalized",
+            finalized_at="2026-04-28T02:00:00+00:00",
+        )
+        report = run_startup_scan(self.sessions_root, self.db)
+        self.assertEqual(report.dirty_sessions_marked, [])
 
 
 if __name__ == "__main__":

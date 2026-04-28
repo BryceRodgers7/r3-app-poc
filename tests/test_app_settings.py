@@ -19,6 +19,34 @@ class AppSettingsTests(unittest.TestCase):
         self.assertEqual(settings.default_source_kind, "synthetic")
         self.assertIsNone(settings.ndi_source_name)
         self.assertEqual(settings.default_feed_id, "feed_main")
+        # Slice 3.C default — production warnings are off until opted in.
+        self.assertEqual(settings.app_mode, "development")
+
+    def test_load_accepts_production_app_mode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[app]
+app_mode = "production"
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.app_mode, "production")
+
+    def test_load_rejects_unknown_app_mode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[app]
+app_mode = "staging"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                AppSettings.load(config_path)
 
     def test_load_reads_source_configuration_from_toml(self) -> None:
         with TemporaryDirectory() as temp_dir:

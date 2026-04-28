@@ -89,6 +89,13 @@ class PipelineManager:
         self._audio_tee_request_pads: list[Any] = []
         self._branch_valves: dict[str, Any] = {}
         self._audio_branch_valves: dict[str, Any] = {}
+        # Slice 3.B: queue elements stored per-branch so the telemetry
+        # hub can sample `current-level-buffers` periodically. Keys
+        # match the branch names ("preview", "record").
+        self._branch_queues: dict[str, Any] = {}
+        # Configured caps per branch — populated alongside the queue
+        # element so saturation calc has both the level and the limit.
+        self._branch_queue_caps: dict[str, dict[str, int]] = {}
         self._preview_sink: Any | None = None
         self._preview_sink_factory_name: str | None = None
         self._operator_preview_sink: Any | None = None
@@ -486,6 +493,82 @@ class PipelineManager:
             if state_change == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("Failed to move the GStreamer pipeline to PLAYING.")
 
+    def _configure_preview_queue(self, queue: Any, branch_name: str) -> None:
+        """Apply the §4.3 preview queue policy.
+
+        Leaky-downstream so a slow preview drops frames rather than
+        pushing back on the source tee, time-bounded at 200ms, with a
+        small buffer-count cap as a secondary guard.
+        """
+        # `leaky=2` is GST_QUEUE_LEAK_DOWNSTREAM — drop the oldest
+        # buffer when the queue is full, never block upstream.
+        max_size_buffers = 4
+        max_size_time_ns = 200_000_000  # 200 ms
+        try:
+            queue.set_property("leaky", 2)
+            queue.set_property("max-size-buffers", max_size_buffers)
+            queue.set_property("max-size-time", max_size_time_ns)
+            queue.set_property("max-size-bytes", 0)
+        except Exception:
+            LOGGER.exception("Failed to configure preview queue policy")
+        self._branch_queues[branch_name] = queue
+        self._branch_queue_caps[branch_name] = {
+            "max_size_buffers": max_size_buffers,
+            "max_size_time_ns": max_size_time_ns,
+        }
+
+    def _configure_record_queue(self, queue: Any, branch_name: str) -> None:
+        """Apply the §4.4 record queue policy.
+
+        Non-leaky: pressure on the recording branch must surface as a
+        `RECORDING_ERROR` health event rather than silently dropping
+        buffers. Time-bounded at one segment's worth of frames so a
+        wedged disk eventually stops the pipeline rather than ballooning
+        memory unbounded.
+        """
+        Gst = self._Gst
+        assert Gst is not None
+        max_size_buffers = 256
+        max_size_time_ns = int(self._recording_segment_duration_seconds * Gst.SECOND)
+        try:
+            queue.set_property("leaky", 0)  # GST_QUEUE_LEAK_NO
+            queue.set_property("max-size-buffers", max_size_buffers)
+            queue.set_property("max-size-time", max_size_time_ns)
+            queue.set_property("max-size-bytes", 0)
+        except Exception:
+            LOGGER.exception("Failed to configure record queue policy")
+        self._branch_queues[branch_name] = queue
+        self._branch_queue_caps[branch_name] = {
+            "max_size_buffers": max_size_buffers,
+            "max_size_time_ns": max_size_time_ns,
+        }
+
+    def sample_queue_depths(self) -> dict[str, dict[str, int]]:
+        """Read `current-level-*` from each tracked branch queue.
+
+        Returns a mapping from branch name to a dict with `buffers`,
+        `time_ns`, and the configured max for each. Used by the
+        telemetry hub's periodic sampler. Errors are swallowed and
+        return zero — a flaky element shouldn't break the diagnostics
+        widget.
+        """
+        out: dict[str, dict[str, int]] = {}
+        for name, queue in self._branch_queues.items():
+            try:
+                buffers = int(queue.get_property("current-level-buffers") or 0)
+                time_ns = int(queue.get_property("current-level-time") or 0)
+            except Exception:
+                buffers = 0
+                time_ns = 0
+            caps = self._branch_queue_caps.get(name, {})
+            out[name] = {
+                "buffers": buffers,
+                "time_ns": time_ns,
+                "max_buffers": int(caps.get("max_size_buffers", 0)),
+                "max_time_ns": int(caps.get("max_size_time_ns", 0)),
+            }
+        return out
+
     def _add_branch(self, branch_name: str) -> None:
         if branch_name == "preview":
             self._add_preview_branch(branch_name)
@@ -519,6 +602,13 @@ class PipelineManager:
         Frames flow `tee → queue → valve → videoconvert → appsink`; the
         appsink emits `new-sample` and `_on_preview_sample` reshapes the
         buffer into a NumPy `MediaFrame` for QImage rendering.
+
+        Slice 3.B: explicit §4.3 queue policy — leaky downstream so a
+        slow preview consumer drops frames rather than back-pressuring
+        the source tee, and time-bounded at 200 ms so the preview never
+        falls more than that behind live. The policy is codified here
+        rather than left as queue defaults so 3.A.3 / NDI hardware
+        retries can't accidentally regress it.
         """
         assert self._pipeline is not None
         Gst = self._Gst
@@ -529,6 +619,7 @@ class PipelineManager:
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
         sink = self._make_element("appsink", f"{branch_name}_sink")
 
+        self._configure_preview_queue(queue, branch_name)
         valve.set_property("drop", True)
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
@@ -722,6 +813,7 @@ class PipelineManager:
         queue = self._make_element("queue", f"{branch_name}_queue")
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
+        self._configure_record_queue(queue, branch_name)
         # Force the input to jpegenc to be BT.601 I420. JPEG has no
         # standardized colorimetry tag; players decode assuming BT.601.
         # If we let the BT.709 source flow straight to jpegenc, players

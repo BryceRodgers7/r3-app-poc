@@ -84,7 +84,14 @@ class RateCounter:
 
 @dataclass(frozen=True, slots=True)
 class FeedMetricsSnapshot:
-    """Read-only view of one feed's counters at a moment in time."""
+    """Read-only view of one feed's counters at a moment in time.
+
+    Slice 3.B added queue-depth gauges (`queue_depth_*` plus their
+    configured `queue_max_*` caps). Both values come from the feed's
+    `PipelineManager` via `TelemetryHub.register_queue_depth_sampler`;
+    feeds that never register a sampler keep their values at zero so
+    older callers don't have to special-case.
+    """
 
     feed_id: str
     display_name: str
@@ -94,6 +101,10 @@ class FeedMetricsSnapshot:
     dropped_per_sec: float = 0.0
     python_frames_per_sec: float = 0.0
     pipeline_mode: str = "python_push"
+    queue_depth_preview: int = 0
+    queue_depth_recording: int = 0
+    queue_max_preview: int = 0
+    queue_max_recording: int = 0
 
 
 class FeedMetrics:
@@ -119,6 +130,10 @@ class FeedMetrics:
         "_recording",
         "_dropped",
         "_python_frames",
+        "_queue_depth_preview",
+        "_queue_depth_recording",
+        "_queue_max_preview",
+        "_queue_max_recording",
     )
 
     def __init__(
@@ -138,6 +153,10 @@ class FeedMetrics:
         self._recording = RateCounter(window_seconds, clock=clock)
         self._dropped = RateCounter(window_seconds, clock=clock)
         self._python_frames = RateCounter(window_seconds, clock=clock)
+        self._queue_depth_preview = 0
+        self._queue_depth_recording = 0
+        self._queue_max_preview = 0
+        self._queue_max_recording = 0
 
     def tick_source(self) -> None:
         self._source.tick()
@@ -157,6 +176,26 @@ class FeedMetrics:
     def set_pipeline_mode(self, mode: str) -> None:
         self.pipeline_mode = mode
 
+    def set_queue_depths(
+        self,
+        *,
+        preview_buffers: int = 0,
+        recording_buffers: int = 0,
+    ) -> None:
+        """Update current queue-depth gauges (slice 3.B sampler)."""
+        self._queue_depth_preview = max(0, int(preview_buffers))
+        self._queue_depth_recording = max(0, int(recording_buffers))
+
+    def set_queue_capacity(
+        self,
+        *,
+        preview_max_buffers: int = 0,
+        recording_max_buffers: int = 0,
+    ) -> None:
+        """Update the configured max queue depth (slice 3.B sampler)."""
+        self._queue_max_preview = max(0, int(preview_max_buffers))
+        self._queue_max_recording = max(0, int(recording_max_buffers))
+
     def snapshot(self) -> FeedMetricsSnapshot:
         return FeedMetricsSnapshot(
             feed_id=self.feed_id,
@@ -167,6 +206,10 @@ class FeedMetrics:
             dropped_per_sec=self._dropped.rate(),
             python_frames_per_sec=self._python_frames.rate(),
             pipeline_mode=self.pipeline_mode,
+            queue_depth_preview=self._queue_depth_preview,
+            queue_depth_recording=self._queue_depth_recording,
+            queue_max_preview=self._queue_max_preview,
+            queue_max_recording=self._queue_max_recording,
         )
 
 
@@ -417,6 +460,16 @@ class TelemetryHub:
         self._health_log = health_log if health_log is not None else default_log()
         self._zero_fps_streak: dict[str, int] = {}
         self._feed_states: dict[str, StateMachine[FeedState]] = {}
+        # Slice 3.B: per-feed callbacks that return current queue depths.
+        # The callback's return shape mirrors `PipelineManager.sample_queue_depths`:
+        # `{branch_name: {"buffers": int, "time_ns": int, "max_buffers": int, "max_time_ns": int}}`.
+        self._queue_depth_samplers: dict[
+            str, Callable[[], dict[str, dict[str, int]]]
+        ] = {}
+        # Streak counters for the §4.4 saturation health rules.
+        self._record_saturated_streak: dict[str, int] = {}
+        self._preview_saturated_streak: dict[str, int] = {}
+        self._recording_state: StateMachine[Any] | None = None
 
     def register(self, feed_id: str, display_name: str) -> FeedMetrics:
         """Create and store a `FeedMetrics` for `feed_id`."""
@@ -443,6 +496,26 @@ class TelemetryHub:
     def feed_state(self, feed_id: str) -> StateMachine[FeedState] | None:
         with self._lock:
             return self._feed_states.get(feed_id)
+
+    def register_queue_depth_sampler(
+        self,
+        feed_id: str,
+        sampler: Callable[[], dict[str, dict[str, int]]],
+    ) -> None:
+        """Register a callback that returns current queue depths for a feed.
+
+        The callback is invoked once per `_log_all_snapshots` tick (1Hz
+        by default). Its return shape mirrors
+        `PipelineManager.sample_queue_depths`. Errors are caught and
+        logged so a flaky pipeline never breaks the diagnostics widget.
+        """
+        with self._lock:
+            self._queue_depth_samplers[feed_id] = sampler
+
+    def register_recording_state(self, state_machine: StateMachine[Any]) -> None:
+        """Attach the global `RecordingState` machine for saturation-driven errors."""
+        with self._lock:
+            self._recording_state = state_machine
 
     def snapshot(self) -> list[FeedMetricsSnapshot]:
         """Snapshot every registered feed in registration order."""
@@ -511,15 +584,25 @@ class TelemetryHub:
 
     def _log_all_snapshots(self) -> None:
         """Emit periodic INFO log lines for feeds and latency samplers."""
+        # Pull queue-depth gauges into FeedMetrics before snapshotting so
+        # both the log line and the saturation evaluator see the same
+        # value within one tick.
+        self._refresh_queue_depths()
         for snap in self.snapshot():
             LOGGER.info(
-                "telemetry feed_id=%s source_fps=%.2f preview_fps=%.2f recording_fps=%.2f",
+                "telemetry feed_id=%s source_fps=%.2f preview_fps=%.2f recording_fps=%.2f "
+                "qprv=%d/%d qrec=%d/%d",
                 snap.feed_id,
                 snap.source_fps,
                 snap.preview_fps,
                 snap.recording_fps,
+                snap.queue_depth_preview,
+                snap.queue_max_preview,
+                snap.queue_depth_recording,
+                snap.queue_max_recording,
             )
             self._evaluate_feed_health(snap)
+            self._evaluate_queue_saturation(snap)
         for lat in latency_snapshots():
             if lat.count == 0:
                 continue
@@ -531,6 +614,107 @@ class TelemetryHub:
                 lat.p95_ms,
                 lat.max_ms,
             )
+
+    def _refresh_queue_depths(self) -> None:
+        """Pull per-feed queue depths from registered samplers into `FeedMetrics`."""
+        with self._lock:
+            samplers = list(self._queue_depth_samplers.items())
+            feeds = dict(self._feeds)
+        for feed_id, sampler in samplers:
+            metrics = feeds.get(feed_id)
+            if metrics is None:
+                continue
+            try:
+                depths = sampler()
+            except Exception:
+                LOGGER.exception(
+                    "queue-depth sampler raised for %s; skipping update", feed_id
+                )
+                continue
+            preview = depths.get("preview", {})
+            record = depths.get("record", {})
+            metrics.set_queue_depths(
+                preview_buffers=int(preview.get("buffers", 0) or 0),
+                recording_buffers=int(record.get("buffers", 0) or 0),
+            )
+            metrics.set_queue_capacity(
+                preview_max_buffers=int(preview.get("max_buffers", 0) or 0),
+                recording_max_buffers=int(record.get("max_buffers", 0) or 0),
+            )
+
+    def _evaluate_queue_saturation(self, snap: FeedMetricsSnapshot) -> None:
+        """Drive recording/feed states from sustained queue saturation (§4.4).
+
+        Two heuristics, both with a two-tick streak guard:
+
+        - Recording branch ≥ 75% of `queue_max_recording` for ≥ 2 ticks
+          → `RecordingState.RECORDING → RECORDING_ERROR` and a
+          `recording_branch_saturated` health event. The state-machine
+          transition only fires when we're currently in `RECORDING` so
+          a transient saturation while starting up doesn't trip the
+          error path.
+        - Preview branch ≥ 75% of `queue_max_preview` for ≥ 2 ticks
+          → `FeedState.LIVE → DEGRADED`. Transient single-tick spikes
+          are common when the operator focuses/unfocuses a window and
+          should not flap the state.
+        """
+        rec_streak = self._record_saturated_streak.get(snap.feed_id, 0)
+        if snap.queue_max_recording > 0 and (
+            snap.queue_depth_recording / max(1, snap.queue_max_recording) >= 0.75
+        ):
+            rec_streak += 1
+        else:
+            rec_streak = 0
+        self._record_saturated_streak[snap.feed_id] = rec_streak
+        if rec_streak == 2:
+            recording_state = self._recording_state
+            if recording_state is not None:
+                # Avoid a cyclic import (recording_state ↔ telemetry) — the
+                # enum value comparison is by string, matching our
+                # `state_machine.transition_to` API which accepts the enum.
+                from app.core.recording_state import RecordingState
+
+                if recording_state.state == RecordingState.RECORDING:
+                    try:
+                        recording_state.transition_to(RecordingState.RECORDING_ERROR)
+                    except Exception:
+                        LOGGER.exception(
+                            "telemetry: failed to drive RECORDING→RECORDING_ERROR"
+                        )
+            if not self._health_log.has_open_event(
+                category="recording_branch_saturated", feed_id=snap.feed_id
+            ):
+                self._health_log.record(
+                    severity=HealthSeverity.ERROR,
+                    category="recording_branch_saturated",
+                    message=(
+                        f"Recording queue saturated on {snap.display_name} "
+                        f"({snap.queue_depth_recording}/{snap.queue_max_recording})."
+                    ),
+                    feed_id=snap.feed_id,
+                )
+        elif rec_streak == 0:
+            self._health_log.clear_open_event(
+                category="recording_branch_saturated", feed_id=snap.feed_id
+            )
+
+        prv_streak = self._preview_saturated_streak.get(snap.feed_id, 0)
+        if snap.queue_max_preview > 0 and (
+            snap.queue_depth_preview / max(1, snap.queue_max_preview) >= 0.75
+        ):
+            prv_streak += 1
+        else:
+            prv_streak = 0
+        self._preview_saturated_streak[snap.feed_id] = prv_streak
+        if prv_streak == 2:
+            feed_state = self.feed_state(snap.feed_id)
+            if feed_state is not None and feed_state.state == FeedState.LIVE:
+                try:
+                    feed_state.transition_to(FeedState.DEGRADED)
+                except Exception:
+                    LOGGER.exception(
+                        "telemetry: failed to drive %s LIVE→DEGRADED", snap.feed_id
+                    )
 
     def _evaluate_feed_health(self, snap: FeedMetricsSnapshot) -> None:
         """Drive the per-feed state machine from observed counters.

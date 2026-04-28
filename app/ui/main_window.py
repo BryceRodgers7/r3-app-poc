@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
                 application_coordinator.telemetry_hub,
                 self,
                 coordinator=application_coordinator,
+                settings=settings,
             )
 
         central_widget = QWidget(self)

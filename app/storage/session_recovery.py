@@ -35,6 +35,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 import json
 import logging
 from pathlib import Path
@@ -76,6 +77,36 @@ class SessionRecoveryReport:
 
     dirty_sessions_marked: list[str] = field(default_factory=list)
     sessions_scanned: int = 0
+
+
+class RecoveryAction(str, Enum):
+    """The three actions the §11.4 recovery prompt offers per dirty session.
+
+    `RESUME` is the production-target action (continue using the same
+    session_id, scan for partial files, transition back to RECORDING).
+    It is **not implemented in this slice** — the operator-facing
+    dialog disables that button and the API raises
+    `NotImplementedError`. `FINALIZE` and `DISCARD` are the two
+    surfaces that fully close the loop on 4.E.
+    """
+
+    RESUME = "resume"
+    FINALIZE = "finalize"
+    DISCARD = "discard"
+
+
+@dataclass(slots=True, frozen=True)
+class DirtySessionInfo:
+    """Metadata about a session left in `dirty` state on disk.
+
+    Used by the §11.4 recovery prompt to decide what to render and what
+    to do when the operator picks an action.
+    """
+
+    session_id: str
+    session_dir: Path
+    created_at: str | None
+    state: str
 
 
 @dataclass(slots=True)
@@ -328,6 +359,135 @@ def _default_segment_validator(file_path: Path) -> SegmentValidationResult:
         )
     finally:
         capture.release()
+
+
+def run_startup_scan(sessions_root: Path, db: MetadataDb) -> SessionRecoveryReport:
+    """Run the full 4.E startup pass: mark + validate dirty sessions.
+
+    Combines `mark_dirty_sessions` (write `state = "dirty"` for any
+    session that didn't shut down cleanly) and `validate_session_segments`
+    (move corrupt files into quarantine, insert `dirty` rows for
+    in-progress files that lost their finalize step). Returns the
+    session-level report; the per-session segment reports are logged
+    rather than returned so callers don't have to thread them through.
+
+    Intended caller is the application bootstrap, which then runs the
+    §11.4 prompt against `find_dirty_sessions(sessions_root)` to let
+    the operator resolve each session before a new one is created.
+    """
+    report = mark_dirty_sessions(sessions_root)
+    for session_id in report.dirty_sessions_marked:
+        session_paths = _session_paths_for_existing(sessions_root, session_id)
+        try:
+            seg_report = validate_session_segments(session_paths, db)
+        except Exception:
+            LOGGER.exception(
+                "recovery: validate_session_segments failed for %s",
+                session_id,
+            )
+            continue
+        if seg_report.files_quarantined or seg_report.files_marked_dirty:
+            LOGGER.info(
+                "recovery: session %s — quarantined=%d, dirty_inserted=%d",
+                session_id,
+                len(seg_report.files_quarantined),
+                len(seg_report.files_marked_dirty),
+            )
+    return report
+
+
+def _session_paths_for_existing(sessions_root: Path, session_id: str) -> SessionPaths:
+    """Build a `SessionPaths` for an already-on-disk session under `sessions_root`."""
+    root_dir = sessions_root / session_id
+    return SessionPaths(
+        session_id=session_id,
+        root_dir=root_dir,
+        recording_dir=root_dir / "recording",
+        rolling_dir=root_dir / "rolling",
+        clips_dir=root_dir / "clips",
+        quarantine_dir=root_dir / "quarantine",
+    )
+
+
+def find_dirty_sessions(sessions_root: Path) -> list[DirtySessionInfo]:
+    """Return every session whose `session.json` reports `state == "dirty"`.
+
+    Used by the §11.4 recovery prompt to decide whether to block the
+    media UI on launch. Sessions are returned in directory-sorted order
+    so the prompt iterates them deterministically.
+    """
+    if not sessions_root.exists():
+        return []
+    out: list[DirtySessionInfo] = []
+    for session_dir in sorted(sessions_root.iterdir()):
+        if not session_dir.is_dir() or not session_dir.name.startswith("session_"):
+            continue
+        manifest_path = session_dir / SESSION_MANIFEST_FILENAME
+        if not manifest_path.exists():
+            continue
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(data.get("state", "")) != "dirty":
+            continue
+        out.append(
+            DirtySessionInfo(
+                session_id=str(data.get("session_id", session_dir.name)),
+                session_dir=session_dir,
+                created_at=data.get("created_at"),
+                state=str(data.get("state", "dirty")),
+            )
+        )
+    return out
+
+
+def resolve_dirty_session(
+    sessions_root: Path,
+    session_id: str,
+    action: RecoveryAction,
+) -> None:
+    """Apply the operator's §11.4 recovery choice to `session.json`.
+
+    `FINALIZE` writes `state = "finalized"` and stamps `finalized_at`
+    with the current UTC time, matching what `SessionManifest` would
+    produce on a clean shutdown. `DISCARD` writes `state = "created"`
+    and clears `finalized_at` — the segment files stay on disk for §6.8
+    retention rules to handle later.
+
+    `RESUME` raises `NotImplementedError` for this slice. Continuing the
+    same `session_id` with new segment numbering needs a
+    `SessionManager.adopt_session(...)` API plus segment-counter
+    seeding, which lives in a follow-up slice. The dialog disables the
+    Resume button so the operator never reaches this branch.
+    """
+    if action is RecoveryAction.RESUME:
+        raise NotImplementedError(
+            "Resume is not yet implemented; choose FINALIZE or DISCARD."
+        )
+    session_dir = sessions_root / session_id
+    manifest_path = session_dir / SESSION_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"No session.json at {manifest_path}")
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read manifest at {manifest_path}: {exc}") from exc
+    if action is RecoveryAction.FINALIZE:
+        data["state"] = "finalized"
+        data["finalized_at"] = datetime.now(timezone.utc).isoformat()
+    elif action is RecoveryAction.DISCARD:
+        data["state"] = "created"
+        data["finalized_at"] = None
+    else:  # pragma: no cover — covered by the RESUME guard above
+        raise ValueError(f"Unhandled action {action!r}")
+    _atomic_write_json(manifest_path, data)
+    LOGGER.info(
+        "recovery: applied %s to session %s (state → %s)",
+        action.value,
+        session_id,
+        data["state"],
+    )
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

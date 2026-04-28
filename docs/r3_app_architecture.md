@@ -1862,7 +1862,7 @@ Notes:
 
 ## Phase 3 – Native GStreamer Data Path for One Feed
 
-**Status: 🟡 In progress, partially blocked.** 3.A.1 and 3.A.2 are complete; 3.A.3 was attempted and reverted (see slice notes); 3.B and 3.C are **deferred until after Phase 4** for the reasons described in "Blocker discovered during 3.A.3 testing" below.
+**Status: 🟡 In progress, partially blocked.** 3.A.1 and 3.A.2 are complete; 3.B and 3.C landed after Phase 4 (queue policies, queue-depth metrics, saturation-driven health rules, and the transitional pipeline banner are all committed). 3.A.3 (native preview video sink) was attempted and reverted — see slice notes — and remains the only Phase 3 item still open.
 
 ### Blocker discovered during 3.A.3 testing (drives Phase 4 acceleration)
 
@@ -1960,20 +1960,23 @@ The intended design: replace the operator-window preview path's `appsink → num
 - Investigate whether the third-window symptom is gst-plugins-bad d3d11videosink-version-specific. A newer `gst-plugins-rs` `d3d12sink` may behave differently.
 - Throttle the appsink path with an explicit `videorate` to e.g. 15 fps and accept lower-fidelity preview while keeping recording at full rate. This is an architectural compromise (still Python-bound) but proven to work.
 
-**3.B — Explicit per-branch queue policies + queue-depth metrics**
+**3.B — Explicit per-branch queue policies + queue-depth metrics — ✅ committed**
 
-- Codify the §4.2 policies in code, not in defaults: every branch after a `tee` gets a `queue` element with explicit `max-size-buffers`, `max-size-bytes`, `max-size-time`, and `leaky` properties. Preview branch is leaky-downstream and time-bounded (target < 200 ms per §4.3); recording branch is non-leaky and uses pressure to drive `RecordingState.RECORDING_ERROR` rather than silently drop (§4.4).
-- Add `queue_depth_preview` and `queue_depth_recording` per-feed metrics from §12.1. Sample via GStreamer `current-level-buffers` on the queue element; expose in `FeedMetricsSnapshot` and the diagnostics widget.
-- Hub-driven health: sustained queue saturation on the recording branch (e.g. >75% for >2s) drives `RecordingState.RECORDING → RECORDING_ERROR` and emits a `recording_branch_saturated` health event. Preview saturation drives `FeedState.LIVE → DEGRADED` (it is the natural meaning of "preview can't keep up with frames the source is producing").
-- Applies to both `python_push` and `native` modes uniformly so the queue contract is independent of the source-side change in 3.A.
-- Tests: queue policy applied as configured (inspect element properties); saturation health-event emission threshold; `FeedState` transitions on sustained preview drops.
+- ✅ Preview branch in `pipeline_manager.py` configures `leaky=2` (downstream), `max-size-time=200ms`, `max-size-buffers=4`, `max-size-bytes=0` per §4.3. Record branch configures `leaky=0` (non-leaky), `max-size-time=segment_duration_seconds`, `max-size-buffers=256`, `max-size-bytes=0` per §4.4.
+- ✅ Queue elements stored in `_branch_queues` and `_branch_queue_caps`; `PipelineManager.sample_queue_depths()` returns `{branch: {buffers, time_ns, max_buffers, max_time_ns}}` for the telemetry hub.
+- ✅ `FeedMetricsSnapshot` gained `queue_depth_preview/recording` and `queue_max_preview/recording`. `FeedMetrics.set_queue_depths` / `set_queue_capacity` accept gauge updates from the hub's per-tick sampler refresh.
+- ✅ `TelemetryHub.register_queue_depth_sampler(feed_id, sampler)` takes a per-feed callback; `_log_all_snapshots` calls each sampler before emitting the periodic log line and runs the saturation evaluator.
+- ✅ Saturation rules: recording branch ≥75% utilization for ≥2 ticks → `RecordingState.RECORDING → RECORDING_ERROR` (only when currently recording) + `recording_branch_saturated` health event. Preview branch ≥75% utilization for ≥2 ticks → `FeedState.LIVE → DEGRADED`. Streak counters reset on drain so transient single-tick spikes don't flap the state.
+- ✅ `ApplicationCoordinator` registers `recording_manager.recording_state` on the hub and threads each feed's `pipeline_manager.sample_queue_depths` as the per-feed sampler.
+- ✅ Tests: `FeedMetrics` queue-depth round-trips through `snapshot()`, sampler exception caught, two-tick saturation streak triggers state transitions + health event, single tick is a no-op, drain resets the streak. 9 new tests in `tests/test_queue_saturation.py`.
+- ✅ Applies uniformly to `python_push` and `native` modes.
 
-**3.C — Validation + transitional banner + Phase-3 readout**
+**3.C — Validation + transitional banner + Phase-3 readout — ✅ committed**
 
-- Add a startup log line and a diagnostics-widget banner per feed: `pipeline=native` (clean) or `pipeline=python_push (transitional)`. The banner surfaces the §17.3 guardrail visibly so refactor work doesn't accidentally regress feeds back to Python push.
-- Smoke-test exit criteria: a manual checklist embedded in the diagnostics widget when `mode = "production"` (from §13 config) and any feed reports `python_push`. This is just a visible warning; nothing is enforced beyond a log line.
-- Document the Phase 3 verdict in `ARCHITECTURE.md`: which feeds are native, which still aren't, and what's blocking the rest. Confirm 3.A.3 has lifted the preview-path Python ceiling and that `target_frame_*` defaults can be raised to 1080p without freezing the operator UI.
-- Tests: banner rendering for each pipeline mode; warning emitted only in production mode.
+- ✅ `AppSettings` gained `app_mode` (`"development"` | `"production"`, default `"development"`). TOML loader rejects unknown values.
+- ✅ Coordinator emits a per-feed startup log line: `feed=X pipeline=native (clean)` or `pipeline=python_push (transitional)`. When `app_mode=production` and any feed reports `python_push`, an additional `WARNING` log fires with a pointer to Phase 3.A.3.
+- ✅ `DiagnosticsWidget` shows a transitional pipeline banner when any feed is python_push. In development mode it's a muted gray notice; in production mode it switches to a high-contrast amber/dark-red callout. Each per-feed line now also shows `qprv N/MAX qrec N/MAX` queue gauges.
+- ✅ Tests: `app_mode` defaults to development on missing config / unknown keys raise / explicit production accepted. The diagnostics widget is exercised via the controller tests; the banner toggle is a pure data-driven format change.
 
 ### Out of scope for Phase 3
 
@@ -2092,7 +2095,7 @@ Split into two parts during execution; the data layer was committed cleanly, the
 - ✅ `ApplicationCoordinator.initialize` now calls `mark_dirty_sessions` and `validate_session_segments` before creating the new session. Recovery runs synchronously on app launch; the cost is bounded by the number of prior sessions on disk and dominated by `cv2.VideoCapture` open latency. With cv2 unavailable, the validator falls back to "treat all files as valid" so a stripped-down install doesn't quarantine real recordings.
 - ✅ 15 new tests covering: `mark_dirty_sessions` against `recording`/`stopped`/`finalized`/already-`dirty`/`recording`-with-`finalized_at`/no-manifest fixtures, `validate_session_segments` against corrupt + valid + already-cataloged + non-segment files + quarantine collisions + missing `recording/`, and `load_segment_index_for_session` filtering. Validator is injectable so the tests don't need a real cv2/FFmpeg toolchain.
 
-**§11.4 recovery prompt UI remains deferred.** This slice records the data that prompt will need; the actual "Resume / End and finalize / Discard" dialog is its own slice.
+**§11.4 recovery prompt UI — first cut committed (Finalize/Discard).** The dialog (`app/ui/recovery_dialog.py`) is modal, blocks the media UI per §11.4 (no close button, Escape ignored), and is shown by `main._run_startup_recovery_flow` between coordinator construction and `coordinator.initialize()`. The recovery scan (`run_startup_scan` — combines `mark_dirty_sessions` + `validate_session_segments`) was factored out of the coordinator into `session_recovery.run_startup_scan` so the bootstrap owns the ordering. **Resume is not yet wired** — the button is shown but disabled with a tooltip explaining the workaround, and the corresponding API path raises `NotImplementedError`. Adopting the same `session_id` for new segment numbering needs a `SessionManager.adopt_session(...)` API plus segment-counter seeding (highest existing fragment_index + 1) — its own slice. Finalize and Discard fully close the loop on 4.E: an unclean shutdown leaves a dirty manifest, the next launch surfaces it in a modal, and the operator's choice updates `session.json` before any new session is created. 10 new tests cover `find_dirty_sessions`, `resolve_dirty_session(FINALIZE/DISCARD/RESUME)`, and `run_startup_scan`.
 
 **Exit criteria for 4.E:** an unclean shutdown leaves `session.json` in `dirty` state on disk; corrupt segments end up in `<session>/quarantine/<feed_id>/`; in-progress (no DB row) segments that survived the crash get a `dirty` SQLite row so they're addressable by future tooling; the next launch sees the dirty state without crashing.
 
@@ -2100,8 +2103,8 @@ Split into two parts during execution; the data layer was committed cleanly, the
 
 - **Audio in segments (slice 4.F).** Was attempted inline during 4.A as "4.A.bis" — wiring `audio_tee → queue → valve → audioconvert → audioresample → opusenc → splitmuxsink (audio_%u request pad)`. On the test hardware (Windows + NDI Tools Screen Capture + gst-plugins-good splitmuxsink) the change broke the video pipeline (live preview froze on a stale frame, no recording files produced). Reverted; promoted from inline follow-up to a properly-scoped 4.F slice. Likely root cause directions worth investigating: splitmuxsink's behavior when audio data starts flowing after video data (timestamp alignment); whether `audio_%u` request pad needs to be requested *before* the video pad is implicitly bound; and whether the live audio path's wasapisink and the new audio_record path conflict on the audio tee. Recommended workaround until 4.F: leave audio recording disabled in 4.A; if audio is needed for a play, handle it separately at the post-session processor (Phase 8).
 - **ProRes / DNxHR codec selection.** §5.2's first-choice codecs require `gst-plugins-bad` elements that aren't always available on UCRT64. Add a config-driven codec selector once MJPEG path is solid; this becomes a small Phase-4-bis or a Phase 11 task (hardware acceleration ties into encoder choice).
-- **§11.4 recovery prompt UI.** 4.E marks `DIRTY` sessions correctly so the prompt has data to react to, but the prompt itself ("Resume / End and finalize / Discard") is its own slice.
-- **Phase 3.B and 3.C resumption.** Once Phase 4 lands and recording works end-to-end, queue policies (3.B) and the transitional banner (3.C) become meaningful again.
+- **§11.4 recovery-prompt Resume action.** 4.E + the §11.4 first cut land the dirty-detection, prompt UI, Finalize, and Discard paths. Resume (continue the same `session_id` with new segment numbering) needs `SessionManager.adopt_session(...)` plus segment-counter seeding from the highest existing fragment_index — deferred to a follow-up.
+- ~~**Phase 3.B and 3.C resumption.**~~ ✅ Committed after Phase 4 (queue policies, queue-depth metrics, saturation-driven health rules, transitional pipeline banner, `app_mode` setting).
 - **Native preview video sink (3.A.3 retry).** Same — revisit after Phase 4 reduces concurrent unknowns.
 
 ---

@@ -11,12 +11,20 @@ from app.core.health_events import default_log
 from app.core.telemetry import TelemetryHub, latency_snapshots
 
 if TYPE_CHECKING:
+    from app.config.settings import AppSettings
     from app.core.application_coordinator import ApplicationCoordinator
 
 
 class DiagnosticsWidget(QFrame):
     """Compact telemetry summary: app state, per-feed FPS+state, disk,
-    recent latency, invalid-transition count."""
+    recent latency, invalid-transition count.
+
+    Slice 3.B added queue-depth gauges next to each per-feed line.
+    Slice 3.C added a banner at the top that surfaces transitional
+    `python_push` feeds visibly, escalating to a warning style when
+    `app_mode = "production"` so refactors that accidentally regress
+    a feed off the native path can't ship silently.
+    """
 
     REFRESH_MS = 1000
 
@@ -26,12 +34,17 @@ class DiagnosticsWidget(QFrame):
         parent: QWidget | None = None,
         *,
         coordinator: "ApplicationCoordinator | None" = None,
+        settings: "AppSettings | None" = None,
     ) -> None:
         super().__init__(parent)
         self._hub = hub
         self._coordinator = coordinator
+        self._settings = settings
 
         self._title = QLabel("Diagnostics")
+        self._banner_label = QLabel("")
+        self._banner_label.setWordWrap(True)
+        self._banner_label.setVisible(False)
         self._app_state_label = QLabel("-")
         self._feeds_label = QLabel("-")
         self._disk_label = QLabel("-")
@@ -50,6 +63,7 @@ class DiagnosticsWidget(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
         layout.addWidget(self._title)
+        layout.addWidget(self._banner_label)
         layout.addWidget(self._app_state_label)
         layout.addWidget(self._feeds_label)
         layout.addWidget(self._disk_label)
@@ -92,6 +106,7 @@ class DiagnosticsWidget(QFrame):
             self._app_state_label.setText("app: (no coordinator)")
 
         snaps = self._hub.snapshot()
+        self._update_pipeline_banner(snaps)
         if not snaps:
             self._feeds_label.setText("(no feeds registered)")
         else:
@@ -107,7 +122,9 @@ class DiagnosticsWidget(QFrame):
                 lines.append(
                     f"{s.feed_id:<12} {fs_text:<13} {mode_text:<22} "
                     f"src {s.source_fps:5.1f}  prv {s.preview_fps:5.1f}  "
-                    f"rec {s.recording_fps:5.1f}  drop {s.dropped_per_sec:4.1f}/s"
+                    f"rec {s.recording_fps:5.1f}  drop {s.dropped_per_sec:4.1f}/s  "
+                    f"qprv {s.queue_depth_preview}/{s.queue_max_preview}  "
+                    f"qrec {s.queue_depth_recording}/{s.queue_max_recording}"
                 )
             self._feeds_label.setText("\n".join(lines))
 
@@ -140,5 +157,37 @@ class DiagnosticsWidget(QFrame):
         self._health_label.setText(
             f"invalid_transitions: {log.category_count('invalid_transition')}  "
             f"feed_lost: {log.category_count('feed_lost')}  "
-            f"disk_low: {log.category_count('disk_low')}"
+            f"disk_low: {log.category_count('disk_low')}  "
+            f"recording_branch_saturated: "
+            f"{log.category_count('recording_branch_saturated')}"
         )
+
+    def _update_pipeline_banner(self, snaps) -> None:
+        """Show / hide the §3.C transitional pipeline banner."""
+        transitional = [s for s in snaps if s.pipeline_mode == "python_push"]
+        if not transitional:
+            self._banner_label.setVisible(False)
+            self._banner_label.setText("")
+            return
+        feed_list = ", ".join(s.feed_id for s in transitional)
+        is_production = (
+            self._settings is not None
+            and getattr(self._settings, "app_mode", "development") == "production"
+        )
+        if is_production:
+            self._banner_label.setStyleSheet(
+                "QLabel { color: #ffd866; "
+                "background-color: #4a2a00; padding: 4px; border-radius: 4px; }"
+            )
+            self._banner_label.setText(
+                f"⚠ python_push pipeline active for: {feed_list}. "
+                f"app_mode=production expects native; preview is GIL-bound."
+            )
+        else:
+            self._banner_label.setStyleSheet(
+                "QLabel { color: #a0a0a0; padding: 2px 4px; }"
+            )
+            self._banner_label.setText(
+                f"pipeline=python_push (transitional) for: {feed_list}"
+            )
+        self._banner_label.setVisible(True)

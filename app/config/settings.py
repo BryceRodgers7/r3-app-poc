@@ -37,6 +37,11 @@ class AppSettings:
     operator_window_title: str = "Sports Replay Operator"
     program_window_title: str = "Sports Replay Program"
     base_data_dir: Path = Path(r"C:\SportsReplay")
+    # §13 / slice 3.C runtime mode. "development" silences the
+    # python_push transitional warning in the diagnostics widget;
+    # "production" surfaces it loudly so refactors don't accidentally
+    # ship a Python-bound preview path.
+    app_mode: str = "development"
     touch_button_height: int = 72
     default_feed_id: str = "feed_main"
     default_source_name: str = "Test Source"
@@ -95,6 +100,14 @@ class AppSettings:
             settings.program_window_title = str(app_config["program_window_title"])
         if "base_data_dir" in app_config:
             settings.base_data_dir = Path(str(app_config["base_data_dir"]))
+        if "app_mode" in app_config:
+            mode = str(app_config["app_mode"]).strip().lower() or "development"
+            if mode not in {"development", "production"}:
+                raise RuntimeError(
+                    f"[app] app_mode={mode!r} is not supported; "
+                    f"valid values are 'development' or 'production'."
+                )
+            settings.app_mode = mode
         if "touch_button_height" in app_config:
             settings.touch_button_height = int(app_config["touch_button_height"])
         if "target_frame_width" in app_config:
