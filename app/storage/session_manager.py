@@ -50,6 +50,14 @@ class SessionManager:
         """Return the active session's state machine, if any."""
         return self._active_session_state
 
+    def get_metadata_db(self) -> MetadataDb:
+        """Return the underlying SQLite metadata DB.
+
+        Slice 4.B threads this into per-feed `PipelineManager` so segment
+        rows can be persisted as their splitmuxsink rotates files.
+        """
+        return self._metadata_db
+
     def close(self) -> None:
         """Release persistence resources and finalize the active session."""
         if self._active_session_state is not None:

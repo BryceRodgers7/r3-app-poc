@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 import importlib
 import logging
@@ -15,8 +15,19 @@ from typing import Any
 
 import numpy as np
 
+from datetime import datetime, timezone
+
 from app.core.feed_state import FeedState
-from app.core.models import AudioChunk, AudioFormat, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
+from app.core.models import (
+    AudioChunk,
+    AudioFormat,
+    FrameOverlayInfo,
+    IngestTelemetry,
+    MediaFrame,
+    SEGMENT_STATE_COMPLETE,
+    Segment,
+    SessionPaths,
+)
 from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
 from app.media.frame_overlay import render_frame_overlay
@@ -26,6 +37,8 @@ from app.media.preview_output import PreviewOutput
 from app.media.recorder import Recorder
 from app.media.replay_buffer import ReplayBuffer, ReplayFrameRef, ReplayStore
 from app.media.source_interface import SourceInterface
+from app.storage.metadata_db import MetadataDb
+from app.storage.segment_index import SegmentIndex
 
 LOGGER = logging.getLogger(__name__)
 
@@ -129,6 +142,13 @@ class PipelineManager:
         self._recording_segment_duration_seconds: float = max(
             0.5, float(recording_segment_duration_seconds)
         )
+        # Phase 4.B: per-segment metadata tracking. The buffer probe on
+        # jpegenc.src updates `_pending_segment` for the currently-writing
+        # segment; format-location and disable_file_recording finalize it
+        # into the metadata DB + segment index.
+        self._pending_segment: dict[str, Any] | None = None
+        self._metadata_db: MetadataDb | None = None
+        self._segment_index: SegmentIndex | None = None
         self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
         self._recording_container: str = recording_container.strip().lower() or "mkv"
         if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
@@ -195,9 +215,15 @@ class PipelineManager:
         segments. The valve stays closed until the operator clicks Start
         again, at which point splitmuxsink continues with the next
         sequential fragment id under the same session/feed.
+
+        Slice 4.B: flush the in-progress segment's metadata into the DB
+        + index. The on-disk file may still be finalizing asynchronously
+        (matroskamux + async-finalize=True), so file size is read with
+        best-effort accuracy.
         """
         self._recording_running = False
         self._set_branch_enabled("record", False)
+        self._finalize_pending_segment_locked()
         LOGGER.info(
             "Recording stopped for feed_id=%s",
             self._recording_feed_id,
@@ -294,6 +320,14 @@ class PipelineManager:
     def set_feed_state(self, state_machine: StateMachine[FeedState] | None) -> None:
         """Attach the per-feed state machine driven by bus events."""
         self._feed_state = state_machine
+
+    def set_metadata_db(self, db: MetadataDb | None) -> None:
+        """Attach the SQLite metadata-db that segment rows are written to (slice 4.B)."""
+        self._metadata_db = db
+
+    def set_segment_index(self, index: SegmentIndex | None) -> None:
+        """Attach the in-memory segment index that finalized segments are added to (slice 4.B)."""
+        self._segment_index = index
 
     def set_video_window_handle(self, window_handle: int) -> None:
         """Attach the active embedded video sink to a Qt-owned native child window."""
@@ -917,6 +951,17 @@ class PipelineManager:
                 None,
             )
 
+        # Slice 4.B: probe jpegenc's src so we capture per-segment first/last
+        # PTS and frame counts of the *encoded* stream (matches what
+        # splitmuxsink actually writes to disk).
+        jpegenc_src_pad = jpegenc.get_static_pad("src")
+        if jpegenc_src_pad is not None:
+            jpegenc_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._on_jpegenc_buffer_probe,
+                None,
+            )
+
         for element in (queue, valve, convert, encode_caps, jpegenc, splitmuxsink):
             element.sync_state_with_parent()
 
@@ -935,10 +980,21 @@ class PipelineManager:
         filenames predictable: every new recording session starts at
         `segment_00000.mkv`.
 
+        Slice 4.B: also drives segment-metadata lifecycle. By the time
+        this callback fires for fragment N, fragment N-1 has been closed
+        by splitmuxsink's rotation (modulo `async-finalize` flushing). So
+        finalize the previous pending segment (if any) into the metadata
+        DB + index, then reset state for the new segment.
+
         If the callback fires without an active session (defensive — the
         upstream valve should be closed in that case), fall back to a temp
         path so the caller doesn't crash.
         """
+        # Finalize the previous segment (if any) before opening the next.
+        # This is where we transition state="writing" → "complete" and
+        # capture first/last PTS, frame count, file size.
+        self._finalize_pending_segment_locked()
+
         if self._recording_session_paths is None or self._recording_feed_id is None:
             tmp = Path(f"./_unrouted_segment_{fragment_id:05d}.mkv").resolve()
             LOGGER.warning(
@@ -960,7 +1016,109 @@ class PipelineManager:
             self._recording_feed_id,
             path,
         )
+        # Begin tracking the new pending segment. The buffer probe will
+        # populate first/last PTS and frame count as buffers flow.
+        self._pending_segment = {
+            "session_id": self._recording_session_paths.session_id,
+            "feed_id": self._recording_feed_id,
+            "fragment_index": index,
+            "file_path": str(path),
+            "first_pts_ns": None,
+            "last_pts_ns": None,
+            "frame_count": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
         return str(path)
+
+    def _on_jpegenc_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
+        """Track per-segment first/last PTS and frame count (slice 4.B).
+
+        Runs on the streaming thread once per encoded JPEG buffer. Reads
+        only buffer.pts and increments a counter — no pixel work. The
+        captured stats are flushed into a `Segment` row by
+        `_finalize_pending_segment_locked` when the segment closes.
+        """
+        Gst = self._Gst
+        if Gst is None:
+            return 0
+        pending = self._pending_segment
+        if pending is None or not self._recording_running:
+            return Gst.PadProbeReturn.OK
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+        if buf.pts != Gst.CLOCK_TIME_NONE:
+            pts_ns = int(buf.pts)
+            if pending["first_pts_ns"] is None:
+                pending["first_pts_ns"] = pts_ns
+            pending["last_pts_ns"] = pts_ns
+        pending["frame_count"] += 1
+        return Gst.PadProbeReturn.OK
+
+    def _finalize_pending_segment_locked(self) -> None:
+        """Convert the pending-segment state into a `Segment` row + index entry.
+
+        Called from `_on_splitmuxsink_format_location` (when the next
+        segment is about to open) and from `disable_file_recording` (when
+        the operator clicks Stop). No-op if there's no pending segment or
+        the segment had no buffers (e.g. valve closed before any frame
+        flowed through).
+        """
+        pending = self._pending_segment
+        self._pending_segment = None
+        if pending is None:
+            return
+        if pending["first_pts_ns"] is None:
+            # Empty segment — no buffers ever flowed through. Nothing to
+            # record. The on-disk file may exist as zero bytes; let 4.E's
+            # cleanup handle it.
+            LOGGER.debug(
+                "skipping finalize for empty segment %s",
+                pending.get("file_path"),
+            )
+            return
+        file_path = Path(pending["file_path"])
+        try:
+            size_bytes = file_path.stat().st_size if file_path.exists() else 0
+        except OSError:
+            size_bytes = 0
+        first_pts = int(pending["first_pts_ns"])
+        last_pts = int(pending["last_pts_ns"]) if pending["last_pts_ns"] is not None else first_pts
+        segment = Segment(
+            session_id=pending["session_id"],
+            feed_id=pending["feed_id"],
+            fragment_index=int(pending["fragment_index"]),
+            file_path=str(file_path),
+            codec=self._recording_codec,
+            container=self._recording_container,
+            start_pts_ns=first_pts,
+            end_pts_ns=last_pts,
+            duration_ns=max(0, last_pts - first_pts),
+            frame_count_estimate=int(pending["frame_count"]),
+            size_bytes=size_bytes,
+            state=SEGMENT_STATE_COMPLETE,
+            created_at=str(pending["created_at"]),
+            finalized_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if self._metadata_db is not None:
+            try:
+                seg_id = self._metadata_db.insert_segment(segment)
+                segment = replace(segment, segment_id=seg_id)
+            except Exception as exc:
+                LOGGER.exception(
+                    "Failed to insert segment metadata for %s: %s",
+                    file_path,
+                    exc,
+                )
+        if self._segment_index is not None:
+            self._segment_index.add(segment)
+        LOGGER.info(
+            "finalized segment %s: frames=%d bytes=%d duration_ms=%d",
+            file_path.name,
+            segment.frame_count_estimate,
+            segment.size_bytes,
+            segment.duration_ns // 1_000_000,
+        )
 
     def _on_record_branch_buffer_probe(self, _pad: Any, _info: Any, _user: Any) -> Any:
         """Tick the recording-fps metric when the operator is actively recording."""

@@ -63,6 +63,11 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         pm._recording_codec = codec
         pm._recording_container = container
         pm._recording_segment_counter = 0
+        # Slice 4.B fields touched by `_on_splitmuxsink_format_location`
+        # via the `_finalize_pending_segment_locked` call:
+        pm._pending_segment = None
+        pm._metadata_db = None
+        pm._segment_index = None
         return pm
 
     def _session_paths(self, root: Path) -> SessionPaths:

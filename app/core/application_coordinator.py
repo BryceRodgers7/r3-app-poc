@@ -13,6 +13,7 @@ from app.core.session_state import SessionState
 from app.core.telemetry import TelemetryHub
 from app.media.feed_runtime import FeedRuntime
 from app.media.source_interface import PipelineMode
+from app.storage.segment_index import SegmentIndex
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
@@ -38,6 +39,7 @@ class ApplicationCoordinator:
         telemetry_hub: TelemetryHub,
         operator_renderer: MultiFeedOutputRenderer,
         program_renderer: MultiFeedOutputRenderer,
+        segment_index: SegmentIndex | None = None,
     ) -> None:
         self._settings = settings
         self._session_manager = session_manager
@@ -48,6 +50,9 @@ class ApplicationCoordinator:
         self.telemetry_hub = telemetry_hub
         self.operator_renderer = operator_renderer
         self.program_renderer = program_renderer
+        # Slice 4.B: shared per-app in-memory segment index. Each feed's
+        # PipelineManager writes finalized segments here as they close.
+        self.segment_index = segment_index if segment_index is not None else SegmentIndex()
 
         primary_feed = feed_registry.get_primary_feed()
         enabled_feeds = feed_registry.get_enabled_feeds()
@@ -199,6 +204,7 @@ def build_default_application_coordinator(
     recording_manager = RecordingManager()
     replay_store_manager = ReplayStoreManager()
     telemetry_hub = TelemetryHub()
+    segment_index = SegmentIndex()
     feed_runtimes: dict[str, FeedRuntime] = {}
 
     for feed in feed_registry.get_enabled_feeds():
@@ -229,6 +235,11 @@ def build_default_application_coordinator(
         feed_state = make_feed_state_machine(feed.feed_id, feed.display_name)
         pipeline_manager.set_feed_state(feed_state)
         telemetry_hub.register_feed_state(feed.feed_id, feed_state)
+        # Slice 4.B: each PipelineManager writes finalized segment rows
+        # into the shared SQLite + in-memory index when its splitmuxsink
+        # rotates files (or recording stops).
+        pipeline_manager.set_metadata_db(session_manager.get_metadata_db())
+        pipeline_manager.set_segment_index(segment_index)
         runtime = FeedRuntime(
             feed=feed,
             source=source,
@@ -251,6 +262,7 @@ def build_default_application_coordinator(
         telemetry_hub=telemetry_hub,
         operator_renderer=operator_renderer,
         program_renderer=program_renderer,
+        segment_index=segment_index,
     )
 
 

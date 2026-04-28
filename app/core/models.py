@@ -186,3 +186,45 @@ class SessionPaths:
             rolling_dir=self.rolling_dir / safe_feed_id,
             clips_dir=self.clips_dir / safe_feed_id,
         )
+
+
+# Segment metadata states (§6.5). The 4.B implementation only writes
+# `complete` rows today; `dirty`/`corrupt`/`quarantined` are reserved for
+# 4.E's startup scan.
+SEGMENT_STATE_WRITING = "writing"
+SEGMENT_STATE_COMPLETE = "complete"
+SEGMENT_STATE_DIRTY = "dirty"
+SEGMENT_STATE_CORRUPT = "corrupt"
+SEGMENT_STATE_QUARANTINED = "quarantined"
+
+
+@dataclass(slots=True, frozen=True)
+class Segment:
+    """One closed recording segment, matching the §6.3 schema.
+
+    Audio fields, `pts_to_session_offset_ns`, and the wall-clock pair are
+    populated as they become available — slice 4.B captures what
+    `splitmuxsink`'s `format-location` cycle gives us cleanly. Phase 5's
+    `SessionClock` will fill in `start_session_time_ns` / `end_session_time_ns`.
+    """
+
+    session_id: str
+    feed_id: str
+    fragment_index: int
+    file_path: str
+    codec: str
+    container: str
+    start_pts_ns: int
+    end_pts_ns: int
+    duration_ns: int
+    frame_count_estimate: int
+    size_bytes: int
+    state: str
+    created_at: str
+    finalized_at: str | None
+    segment_id: int | None = None  # set on insert by SQLite
+    start_session_time_ns: int | None = None
+    end_session_time_ns: int | None = None
+    pts_to_session_offset_ns: int | None = None
+    start_wall_clock_utc: str | None = None
+    end_wall_clock_utc: str | None = None
