@@ -144,12 +144,15 @@ class PlaybackOverlayInfo:
 
 @dataclass(slots=True)
 class FeedDefinition:
-    """Configuration for a single ingest feed."""
+    """Configuration for a single ingest feed.
+
+    `source_kind` accepts only `"ndi"` (production) or `"synthetic"` (dev
+    fallback). USB / OpenCV camera ingest was removed in Phase 2.5.
+    """
 
     feed_id: str
     display_name: str
-    source_kind: str = "auto"
-    camera_index: int = 0
+    source_kind: str = "synthetic"
     ndi_name: str | None = None
     enabled: bool = True
 

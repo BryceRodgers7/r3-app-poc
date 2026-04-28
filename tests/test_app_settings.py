@@ -16,7 +16,7 @@ class AppSettingsTests(unittest.TestCase):
     def test_load_returns_defaults_when_file_is_missing(self) -> None:
         settings = AppSettings.load(Path("missing_app_settings.toml"))
 
-        self.assertEqual(settings.default_source_kind, "auto")
+        self.assertEqual(settings.default_source_kind, "synthetic")
         self.assertIsNone(settings.ndi_source_name)
         self.assertEqual(settings.default_feed_id, "feed_main")
 
@@ -40,7 +40,6 @@ replay_audio_segment_seconds = 1.5
 kind = "ndi"
 display_name = "NDI Bench Camera"
 feed_id = "feed_ndi"
-camera_index = 2
 ndi_name = "OBS-PC (Camera)"
 """.strip(),
                 encoding="utf-8",
@@ -53,7 +52,6 @@ ndi_name = "OBS-PC (Camera)"
         self.assertEqual(settings.default_source_kind, "ndi")
         self.assertEqual(settings.default_source_name, "NDI Bench Camera")
         self.assertEqual(settings.default_feed_id, "feed_ndi")
-        self.assertEqual(settings.test_camera_index, 2)
         self.assertEqual(settings.ndi_source_name, "OBS-PC (Camera)")
         self.assertTrue(settings.enable_embedded_audio)
         self.assertFalse(settings.live_audio_monitor_enabled)
@@ -63,12 +61,25 @@ ndi_name = "OBS-PC (Camera)"
         self.assertEqual(settings.audio_container, "mp4")
         self.assertEqual(settings.replay_audio_segment_seconds, 1.5)
 
+    def test_load_rejects_legacy_auto_kind_with_migration_hint(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[source]
+kind = "auto"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("Phase 2.5", str(ctx.exception))
+
     def test_feed_registry_uses_loaded_source_settings(self) -> None:
         settings = AppSettings(
             default_feed_id="feed_ndi",
             default_source_name="Program Camera",
             default_source_kind="ndi",
-            test_camera_index=3,
             ndi_source_name="Program NDI",
         )
 
@@ -78,7 +89,6 @@ ndi_name = "OBS-PC (Camera)"
         self.assertEqual(feed.feed_id, "feed_ndi")
         self.assertEqual(feed.display_name, "Program Camera")
         self.assertEqual(feed.source_kind, "ndi")
-        self.assertEqual(feed.camera_index, 3)
         self.assertEqual(feed.ndi_name, "Program NDI")
 
     def test_load_reads_feeds_array_for_multi_feed(self) -> None:
@@ -91,9 +101,8 @@ target_fps = 30.0
 
 [[feeds]]
 feed_id = "a"
-display_name = "Cam A"
-kind = "auto"
-camera_index = 0
+display_name = "Synthetic A"
+kind = "synthetic"
 
 [[feeds]]
 feed_id = "b"
@@ -111,8 +120,24 @@ ndi_name = "Sender 1"
         enabled = registry.get_enabled_feeds()
         self.assertEqual(len(enabled), 2)
         self.assertEqual(enabled[0].feed_id, "a")
+        self.assertEqual(enabled[0].source_kind, "synthetic")
         self.assertEqual(enabled[1].source_kind, "ndi")
         self.assertEqual(enabled[1].ndi_name, "Sender 1")
+
+    def test_load_rejects_legacy_auto_kind_in_feeds_table(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[[feeds]]
+feed_id = "legacy"
+kind = "auto"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("Phase 2.5", str(ctx.exception))
 
     def test_source_chain_reports_embedded_audio_capability_for_ndi(self) -> None:
         settings = AppSettings(default_source_kind="ndi")
@@ -125,17 +150,17 @@ ndi_name = "Sender 1"
                 ndi_name="Sender",
             ),
         )
-        test_source = build_source_for_feed(
+        synthetic_source = build_source_for_feed(
             settings,
             FeedDefinition(
-                feed_id="test",
-                display_name="Test",
-                source_kind="auto",
+                feed_id="dev",
+                display_name="Dev",
+                source_kind="synthetic",
             ),
         )
 
         self.assertTrue(ndi_source.supports_embedded_audio())
-        self.assertFalse(test_source.supports_embedded_audio())
+        self.assertFalse(synthetic_source.supports_embedded_audio())
 
 
 if __name__ == "__main__":

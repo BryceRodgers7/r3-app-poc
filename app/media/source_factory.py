@@ -1,114 +1,39 @@
-"""Helpers for constructing the preferred live video source chain."""
+"""Build the configured source for one feed.
+
+After Phase 2.5 the source surface is intentionally narrow: production uses
+NDI (`kind = "ndi"`); development without NDI hardware uses the synthetic
+test source (`kind = "synthetic"`). Any other `kind` value raises
+`ConfigError` so misconfigured prod deployments fail loudly rather than
+falling back to a dev source.
+"""
 
 from __future__ import annotations
 
 import logging
 
 from app.config.settings import AppSettings
-from app.core.models import AudioChunk, AudioFormat, FeedDefinition, IngestTelemetry, MediaFrame
-from app.media.gstreamer_camera_source import GStreamerCameraSource
+from app.core.models import FeedDefinition
 from app.media.ndi_receiver import NDIReceiver
 from app.media.source_interface import SourceInterface
 from app.media.test_source import TestSource
 
 LOGGER = logging.getLogger(__name__)
 
+VALID_SOURCE_KINDS = {"ndi", "synthetic"}
 
-class PreferredSourceChain(SourceInterface):
-    """Try sources in order and keep the first one that connects."""
 
-    def __init__(self, sources: list[SourceInterface]) -> None:
-        if not sources:
-            raise ValueError("PreferredSourceChain requires at least one source.")
-        self._sources = sources
-        self._active_source: SourceInterface | None = None
-
-    def connect_source(self) -> bool:
-        """Connect the first source that succeeds."""
-        if self._active_source is not None and self._active_source.is_connected():
-            return True
-
-        self._active_source = None
-        for source in self._sources:
-            if not source.connect_source():
-                LOGGER.info("Source candidate %s did not connect.", source.__class__.__name__)
-                continue
-            self._active_source = source
-            LOGGER.info("Selected source candidate %s.", source.__class__.__name__)
-            return True
-        return False
-
-    def disconnect_source(self) -> None:
-        """Disconnect the active source if one is selected."""
-        if self._active_source is not None:
-            self._active_source.disconnect_source()
-        self._active_source = None
-
-    def is_connected(self) -> bool:
-        """Return whether the active source is connected."""
-        return self._active_source is not None and self._active_source.is_connected()
-
-    def get_display_name(self) -> str:
-        """Return the selected source name."""
-        return self._active().get_display_name()
-
-    def get_feed_id(self) -> str:
-        """Return the selected feed identifier."""
-        return self._active().get_feed_id()
-
-    def create_pipeline_fragment(self) -> str:
-        """Return the selected source fragment description."""
-        return self._active().create_pipeline_fragment()
-
-    def read_frame(self) -> MediaFrame | None:
-        """Read the next frame from the selected source."""
-        return self._active().read_frame()
-
-    def supports_embedded_audio(self) -> bool:
-        """Return whether the selected source exposes embedded audio."""
-        if self._active_source is None:
-            return any(source.supports_embedded_audio() for source in self._sources)
-        return self._active_source.supports_embedded_audio()
-
-    def get_audio_format(self) -> AudioFormat | None:
-        """Return embedded audio format for the selected source."""
-        if self._active_source is None:
-            return None
-        return self._active_source.get_audio_format()
-
-    def read_audio_chunk(self) -> AudioChunk | None:
-        """Read embedded audio from the selected source."""
-        if self._active_source is None:
-            return None
-        return self._active_source.read_audio_chunk()
-
-    def get_frame_size(self) -> tuple[int, int]:
-        """Return the selected source frame size."""
-        return self._active().get_frame_size()
-
-    def get_nominal_fps(self) -> float:
-        """Return the selected source frame rate."""
-        return self._active().get_nominal_fps()
-
-    def get_status_message(self) -> str | None:
-        """Return the selected source status message."""
-        return self._active().get_status_message()
-
-    def get_ingest_telemetry(self) -> IngestTelemetry | None:
-        """Return ingest telemetry for the active source."""
-        if self._active_source is None:
-            return None
-        return self._active_source.get_ingest_telemetry()
-
-    def _active(self) -> SourceInterface:
-        if self._active_source is None:
-            raise RuntimeError("No active source is selected.")
-        return self._active_source
+class ConfigError(RuntimeError):
+    """Raised when feed configuration cannot be turned into a source."""
 
 
 def build_source_for_feed(settings: AppSettings, feed: FeedDefinition) -> SourceInterface:
-    """Build the preferred source chain for a configured feed."""
-    if feed.source_kind == "ndi":
+    """Build the configured source for one feed."""
+    kind = (feed.source_kind or "").strip().lower()
+    if kind == "ndi":
+        if not feed.ndi_name or not str(feed.ndi_name).strip():
+            raise ConfigError(
+                f"Feed {feed.feed_id!r}: kind='ndi' requires an `ndi_name`."
+            )
         return NDIReceiver(
             source_name=feed.display_name,
             feed_id=feed.feed_id,
@@ -117,38 +42,30 @@ def build_source_for_feed(settings: AppSettings, feed: FeedDefinition) -> Source
             frame_height=settings.target_frame_height,
             target_fps=settings.target_fps,
         )
-
-    return PreferredSourceChain(
-        [
-            GStreamerCameraSource(
-                source_name=feed.display_name,
-                feed_id=feed.feed_id,
-                camera_index=feed.camera_index,
-                frame_width=settings.target_frame_width,
-                frame_height=settings.target_frame_height,
-                target_fps=settings.target_fps,
-            ),
-            TestSource(
-                source_name=feed.display_name,
-                feed_id=feed.feed_id,
-                camera_index=feed.camera_index,
-                frame_width=settings.target_frame_width,
-                frame_height=settings.target_frame_height,
-                target_fps=settings.target_fps,
-            ),
-        ]
+    if kind == "synthetic":
+        return TestSource(
+            source_name=feed.display_name,
+            feed_id=feed.feed_id,
+            frame_width=settings.target_frame_width,
+            frame_height=settings.target_frame_height,
+            target_fps=settings.target_fps,
+        )
+    raise ConfigError(
+        f"Feed {feed.feed_id!r}: unsupported kind={feed.source_kind!r}. "
+        f"Valid values are {sorted(VALID_SOURCE_KINDS)}. "
+        f"(USB-camera ingest was removed in Phase 2.5; use kind='synthetic' "
+        f"for dev or kind='ndi' for production.)"
     )
 
 
 def build_default_source(settings: AppSettings) -> SourceInterface:
-    """Build the preferred live source chain for the current platform."""
+    """Build a single default source from `[source]` in the legacy TOML schema."""
     return build_source_for_feed(
         settings,
         FeedDefinition(
             feed_id=settings.default_feed_id,
             display_name=settings.default_source_name,
             source_kind=settings.default_source_kind,
-            camera_index=settings.test_camera_index,
             ndi_name=settings.ndi_source_name,
         ),
     )

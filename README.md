@@ -1,6 +1,6 @@
 # Sports Replay POC
 
-Windows desktop proof of concept for live sports replay using **Python** and **PySide6**, with a **GStreamer**-centered media path (preview, file recording, and rolling replay). Some ingest options still use **OpenCV**-based or transitional Python frame delivery; see *Temporary vs intended to remain* below.
+Windows desktop proof of concept for live sports replay using **Python** and **PySide6**, with a **GStreamer**-centered media path (preview, file recording, and rolling replay). Production ingest is **NDI-only**; a synthetic test source exists for camera-less development. See *Temporary vs intended to remain* below for which paths still go through Python.
 
 **Developing on Windows:** the media layer loads **GStreamer** through **PyGObject** (`gi`). That stack is easiest with a coherent MSYS2 **UCRT64** Python and GStreamer install. If you see import or DLL issues outside that environment, read [docs/UCRT64_DEVELOPMENT.md](docs/UCRT64_DEVELOPMENT.md).
 
@@ -21,8 +21,10 @@ Target vs current design (multi-feed, two windows, future playback model) is des
 
 **Optional** `app_settings.toml` in the working directory sets ingest and paths (see [app/config/settings.py](app/config/settings.py)). If the file defines `[[feeds]]`, at least one feed must have `enabled = true` and the legacy `[source]` section is ignored. With no `[[feeds]]` table, the app uses a single feed from `[source]`.
 
-- **`kind = "auto"`** (per feed or legacy): try **GStreamer** camera capture first, then fall back to **OpenCV** webcam / synthetic test frames in [app/media/test_source.py](app/media/test_source.py).
-- **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed.
+- **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed. Production deployments use this exclusively.
+- **`kind = "synthetic"`**: deterministic synthetic test pattern from [app/media/test_source.py](app/media/test_source.py). Dev-only fallback for machines without NDI hardware.
+
+USB / OpenCV / GStreamer-camera ingest was removed in Phase 2.5; `kind = "auto"` now produces a startup error.
 
 ## Current vertical slice
 
@@ -37,8 +39,8 @@ Target vs current design (multi-feed, two windows, future playback model) is des
 
 **Temporary or transitional for this milestone**
 
-- **OpenCV** webcam capture and **synthetic** fallback, and the OpenCV `read_frame` path, in [app/media/test_source.py](app/media/test_source.py) (used when GStreamer camera capture does not connect, and for exercises of the `SourceInterface` contract).
-- **NumPy / OpenCV BGR** `MediaFrame` payloads and pushing frames from Python into GStreamer in [app/media/pipeline_manager.py](app/media/pipeline_manager.py) — the graph is still described as transitional until native in-tree sources dominate.
+- **Synthetic test source** in [app/media/test_source.py](app/media/test_source.py) — deterministic frame generator for dev environments without NDI hardware. Stays on the `python_push` path by design; not productionized.
+- **NumPy / OpenCV BGR** `MediaFrame` payloads and pushing frames from Python into GStreamer in [app/media/pipeline_manager.py](app/media/pipeline_manager.py) — the graph is still described as transitional until Phase 3 lands native NDI ingest.
 - [app/media/replay_buffer.py](app/media/replay_buffer.py) — rolling replay storage is **JPEG- and file-backed** with a defined `ReplayStore` interface; a future system might replace the mix of thumbs + rolling segments with a different timeline store.
 
 **Intended to remain (stable seams)**

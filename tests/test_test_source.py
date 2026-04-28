@@ -1,113 +1,67 @@
-"""Focused tests for camera backend selection in TestSource."""
+"""Tests for the synthetic dev-fallback source.
+
+Phase 2.5 stripped USB / OpenCV / DSHOW / MSMF logic from `TestSource`;
+what remains is a deterministic synthetic frame generator. These tests
+cover the public contract a `SourceInterface` consumer relies on.
+"""
 
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
-
-import cv2
-import numpy as np
 
 from app.media.test_source import TestSource
 
 
-class _FakeCapture:
-    def __init__(self, frames: list[np.ndarray | None], opened: bool = True) -> None:
-        self._frames = list(frames)
-        self._opened = opened
-        self.released = False
-        self.settings: dict[int, float] = {}
-
-    def isOpened(self) -> bool:
-        return self._opened
-
-    def read(self) -> tuple[bool, np.ndarray | None]:
-        if not self._frames:
-            return False, None
-        frame = self._frames.pop(0)
-        return frame is not None, frame
-
-    def set(self, prop_id: int, value: float) -> bool:
-        self.settings[prop_id] = value
-        return True
-
-    def release(self) -> None:
-        self.released = True
-
-
 class TestSourceTests(unittest.TestCase):
-    def test_connect_source_skips_black_directshow_frames(self) -> None:
-        black_frame = np.zeros((32, 48, 3), dtype=np.uint8)
-        color_frame = np.full((32, 48, 3), 120, dtype=np.uint8)
-        secondary_backend = getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)
-        captures = {
-            cv2.CAP_DSHOW: _FakeCapture([black_frame] * 12),
-            secondary_backend: _FakeCapture([color_frame]),
-        }
-
-        def fake_video_capture(camera_index: int, backend_id: int) -> _FakeCapture:
-            self.assertEqual(camera_index, 0)
-            capture = captures.get(backend_id)
-            if capture is None:
-                return _FakeCapture([], opened=False)
-            return capture
-
-        source = TestSource(
-            source_name="Test Source",
-            feed_id="feed_cam1",
-            camera_index=0,
+    def _build(self) -> TestSource:
+        return TestSource(
+            source_name="Dev Source",
+            feed_id="feed_dev",
             frame_width=64,
             frame_height=36,
-            target_fps=15.0,
+            target_fps=30.0,
         )
 
-        with patch("app.media.test_source.cv2.VideoCapture", side_effect=fake_video_capture), patch(
-            "app.media.test_source.time.sleep", return_value=None
-        ):
-            self.assertTrue(source.connect_source())
-            backend_label = "CAP_MSMF" if secondary_backend == getattr(cv2, "CAP_MSMF", None) else "CAP_ANY"
-            self.assertIn(backend_label, source.get_display_name())
-            frame = source.read_frame()
+    def test_connect_source_succeeds_without_hardware(self) -> None:
+        source = self._build()
+        self.assertTrue(source.connect_source())
+        self.assertTrue(source.is_connected())
+        self.assertIn("Synthetic", source.get_display_name())
 
+    def test_read_frame_returns_a_non_black_frame_with_expected_shape(self) -> None:
+        source = self._build()
+        source.connect_source()
+        frame = source.read_frame()
         self.assertIsNotNone(frame)
         assert frame is not None
         self.assertEqual(frame.image.shape, (36, 64, 3))
-        self.assertEqual(frame.feed_id, "feed_cam1")
-        self.assertTrue(captures[cv2.CAP_DSHOW].released)
-        self.assertFalse(captures[secondary_backend].released)
-
-    def test_connect_source_falls_back_to_synthetic_when_all_backends_fail(self) -> None:
-        black_frame = np.zeros((32, 48, 3), dtype=np.uint8)
-
-        def fake_video_capture(camera_index: int, backend_id: int) -> _FakeCapture:
-            self.assertEqual(camera_index, 2)
-            del backend_id
-            return _FakeCapture([black_frame] * 12)
-
-        source = TestSource(
-            source_name="Test Source",
-            feed_id="feed_cam2",
-            camera_index=2,
-            frame_width=64,
-            frame_height=36,
-            target_fps=15.0,
-        )
-
-        with patch("app.media.test_source.cv2.VideoCapture", side_effect=fake_video_capture), patch(
-            "app.media.test_source.time.sleep", return_value=None
-        ):
-            self.assertTrue(source.connect_source())
-            self.assertIn("Synthetic Fallback", source.get_display_name())
-            self.assertEqual(
-                source.get_status_message(),
-                "Camera opened but returned black frames; using synthetic fallback.",
-            )
-            frame = source.read_frame()
-
-        self.assertIsNotNone(frame)
-        assert frame is not None
+        self.assertEqual(frame.feed_id, "feed_dev")
         self.assertGreater(int(frame.image.max()), 0)
-        self.assertEqual(frame.feed_id, "feed_cam2")
+
+    def test_read_frame_increments_frame_id_monotonically(self) -> None:
+        source = self._build()
+        source.connect_source()
+        f1 = source.read_frame()
+        f2 = source.read_frame()
+        assert f1 is not None and f2 is not None
+        self.assertGreater(f2.frame_id, f1.frame_id)
+
+    def test_disconnect_clears_connected_flag(self) -> None:
+        source = self._build()
+        source.connect_source()
+        source.disconnect_source()
+        self.assertFalse(source.is_connected())
+        self.assertIsNone(source.read_frame())
+
+    def test_ingest_telemetry_reports_target_dimensions(self) -> None:
+        source = self._build()
+        source.connect_source()
+        telemetry = source.get_ingest_telemetry()
+        self.assertIsNotNone(telemetry)
+        assert telemetry is not None
+        self.assertEqual(telemetry.target_width, 64)
+        self.assertEqual(telemetry.target_height, 36)
+        self.assertEqual(telemetry.target_fps, 30.0)
 
 
 if __name__ == "__main__":

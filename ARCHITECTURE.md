@@ -21,7 +21,7 @@ The current codebase is a good vertical slice, not a finished foundation. Severa
 - A first-class **`PlaybackSession`** model (timeline position, rate, per-output state) as a named type — today much of this lives inside `PlaybackController`
 - **Full** timeline- and rate-based replay (slow motion, independent timelines) without leaning on the primary feed for some replay paths
 - Hardening for production: deployment, ops, source-loss policy, timestamp alignment across many feeds, etc.
-- Replace or narrow **transitional** Python frame push + OpenCV fallbacks where native GStreamer sources should own the full graph
+- Replace **transitional** Python frame push (still used by NDI ingest and the synthetic dev source) with a native GStreamer source bin for production NDI feeds (Phase 3.A). USB / OpenCV ingest was removed in Phase 2.5; the synthetic source intentionally stays on the Python-push path as the dev fallback.
 
 ## Design Goals
 
@@ -235,7 +235,7 @@ Conclusion:
 4. ~~Per-window output renderers and a second window~~ — operator + program `MainWindow` and renderers
 5. Extend replay to **true** per-feed (or cross-feed) timeline semantics, not only primary-feed replay where applicable
 6. Add slow-motion playback rates consistently with a timeline + rate model
-7. Harden NDI and non-test sources; reduce reliance on `TestSource` / Python-pushed frames where the graph should be native end-to-end
+7. Convert NDI ingest to a native GStreamer source bin (Phase 3.A); `TestSource` is the dev-only fallback and remains Python-push by design
 
 ## Architectural Verdict
 

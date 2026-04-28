@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-Windows desktop proof-of-concept for live multi-feed sports video replay. PySide6 UI on top of a GStreamer-centered media path (preview, file recording, rolling replay). Some ingest still goes through OpenCV / Python-pushed frames as a transitional fallback. Two top-level windows (operator + program) drive two independent `PlaybackController` instances over a shared graph of per-feed `FeedRuntime`s.
+Windows desktop proof-of-concept for live multi-feed sports video replay. PySide6 UI on top of a GStreamer-centered media path (preview, file recording, rolling replay). Production ingest is **NDI-only** (`kind = "ndi"`); a synthetic test source (`kind = "synthetic"`) is the dev fallback for camera-less work. Both still push frames through Python today — Phase 3.A is the slice that converts NDI to a native GStreamer source bin. Two top-level windows (operator + program) drive two independent `PlaybackController` instances over a shared graph of per-feed `FeedRuntime`s.
 
 The repo is between proof-of-concept and production. Two architecture documents coexist:
 - [ARCHITECTURE.md](ARCHITECTURE.md) — describes the **current** code's object graph and what is "still open."
@@ -45,7 +45,7 @@ main.py
        ├─ build_default_application_coordinator    # app/core/application_coordinator.py
        │     ├─ FeedRegistry                       # one FeedDefinition per [[feeds]] row
        │     └─ for each enabled feed:
-       │           Source (NDI / GStreamer cam / OpenCV / synthetic)
+       │           Source (NDI / synthetic)
        │           Recorder, ReplayBuffer (ReplayStore)
        │           PreviewOutput
        │           PipelineManager (owns the GStreamer graph + tee fan-out)
@@ -72,7 +72,7 @@ Key invariants worth knowing before editing:
 
 - `app/config/` — `AppSettings` dataclass + TOML loader (legacy `[source]` and new `[[feeds]]`).
 - `app/core/` — coordinator, registry, playback controller, app state, signals, dataclasses (`models.py` defines `MediaFrame`, `AudioChunk`, `SessionPaths`, `PlaybackMode`).
-- `app/media/` — sources (`source_interface`, `source_factory`, `gstreamer_camera_source`, `ndi_receiver`, `test_source`), pipeline (`pipeline_manager`), recording (`recorder`, `muxed_writer`, `recording_manager`), replay (`replay_buffer`, `replay_store_manager`), output (`output_renderer`, `preview_output`), telemetry/overlay helpers.
+- `app/media/` — sources (`source_interface`, `source_factory`, `ndi_receiver`, `test_source`), pipeline (`pipeline_manager`), recording (`recorder`, `muxed_writer`, `recording_manager`), replay (`replay_buffer`, `replay_store_manager`), output (`output_renderer`, `preview_output`), telemetry/overlay helpers.
 - `app/storage/` — filesystem layout (`file_manager`), SQLite metadata (`metadata_db`), session lifecycle (`session_manager`).
 - `app/ui/` — `MainWindow` (re-used for both operator and program with flags), `controls_widget`, `multi_feed_video_panel`, `status_bar_widget`, `video_widget`.
 - `tests/` — fast unit tests using stdlib `unittest`. They mock or stub GStreamer where needed; do not require real cameras to run.
@@ -81,8 +81,8 @@ Key invariants worth knowing before editing:
 
 - Do not bypass the per-feed seams. Code that touches recording, replay storage, or ingest should go through `FeedRuntime`, `RecordingManager`, or `ReplayStoreManager`, not directly into one feed's internals.
 - The `PreviewOutput` / `OutputRenderer` split is intentional: a feed's `PreviewOutput` is its own ingest sink, while operator/program windows render via `MultiFeedOutputRenderer`. Do not collapse them.
-- The OpenCV and synthetic-test paths in `app/media/test_source.py` are documented as transitional. They are still load-bearing for development without cameras — don't remove them as part of unrelated work.
-- `MediaFrame` payloads are `numpy` BGR images (OpenCV convention). When adding overlays, use `app/media/frame_overlay.py`.
+- The synthetic source in `app/media/test_source.py` is the only non-NDI path the app builds. It is the dev fallback for camera-less environments — don't remove it as part of unrelated work.
+- `MediaFrame` payloads are `numpy` BGR images (OpenCV ordering convention). When adding overlays, use `app/media/frame_overlay.py`.
 - For UI changes, run `python main.py` and exercise the relevant transport (start/stop recording, rewind 10s, slow 1/2x, slow 1/4x, jump to live) — type checks won't catch playback regressions.
 
 ## Architecture doc vs current code (gaps and contradictions in `docs/r3_app_architecture.md`)

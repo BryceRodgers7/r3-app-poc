@@ -9,6 +9,24 @@ from typing import Any
 
 CONFIG_FILENAME = "app_settings.toml"
 
+_VALID_SOURCE_KINDS = {"ndi", "synthetic"}
+
+
+def _validate_source_kind(kind: str, *, where: str) -> None:
+    """Reject obsolete or unknown `kind` values with a clear migration hint."""
+    if kind in _VALID_SOURCE_KINDS:
+        return
+    if kind == "auto":
+        raise RuntimeError(
+            f"{where}: kind='auto' is no longer supported. USB-camera ingest was "
+            f"removed in Phase 2.5. Use kind='ndi' for production or kind='synthetic' "
+            f"for development without NDI hardware."
+        )
+    raise RuntimeError(
+        f"{where}: unsupported kind={kind!r}. Valid values are "
+        f"{sorted(_VALID_SOURCE_KINDS)}."
+    )
+
 
 @dataclass(slots=True)
 class AppSettings:
@@ -23,8 +41,7 @@ class AppSettings:
     touch_button_height: int = 72
     default_feed_id: str = "feed_main"
     default_source_name: str = "Test Source"
-    default_source_kind: str = "auto"
-    test_camera_index: int = 0
+    default_source_kind: str = "synthetic"
     ndi_source_name: str | None = None
     target_frame_width: int = 640
     target_frame_height: int = 360
@@ -108,9 +125,9 @@ class AppSettings:
         if "display_name" in source_config:
             settings.default_source_name = str(source_config["display_name"])
         if "kind" in source_config:
-            settings.default_source_kind = str(source_config["kind"]).strip().lower() or "auto"
-        if "camera_index" in source_config:
-            settings.test_camera_index = int(source_config["camera_index"])
+            raw_kind = str(source_config["kind"]).strip().lower()
+            settings.default_source_kind = raw_kind or "synthetic"
+            _validate_source_kind(raw_kind, where="[source]")
         if "ndi_name" in source_config:
             ndi_name = str(source_config["ndi_name"]).strip()
             settings.ndi_source_name = ndi_name or None
@@ -131,8 +148,8 @@ class AppSettings:
             if not feed_id:
                 continue
             display_name = str(row.get("display_name", feed_id or "Feed")).strip()
-            kind = str(row.get("kind", "auto")).strip().lower() or "auto"
-            camera_index = int(row.get("camera_index", 0))
+            kind = str(row.get("kind", "synthetic")).strip().lower() or "synthetic"
+            _validate_source_kind(kind, where=f"[[feeds]] feed_id={feed_id!r}")
             ndi_raw = row.get("ndi_name")
             ndi_name = str(ndi_raw).strip() if ndi_raw is not None else None
             if ndi_name == "":
@@ -143,7 +160,6 @@ class AppSettings:
                     "feed_id": feed_id,
                     "display_name": display_name or feed_id,
                     "source_kind": kind,
-                    "camera_index": camera_index,
                     "ndi_name": ndi_name,
                     "enabled": enabled,
                 }

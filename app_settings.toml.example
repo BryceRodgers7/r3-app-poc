@@ -14,42 +14,42 @@ replay_buffer_seconds = 120
 # short_segments_subdir = "segments"
 # short_segment_filename_prefix = "segment"
 
-# Multi-feed (up to 8 enabled feeds). When present, [[feeds]] replaces the single [source] block below.
-# Mix USB/webcam rows (kind = "auto") and NDI rows (kind = "ndi", ndi_name required).
+# Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
+# dev-time fallback for machines without NDI hardware. USB / OpenCV camera
+# ingest was removed in Phase 2.5 — `kind = "auto"` is now an error.
 
 [[feeds]]
-feed_id = "cam_a"
-display_name = "USB Cam A"
-kind = "auto"
-camera_index = 0
+feed_id = "ndi_main"
+display_name = "Main Camera"
+kind = "ndi"
+ndi_name = "DAVIDI7 (Camera 1)"
 enabled = true
 
 [[feeds]]
-feed_id = "cam_b"
-display_name = "USB Cam B"
-kind = "auto"
-camera_index = 1
-
-[[feeds]]
-feed_id = "ndi_1"
-display_name = "NDI Program"
+feed_id = "ndi_angle"
+display_name = "Angle 2"
 kind = "ndi"
-ndi_name = "DAVIDI7 (Test Pattern)"
+ndi_name = "DAVIDI7 (Camera 2)"
+enabled = true
+
+# Dev-only synthetic source for camera-less testing. Comment out for production.
+# [[feeds]]
+# feed_id = "feed_dev"
+# display_name = "Synthetic Test Pattern"
+# kind = "synthetic"
+# enabled = true
 
 [source]
 # Used only when no [[feeds]] entries are defined.
-# Use "auto" to prefer the native webcam path and fall back automatically.
-# Use "ndi" to connect to an NDI sender by name.
-kind = "auto"
+# Use "ndi" for production NDI cameras.
+# Use "synthetic" for camera-less development.
+kind = "synthetic"
 
 # User-facing label shown in the UI and session metadata.
 display_name = "Main Feed"
 feed_id = "feed_main"
 
-# Used when kind = "auto".
-camera_index = 0
-
-# Used when kind = "ndi".
+# Used when kind = "ndi". Format is `HOSTNAME (Source Name)`.
 # Example:
 # ndi_name = "OBS PGM"
 ndi_name = ""

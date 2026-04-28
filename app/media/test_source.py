@@ -1,9 +1,15 @@
-"""Temporary webcam-backed test source with a synthetic fallback."""
+"""Synthetic test source for development without NDI hardware.
+
+The OpenCV / DSHOW / MSMF webcam paths and the `GStreamerCameraSource`
+fallback that this module used to support were removed in Phase 2.5.
+Production deployments use NDI exclusively (`kind = "ndi"`); this synthetic
+source is the dev-time fallback (`kind = "synthetic"`) and is the only
+non-NDI source the application will build.
+"""
 
 from __future__ import annotations
 
 import logging
-import sys
 import time
 from math import sin
 
@@ -17,267 +23,75 @@ LOGGER = logging.getLogger(__name__)
 
 
 class TestSource(SourceInterface):
-    """Provides a continuous frame stream for the first working vertical slice.
-
-    This temporary source keeps NDI out of scope while exercising the same
-    frame-delivery path that later production sources will use.
-    """
+    """Deterministic synthetic frame generator for camera-less development."""
 
     def __init__(
         self,
         source_name: str,
         feed_id: str,
-        camera_index: int,
         frame_width: int,
         frame_height: int,
         target_fps: float,
     ) -> None:
         self._base_source_name = source_name
         self._feed_id = feed_id
-        self._display_name = source_name
-        self._camera_index = camera_index
+        self._display_name = f"{source_name} (Synthetic)"
         self._frame_width = frame_width
         self._frame_height = frame_height
         self._target_fps = max(target_fps, 1.0)
         self._frame_counter = 0
         self._connected = False
-        self._capture: cv2.VideoCapture | None = None
-        self._capture_backend_name: str | None = None
-        self._use_synthetic_frames = False
         self._last_frame_monotonic = 0.0
-        self._pending_frame: np.ndarray | None = None
-        self._status_message: str | None = None
         self._ingest_telemetry: IngestTelemetry | None = None
 
     def connect_source(self) -> bool:
-        """Open the preferred camera or fall back to a synthetic test feed."""
         if self._connected:
             return True
-
-        self._capture = None
-        self._capture_backend_name = None
-        self._pending_frame = None
-        self._status_message = None
-        self._use_synthetic_frames = True
-        self._display_name = f"{self._base_source_name} (Synthetic Fallback)"
-        saw_black_startup_frames = False
-
-        for backend_name, backend_id in self._get_backend_candidates():
-            capture = cv2.VideoCapture(self._camera_index, backend_id)
-            if not capture.isOpened():
-                capture.release()
-                continue
-
-            self._configure_capture(capture)
-            startup_frame = self._read_usable_startup_frame(capture)
-            if startup_frame is None:
-                saw_black_startup_frames = True
-                LOGGER.warning(
-                    "Rejected camera index %s via %s because startup frames were empty or black.",
-                    self._camera_index,
-                    backend_name,
-                )
-                capture.release()
-                continue
-
-            self._capture = capture
-            self._capture_backend_name = backend_name
-            self._pending_frame = startup_frame
-            self._use_synthetic_frames = False
-            self._display_name = (
-                f"{self._base_source_name} (Camera {self._camera_index}, {backend_name})"
-            )
-            LOGGER.info(
-                "Opened camera index %s using backend %s.",
-                self._camera_index,
-                backend_name,
-            )
-            break
-
-        if self._use_synthetic_frames and saw_black_startup_frames:
-            self._status_message = "Camera opened but returned black frames; using synthetic fallback."
-
         self._connected = True
         self._last_frame_monotonic = time.perf_counter()
-        self._refresh_ingest_telemetry()
-        return True
-
-    def disconnect_source(self) -> None:
-        """Release the active source backend."""
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
-        self._capture_backend_name = None
-        self._pending_frame = None
-        self._connected = False
-        self._ingest_telemetry = None
-
-    def is_connected(self) -> bool:
-        """Return whether the source is available for frame reads."""
-        return self._connected
-
-    def get_display_name(self) -> str:
-        """Return the current source label."""
-        return self._display_name
-
-    def get_feed_id(self) -> str:
-        """Return the stable feed identifier."""
-        return self._feed_id
-
-    def create_pipeline_fragment(self) -> str:
-        """Describe the future source-side replacement for the current appsrc bridge."""
-        return "opencv-test-source-placeholder"
-
-    def get_status_message(self) -> str | None:
-        """Return the current non-fatal status message."""
-        return self._status_message
-
-    def read_frame(self) -> MediaFrame | None:
-        """Read the next delivered frame from the camera or synthetic fallback."""
-        if not self._connected:
-            return None
-
-        if self._use_synthetic_frames:
-            return self._generate_synthetic_frame()
-
-        assert self._capture is not None
-        if self._pending_frame is not None:
-            frame = self._pending_frame
-            self._pending_frame = None
-            return self._build_media_frame(frame)
-
-        ok, frame = self._capture.read()
-        if not ok or frame is None:
-            self._switch_to_synthetic_fallback("Camera capture stopped; using synthetic fallback.")
-            return self._generate_synthetic_frame()
-
-        if self._is_black_frame(frame):
-            LOGGER.warning(
-                "Camera index %s via %s returned an all-black frame; switching to synthetic fallback.",
-                self._camera_index,
-                self._capture_backend_name or "unknown backend",
-            )
-            self._switch_to_synthetic_fallback(
-                "Camera opened but returned black frames; using synthetic fallback."
-            )
-            return self._generate_synthetic_frame()
-
-        frame = cv2.resize(frame, (self._frame_width, self._frame_height))
-        return self._build_media_frame(frame)
-
-    def get_frame_size(self) -> tuple[int, int]:
-        """Return the expected frame size."""
-        return self._frame_width, self._frame_height
-
-    def get_nominal_fps(self) -> float:
-        """Return the target frame rate."""
-        return self._target_fps
-
-    def get_ingest_telemetry(self) -> IngestTelemetry | None:
-        """Return OpenCV-reported camera mode vs configured target dimensions."""
-        return self._ingest_telemetry
-
-    def _refresh_ingest_telemetry(self) -> None:
-        if not self._connected:
-            self._ingest_telemetry = None
-            return
-
-        if self._use_synthetic_frames:
-            self._ingest_telemetry = IngestTelemetry(
-                target_width=self._frame_width,
-                target_height=self._frame_height,
-                target_fps=self._target_fps,
-                raw_width=None,
-                raw_height=None,
-                raw_fps=None,
-            )
-            LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
-            return
-
-        assert self._capture is not None
-        try:
-            getter = self._capture.get
-        except AttributeError:
-            getter = None
-        if getter is None:
-            self._ingest_telemetry = IngestTelemetry(
-                target_width=self._frame_width,
-                target_height=self._frame_height,
-                target_fps=self._target_fps,
-                raw_width=None,
-                raw_height=None,
-                raw_fps=None,
-            )
-            LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
-            return
-
-        try:
-            raw_w = int(getter(cv2.CAP_PROP_FRAME_WIDTH))
-            raw_h = int(getter(cv2.CAP_PROP_FRAME_HEIGHT))
-            raw_fps_prop = float(getter(cv2.CAP_PROP_FPS))
-        except (TypeError, ValueError):
-            raw_w, raw_h, raw_fps_prop = 0, 0, 0.0
-        raw_fps = raw_fps_prop if raw_fps_prop > 0.0 else None
         self._ingest_telemetry = IngestTelemetry(
             target_width=self._frame_width,
             target_height=self._frame_height,
             target_fps=self._target_fps,
-            raw_width=raw_w if raw_w > 0 else None,
-            raw_height=raw_h if raw_h > 0 else None,
-            raw_fps=raw_fps,
+            raw_width=None,
+            raw_height=None,
+            raw_fps=None,
         )
-        LOGGER.info("Ingest telemetry: %s", self._ingest_telemetry.summary_line())
+        LOGGER.info("Synthetic source connected: %s", self._ingest_telemetry.summary_line())
+        return True
 
-    def _switch_to_synthetic_fallback(self, status_message: str | None = None) -> None:
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
-        self._capture_backend_name = None
-        self._pending_frame = None
-        self._use_synthetic_frames = True
-        self._display_name = f"{self._base_source_name} (Synthetic Fallback)"
-        self._status_message = status_message
-        self._refresh_ingest_telemetry()
+    def disconnect_source(self) -> None:
+        self._connected = False
+        self._ingest_telemetry = None
 
-    def _get_backend_candidates(self) -> list[tuple[str, int]]:
-        if sys.platform.startswith("win"):
-            candidates: list[tuple[str, int]] = [("CAP_DSHOW", cv2.CAP_DSHOW)]
-            msmf_backend = getattr(cv2, "CAP_MSMF", None)
-            if msmf_backend is not None:
-                candidates.append(("CAP_MSMF", msmf_backend))
-            if not candidates:
-                candidates.append(("CAP_ANY", cv2.CAP_ANY))
-        else:
-            candidates = [("CAP_ANY", cv2.CAP_ANY)]
+    def is_connected(self) -> bool:
+        return self._connected
 
-        deduplicated: list[tuple[str, int]] = []
-        seen_backend_ids: set[int] = set()
-        for backend_name, backend_id in candidates:
-            if backend_id in seen_backend_ids:
-                continue
-            seen_backend_ids.add(backend_id)
-            deduplicated.append((backend_name, backend_id))
-        return deduplicated
+    def get_display_name(self) -> str:
+        return self._display_name
 
-    def _configure_capture(self, capture: cv2.VideoCapture) -> None:
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._frame_width))
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._frame_height))
-        capture.set(cv2.CAP_PROP_FPS, float(self._target_fps))
+    def get_feed_id(self) -> str:
+        return self._feed_id
 
-    def _read_usable_startup_frame(self, capture: cv2.VideoCapture) -> np.ndarray | None:
-        for _ in range(12):
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                time.sleep(0.05)
-                continue
-            if self._is_black_frame(frame):
-                time.sleep(0.05)
-                continue
-            return cv2.resize(frame, (self._frame_width, self._frame_height))
+    def create_pipeline_fragment(self) -> str:
+        return "synthetic-source-placeholder"
+
+    def get_status_message(self) -> str | None:
         return None
 
-    def _is_black_frame(self, frame: np.ndarray) -> bool:
-        return bool(frame.size == 0 or not np.any(frame))
+    def read_frame(self) -> MediaFrame | None:
+        if not self._connected:
+            return None
+        return self._generate_synthetic_frame()
+
+    def get_frame_size(self) -> tuple[int, int]:
+        return self._frame_width, self._frame_height
+
+    def get_nominal_fps(self) -> float:
+        return self._target_fps
+
+    def get_ingest_telemetry(self) -> IngestTelemetry | None:
+        return self._ingest_telemetry
 
     def _generate_synthetic_frame(self) -> MediaFrame:
         target_interval = 1.0 / self._target_fps
@@ -297,25 +111,15 @@ class TestSource(SourceInterface):
         center_x = int((self._frame_width * 0.5) + (self._frame_width * 0.28 * sin(phase)))
         center_y = int((self._frame_height * 0.5) + (self._frame_height * 0.2 * sin(phase * 0.6)))
         cv2.circle(canvas, (center_x, center_y), 36, (0, 255, 255), -1)
-        cv2.rectangle(canvas, (30, 30), (self._frame_width - 30, self._frame_height - 30), (255, 255, 255), 2)
+        cv2.rectangle(
+            canvas, (30, 30), (self._frame_width - 30, self._frame_height - 30), (255, 255, 255), 2
+        )
 
         self._last_frame_monotonic = time.perf_counter()
         return MediaFrame(
             frame_id=self._frame_counter,
             timestamp=timestamp,
             image=canvas,
-            source_name=self._display_name,
-            feed_id=self._feed_id,
-        )
-
-    def _build_media_frame(self, frame: np.ndarray) -> MediaFrame:
-        self._frame_counter += 1
-        timestamp = time.time()
-        self._last_frame_monotonic = time.perf_counter()
-        return MediaFrame(
-            frame_id=self._frame_counter,
-            timestamp=timestamp,
-            image=frame,
             source_name=self._display_name,
             feed_id=self._feed_id,
         )

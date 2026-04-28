@@ -1821,6 +1821,8 @@ Slices delivered:
 
 ## Phase 2.5 – Narrow Source Surface to Production Targets
 
+**Status: ✅ Complete.**
+
 Goal:
 
 - Remove the USB-camera / OpenCV / GStreamer-camera ingest paths that were a proof-of-concept convenience and are not architectural targets. Leave NDI as the production source and a synthetic test source as the dev-time fallback. Phase 3's "one feed" decision is unambiguous after this slice.

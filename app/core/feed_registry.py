@@ -33,9 +33,9 @@ class FeedRegistry:
                     raise RuntimeError(f"Duplicate feed_id in [[feeds]]: {feed.feed_id!r}.")
                 seen.add(feed.feed_id)
                 kind = feed.source_kind.strip().lower()
-                if kind not in {"auto", "ndi"}:
+                if kind not in {"ndi", "synthetic"}:
                     raise RuntimeError(
-                        f"Feed {feed.feed_id!r}: kind must be 'auto' or 'ndi', not {feed.source_kind!r}."
+                        f"Feed {feed.feed_id!r}: kind must be 'ndi' or 'synthetic', not {feed.source_kind!r}."
                     )
                 if kind == "ndi" and not (feed.ndi_name and str(feed.ndi_name).strip()):
                     raise RuntimeError(f"Feed {feed.feed_id!r}: ndi_name is required when kind is 'ndi'.")
@@ -47,7 +47,6 @@ class FeedRegistry:
                     feed_id=settings.default_feed_id,
                     display_name=settings.default_source_name,
                     source_kind=settings.default_source_kind,
-                    camera_index=settings.test_camera_index,
                     ndi_name=settings.ndi_source_name,
                 )
             ]
@@ -83,8 +82,7 @@ def _feed_from_settings_row(row: dict[str, Any]) -> FeedDefinition:
     return FeedDefinition(
         feed_id=str(row["feed_id"]),
         display_name=str(row.get("display_name", row["feed_id"])),
-        source_kind=str(row.get("source_kind", "auto")),
-        camera_index=int(row.get("camera_index", 0)),
+        source_kind=str(row.get("source_kind", "synthetic")),
         ndi_name=row.get("ndi_name"),
         enabled=bool(row.get("enabled", True)),
     )
