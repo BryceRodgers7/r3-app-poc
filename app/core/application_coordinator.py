@@ -14,6 +14,7 @@ from app.core.telemetry import TelemetryHub
 from app.media.feed_runtime import FeedRuntime
 from app.media.source_interface import PipelineMode
 from app.storage.segment_index import SegmentIndex
+from app.storage.segment_replay_store import RecordingSegmentReplayStore
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
@@ -53,6 +54,11 @@ class ApplicationCoordinator:
         # Slice 4.B: shared per-app in-memory segment index. Each feed's
         # PipelineManager writes finalized segments here as they close.
         self.segment_index = segment_index if segment_index is not None else SegmentIndex()
+        # Slice 4.C: replay query layer over the segment index. Read-only
+        # consumers (operator transport methods, future export tooling)
+        # use this rather than touching the index directly so eligibility
+        # checks (§10.4 / §6.6) stay in one place.
+        self.replay_store = RecordingSegmentReplayStore(self.segment_index)
 
         primary_feed = feed_registry.get_primary_feed()
         enabled_feeds = feed_registry.get_enabled_feeds()
