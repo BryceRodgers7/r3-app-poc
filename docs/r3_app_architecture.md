@@ -2050,20 +2050,22 @@ A pragmatic codec choice up front: §5.2 prefers ProRes/DNxHR/MJPEG, with ProRes
 Split into two parts during execution; the data layer was committed cleanly, the operator integration was deferred:
 
 - ✅ **4.C (data layer, committed):** New `RecordingSegmentReplayStore` (`app/storage/segment_replay_store.py`) over the slice 4.B `SegmentIndex`. API: `is_replay_available(recording_state)`, `resolve(feed_id, target_pts_ns, recording_state) -> SegmentReplayLocation | None`, `earliest_pts(feed_id)`, `latest_replayable_pts(feed_id)`, `available_pts_range(feed_id)`. Enforces §10.4 (replay refused when not RECORDING) and §6.6 (in-progress segments excluded). Wired into `ApplicationCoordinator.replay_store`. 13 tests.
-- ⏳ **4.C.tail (deferred):** Operator's `PlaybackController` transport methods (`rewind_10_seconds`, `pause_playback`, `set_playback_rate`, `jump_to_live`) reroute from the legacy `ReplayBuffer.get_frame_ref_at_or_before` to `replay_store.resolve(target_pts)`. Replay rendering switches from "decode JPEG thumbnail and QImage it" to "seek a segment file in `_replay_pipeline` and render via `d3d11videosink`."
+- ✅ **4.C.tail (committed):** Operator transport methods now resolve through the replay store and render decoded segment frames via a new `SegmentDecoder` (`app/media/segment_decoder.py`). The replay clock operates in PTS-nanoseconds, the same domain as `SegmentIndex` / `RecordingSegmentReplayStore`. Decisions taken on the four deferred unknowns:
+  1. **Rendering target = Python QImage path.** `SegmentDecoder` wraps `cv2.VideoCapture` and decodes MJPEG frames in Python, then hands them to `OutputRenderer.show_frame` like any other `MediaFrame`. Sidesteps the 3.A.3 d3d11 binding bug. 720p MJPEG decode lands well under the 40ms tick budget.
+  2. **Replay clock = persistent capture per feed, one-shot decode per tick.** The decoder keeps the segment file open across same-segment ticks and only re-seeks when offsets change. No long-lived second pipeline.
+  3. **Segment boundary handling = manual file switching.** `replay_store.resolve(target_pts)` returns `(segment, offset_in_segment_ns)` per tick; when the resolver hands back a different file path, `SegmentDecoder` releases the old capture and opens the new one.
+  4. **Slow-motion = clock-side rate.** The replay clock advances `_playback_pts_ns` by `elapsed * rate`; the decoder is rate-agnostic. `set_playback_rate(0.0)` collapses into Pause.
 
-**Why 4.C.tail was deferred:** the integration has multiple coupled unknowns that are easier to design with the dead replay-buffer code already removed (i.e. after 4.D):
+  **Scope:** primary feed only. Multi-feed synchronized replay (rewinding all feeds at the same logical timeline position) requires Phase 5's `SessionClock` to bridge per-feed PTS origins; for now secondary tiles keep showing whatever live frame they last received.
 
-1. **Replay rendering target.** Two reasonable options. (a) Decode segment frames in Python and feed through the existing `OutputRenderer.show_frame` QImage path — preserves UX, sidesteps the d3d11videosink window-handle complexity that 3.A.3 hit. (b) Reconfigure `_replay_pipeline`'s `uridecodebin` URI at runtime and bind its `d3d11videosink` to the operator's video widget — proper production path, but reopens the 3.A.3 binding issue.
-2. **Replay clock.** The existing `_on_replay_timer_tick` advances `_playback_timestamp` and looks up frames per tick. With segment files, "look up a frame" becomes "decode at offset" — a one-shot decode per tick is wasteful. A persistent decoder pipeline that we feed seeks into is better but more complex.
-3. **Segment boundary handling.** The replay clock might cross from segment N into N+1. The decoder needs to switch files seamlessly. `splitmuxsrc` (the playback counterpart of `splitmuxsink`) does this; using it means another long-lived pipeline.
-4. **Slow-motion.** `set_playback_rate(0.5)` needs the decoder to play at half-speed, or for the clock to advance at half rate while the decoder seeks frame-accurately.
+  **Behavior:** during an active recording, the operator can Rewind 10s and see segment-file frames play back at 1.0x or fractional rates; Pause freezes on the current frame; Jump-to-Live snaps back. Replay actions are still rejected when `recording_state != RECORDING`.
 
-**Behavior in the working tree until 4.C.tail lands:** the operator's transport buttons drive `ReplayState` cleanly (status bar updates, Replay/Slow/Pause indicators reflect state) but do not produce visible video changes. The operator window keeps showing the most recent live frame. After 4.D removes the legacy code, the transport methods are stubbed to call the new replay store but skip rendering — `_render_all_replay_at_timestamp` is a no-op until 4.C.tail.
+  **Tests delivered:** 7 `SegmentDecoder` unit tests (stub `cv2.VideoCapture` for the logic + one real cv2 round-trip against a generated MJPG-MKV); 13 `PlaybackController` tests covering rewind→render, pause-freeze decode, slow-motion, jump-to-live, the eligibility gate, and replay-buffer-span reporting.
 
-**Tests delivered:** replay-store eligibility queries (in-window, before-earliest, after-latest, while-not-recording, in-progress-segment-excluded); range queries with mixed complete/writing segments.
-
-**Exit criteria for 4.C.tail (when picked up):** Operator can press Rewind 10s during an active recording and see ~10s-old video play back from a segment file. Slow-motion / pause / jump-to-live continue to work.
+  **Known follow-ups (not blocking 4.C.tail):**
+  - Multi-feed replay (Phase 5).
+  - Audio playback during replay (slice 4.F — pairs with audio-in-segments).
+  - Switching to a long-lived `splitmuxsrc` decoder if the per-tick reseek cost ever shows up in profiling on production hardware.
 
 **4.D — Delete the rolling JPEG buffer + cleanup pass — ✅ committed**
 

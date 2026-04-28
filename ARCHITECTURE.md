@@ -12,7 +12,8 @@ The current codebase is a good vertical slice, not a finished foundation. Severa
 - **Feed-oriented** graph: `FeedRegistry`, one `FeedRuntime` per enabled feed, each with its own `PipelineManager`
 - **Two output channels:** `ApplicationCoordinator` wires an **operator** and **program** `PlaybackController`, each with its own `MultiFeedOutputRenderer` and `MainWindow` (`main.py`)
 - **Native segmented recording:** each feed’s `PipelineManager` runs a `tee → valve → videoconvert → jpegenc → splitmuxsink` branch that writes one MKV per segment under `recording/{feed_id}/segment_NNNNN.mkv`; segment metadata (PTS span, frame count, file size) is persisted to a SQLite `segments` table and indexed in-memory by `SegmentIndex` (slices 4.A / 4.B)
-- **Replay query layer:** `RecordingSegmentReplayStore` (slice 4.C) wraps `SegmentIndex` and is the single eligibility / lookup contract used by `PlaybackController`. Actual segment-file replay rendering is deferred to slice **4.C.tail**
+- **Replay query layer:** `RecordingSegmentReplayStore` (slice 4.C) wraps `SegmentIndex` and is the single eligibility / lookup contract used by `PlaybackController`.
+- **Segment-file replay rendering (slice 4.C.tail):** `SegmentDecoder` (a `cv2.VideoCapture` wrapper, `app/media/segment_decoder.py`) decodes MJPEG frames out of the recorded segments and hands them to `OutputRenderer.show_frame`. The operator's replay clock advances in PTS-ns space; primary-feed only for now. Multi-feed synchronized replay needs Phase 5's `SessionClock`
 - Separation between ingest, recording (segments), replay query, UI, and session storage
 - GStreamer-centered `tee`/fan-out direction in each feed’s `PipelineManager`
 - Controllers that track playback mode and transport (not raw button events only)
@@ -227,7 +228,7 @@ Conclusion:
 1. ~~Introduce feed identifiers and a feed registry~~ — `FeedRegistry` and `[[feeds]]` configuration exist
 2. ~~Split ingest ownership into per-feed services~~ — `FeedRuntime` + per-feed `PipelineManager`
 3. ~~Replace the rolling JPEG buffer with native segmented muxers~~ — `splitmuxsink` recording branch + `SegmentIndex` + `RecordingSegmentReplayStore` (slices 4.A / 4.B / 4.C)
-4. **Wire segment-file replay into the operator output (slice 4.C.tail)** — pick a rendering target (single decoder vs per-segment), define the replay clock, and bridge wall-clock timestamps to PTS nanoseconds
+4. ~~Wire segment-file replay into the operator output~~ — `SegmentDecoder` + PTS-ns replay clock (slice 4.C.tail)
 5. Introduce `PlaybackSession` (or factor state out of `PlaybackController`) as an explicit per-output model
 6. ~~Per-window output renderers and a second window~~ — operator + program `MainWindow` and renderers
 7. Extend replay to **true** per-feed (or cross-feed) timeline semantics, not only primary-feed replay where applicable
