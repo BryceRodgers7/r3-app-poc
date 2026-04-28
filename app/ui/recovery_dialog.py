@@ -24,12 +24,13 @@ class RecoveryDialog(QDialog):
 
     Three actions are exposed:
 
-    - **Resume** — disabled in this slice. Continuing the same
-      `session_id` with new segment numbering needs a
-      `SessionManager.adopt_session(...)` API plus segment-counter
-      seeding; that lives in a follow-up. The button is shown so the
-      operator can see it's a deliberate omission, with a tooltip
-      explaining the workaround.
+    - **Resume** — continue using the same `session_id` with new
+      segment numbering, transitioning the manifest back to `CREATED`
+      so the operator can hit Start Game Recording. Only enabled when
+      `is_resume_eligible=True`, which the bootstrap sets on the most
+      recent dirty session only — resuming two crashes at once isn't
+      meaningful, so older dirty sessions are limited to Finalize /
+      Discard.
     - **End and finalize** — closes the session into `FINALIZED`. The
       surviving segments stay on disk for the post-session processor
       (Phase 8) to handle.
@@ -42,9 +43,11 @@ class RecoveryDialog(QDialog):
         info: DirtySessionInfo,
         *,
         parent: QWidget | None = None,
+        is_resume_eligible: bool = False,
     ) -> None:
         super().__init__(parent)
         self._info = info
+        self._is_resume_eligible = is_resume_eligible
         self._chosen_action: RecoveryAction | None = None
         self.setWindowTitle("Unfinished session detected")
         # Remove the close button so the operator must use one of the
@@ -77,17 +80,24 @@ class RecoveryDialog(QDialog):
         layout.addWidget(body)
 
         buttons = QDialogButtonBox(self)
-        # Resume: deliberately disabled in this slice.
         self._resume_button = QPushButton("Resume", self)
-        self._resume_button.setEnabled(False)
-        self._resume_button.setToolTip(
-            "Resume is not yet implemented. Pick End and finalize "
-            "(keep the recording) or Discard (drop the session)."
-        )
+        self._resume_button.setEnabled(self._is_resume_eligible)
+        if self._is_resume_eligible:
+            self._resume_button.setToolTip(
+                "Continue this session with new segment numbering."
+            )
+            self._resume_button.setDefault(True)
+        else:
+            self._resume_button.setToolTip(
+                "Resume is only available on the most recent unfinished "
+                "session. Pick End and finalize or Discard for older ones."
+            )
+        self._resume_button.clicked.connect(self._on_resume)
         buttons.addButton(self._resume_button, QDialogButtonBox.ButtonRole.AcceptRole)
 
         finalize_button = QPushButton("End and finalize", self)
-        finalize_button.setDefault(True)
+        if not self._is_resume_eligible:
+            finalize_button.setDefault(True)
         finalize_button.clicked.connect(self._on_finalize)
         buttons.addButton(finalize_button, QDialogButtonBox.ButtonRole.AcceptRole)
 
@@ -100,6 +110,10 @@ class RecoveryDialog(QDialog):
     def chosen_action(self) -> RecoveryAction | None:
         """Return the action the operator selected, or `None` if not yet chosen."""
         return self._chosen_action
+
+    def _on_resume(self) -> None:
+        self._chosen_action = RecoveryAction.RESUME
+        self.accept()
 
     def _on_finalize(self) -> None:
         self._chosen_action = RecoveryAction.FINALIZE

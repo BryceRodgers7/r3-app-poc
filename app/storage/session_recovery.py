@@ -455,16 +455,13 @@ def resolve_dirty_session(
     and clears `finalized_at` — the segment files stay on disk for §6.8
     retention rules to handle later.
 
-    `RESUME` raises `NotImplementedError` for this slice. Continuing the
-    same `session_id` with new segment numbering needs a
-    `SessionManager.adopt_session(...)` API plus segment-counter
-    seeding, which lives in a follow-up slice. The dialog disables the
-    Resume button so the operator never reaches this branch.
+    `RESUME` writes the same `state = "created"` payload as `DISCARD` —
+    the difference is in the bootstrap, which adopts the resumed session
+    via `SessionManager.adopt_session` instead of creating a fresh one.
+    Driving the manifest forward here keeps `session.json` consistent
+    with what the state machine will write seconds later when
+    `adopt_session` runs the `DIRTY → CREATED` transition.
     """
-    if action is RecoveryAction.RESUME:
-        raise NotImplementedError(
-            "Resume is not yet implemented; choose FINALIZE or DISCARD."
-        )
     session_dir = sessions_root / session_id
     manifest_path = session_dir / SESSION_MANIFEST_FILENAME
     if not manifest_path.exists():
@@ -476,10 +473,10 @@ def resolve_dirty_session(
     if action is RecoveryAction.FINALIZE:
         data["state"] = "finalized"
         data["finalized_at"] = datetime.now(timezone.utc).isoformat()
-    elif action is RecoveryAction.DISCARD:
+    elif action in (RecoveryAction.DISCARD, RecoveryAction.RESUME):
         data["state"] = "created"
         data["finalized_at"] = None
-    else:  # pragma: no cover — covered by the RESUME guard above
+    else:  # pragma: no cover — defensive
         raise ValueError(f"Unhandled action {action!r}")
     _atomic_write_json(manifest_path, data)
     LOGGER.info(
@@ -488,6 +485,50 @@ def resolve_dirty_session(
         session_id,
         data["state"],
     )
+
+
+def find_next_fragment_index(
+    recording_dir: Path,
+    *,
+    db: MetadataDb | None = None,
+    session_id: str | None = None,
+    feed_id: str | None = None,
+) -> int:
+    """Return the smallest fragment_index a new segment file should use.
+
+    Walks `recording_dir` for `segment_NNNNN.mkv` files and returns
+    `max(NNNNN) + 1` (or 0 if none). When `db`/`session_id`/`feed_id`
+    are all provided, also consults the SQLite `segments` table and
+    takes `max(disk_max, db_max) + 1` — this covers the §11.4 Resume
+    edge case where the recovery scan quarantined the tail segment of
+    a crashed recording: the file is gone from disk but the DB row is
+    still there (state=`quarantined`), so disk-only would reuse the
+    index and trip the `UNIQUE(session_id, feed_id, fragment_index)`
+    constraint when the resumed recording finalizes its first new
+    segment.
+    """
+    highest = -1
+    if recording_dir.exists():
+        for child in recording_dir.iterdir():
+            if not child.is_file():
+                continue
+            match = _SEGMENT_FILENAME_RE.match(child.name)
+            if match is None:
+                continue
+            index = int(match.group(1))
+            if index > highest:
+                highest = index
+    if db is not None and session_id is not None and feed_id is not None:
+        try:
+            for seg in db.segments_for_feed(session_id, feed_id):
+                if seg.fragment_index > highest:
+                    highest = seg.fragment_index
+        except Exception:
+            LOGGER.exception(
+                "find_next_fragment_index: db.segments_for_feed raised; "
+                "falling back to disk-only result"
+            )
+    return highest + 1
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

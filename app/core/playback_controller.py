@@ -23,9 +23,12 @@ from app.storage.segment_replay_store import RecordingSegmentReplayStore
 
 LOGGER = logging.getLogger(__name__)
 
-# How far back the operator's "Rewind 10 seconds" button jumps. Matches
-# the §19 instant-replay shortcut.
-_REWIND_SHORTCUT_NS = 10 * 1_000_000_000
+# Instant-replay shortcuts from §19. The 10s button is the primary
+# transport; the 30s button is mainly for testing the §11.4 Resume
+# flow (lets the operator seek into pre-crash segments without holding
+# down the rewind button).
+_REWIND_10S_NS = 10 * 1_000_000_000
+_REWIND_30S_NS = 30 * 1_000_000_000
 
 
 class PlaybackController:
@@ -155,6 +158,18 @@ class PlaybackController:
 
     def rewind_10_seconds(self) -> None:
         """Move the viewed output back 10 seconds in the segment timeline."""
+        self._rewind_by_ns(_REWIND_10S_NS)
+
+    def rewind_30_seconds(self) -> None:
+        """Move the viewed output back 30 seconds in the segment timeline.
+
+        Same machinery as `rewind_10_seconds`; just a different anchor.
+        Useful for stepping into pre-crash segments after a §11.4 Resume.
+        """
+        self._rewind_by_ns(_REWIND_30S_NS)
+
+    def _rewind_by_ns(self, rewind_ns: int) -> None:
+        """Common rewind implementation parameterized by jump distance."""
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -162,7 +177,7 @@ class PlaybackController:
             self._emit_state("Replay unavailable: start game recording first.")
             return
         with self._lock:
-            target_pts_ns = self._resolve_rewind_target_locked(_REWIND_SHORTCUT_NS)
+            target_pts_ns = self._resolve_rewind_target_locked(rewind_ns)
             if target_pts_ns is None:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()

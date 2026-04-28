@@ -162,12 +162,23 @@ class PipelineManager:
         self._preview_output.show_placeholder_message("Starting live preview...")
         self._set_branch_enabled("preview", True)
 
-    def enable_file_recording(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
+    def enable_file_recording(
+        self,
+        session_paths: SessionPaths,
+        feed_id: str | None = None,
+        *,
+        start_fragment_index: int = 0,
+    ) -> None:
         """Open the record branch's valve so segmented recording starts (Phase 4.A).
 
         The actual writing is done by `splitmuxsink` downstream of the
         valve; we just need to let buffers through and tell the
         `format-location` callback which session/feed to write under.
+
+        `start_fragment_index` lets the §11.4 Resume path seed the
+        counter past the highest pre-crash segment file so the resumed
+        recording doesn't overwrite or reuse a filename. Default 0
+        (fresh session) preserves the original behavior.
         """
         if self._splitmuxsink is None:
             LOGGER.warning(
@@ -178,10 +189,12 @@ class PipelineManager:
         self._recording_session_paths = session_paths
         self._recording_feed_id = feed_id or self._source.get_feed_id()
         # Reset our private segment counter so each recording session
-        # starts at `segment_00000.mkv` regardless of splitmuxsink's
-        # internal fragment_id (which may already be non-zero from
-        # startup state transitions).
-        self._recording_segment_counter = 0
+        # starts at the requested fragment index. Splitmuxsink's
+        # internal `fragment_id` is unreliable (it increments during
+        # startup state transitions before any buffer is written), so
+        # we always pick the filename ourselves via the
+        # `format-location` callback.
+        self._recording_segment_counter = max(0, int(start_fragment_index))
         feed_paths = session_paths.get_feed_paths(self._recording_feed_id)
         feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
         self._set_branch_enabled("record", True)

@@ -99,6 +99,7 @@ class MainWindow(QMainWindow):
         if self.controls_widget is not None:
             self.controls_widget.pause_requested.connect(self._controller.pause_playback)
             self.controls_widget.rewind_requested.connect(self._controller.rewind_10_seconds)
+            self.controls_widget.rewind_30_requested.connect(self._controller.rewind_30_seconds)
             self.controls_widget.half_speed_requested.connect(lambda: self._controller.set_playback_rate(0.5))
             self.controls_widget.quarter_speed_requested.connect(
                 lambda: self._controller.set_playback_rate(0.25)

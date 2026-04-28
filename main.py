@@ -46,7 +46,7 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
     # operator resolve each one before any new session is created. Runs
     # before coordinator.initialize() so the new-session creation path
     # never has to think about dirty manifests on disk.
-    _run_startup_recovery_flow(settings, metadata_db)
+    resume_session_id = _run_startup_recovery_flow(settings, metadata_db)
 
     operator_output = MultiFeedOutputRenderer()
     program_output = MultiFeedOutputRenderer()
@@ -77,20 +77,28 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
         show_controls=False,
         program_live_only=True,
     )
-    coordinator.initialize()
+    coordinator.initialize(resume_session_id=resume_session_id)
     qt_app.aboutToQuit.connect(coordinator.shutdown)
     return qt_app, coordinator, [operator_window, program_window]
 
 
-def _run_startup_recovery_flow(settings: AppSettings, db: MetadataDb) -> None:
+def _run_startup_recovery_flow(
+    settings: AppSettings, db: MetadataDb
+) -> str | None:
     """Run the §11.4 startup scan + recovery prompt before MainWindow opens.
 
     1. `run_startup_scan` marks unfinished sessions DIRTY and quarantines
        any corrupt segments.
-    2. `find_dirty_sessions` lists everything still in DIRTY (newly marked
-       *plus* anything left over from a prior unresolved run).
-    3. For each, show a modal `RecoveryDialog`. The operator's choice is
-       written back to the manifest via `resolve_dirty_session`.
+    2. `find_dirty_sessions` lists everything still in DIRTY.
+    3. For each, show a modal `RecoveryDialog`. The most recent dirty
+       session gets Resume enabled; older ones don't (resuming two
+       crashes at once isn't meaningful and complicates the UX).
+    4. If the operator picks Resume, the chosen `session_id` is
+       returned so the bootstrap can pass it to
+       `coordinator.initialize(resume_session_id=...)`. Only the
+       *first* Resume is honored; subsequent Resumes (which the dialog
+       wouldn't normally offer anyway) are downgraded to FINALIZE for
+       safety.
 
     Per §11.4 the prompt blocks all media UI; nothing has been shown
     yet at this point, so simply running modal dialogs serially before
@@ -100,28 +108,28 @@ def _run_startup_recovery_flow(settings: AppSettings, db: MetadataDb) -> None:
     run_startup_scan(sessions_root, db)
     dirty = find_dirty_sessions(sessions_root)
     if not dirty:
-        return
+        return None
+    # Resume is offered only on the most recent dirty session
+    # (`find_dirty_sessions` returns directory-sorted; the last entry
+    # is the highest session_id and therefore the most recent).
+    most_recent_id = dirty[-1].session_id
+    resume_session_id: str | None = None
     for info in dirty:
-        action = _prompt_for_recovery(info)
-        try:
-            resolve_dirty_session(sessions_root, info.session_id, action)
-        except NotImplementedError:
-            # Defensive: the dialog disables Resume, so we should never
-            # land here. Fall back to FINALIZE so the app can keep going
-            # rather than crashing on launch.
-            logging.getLogger(__name__).warning(
-                "recovery: Resume requested for %s but unsupported; "
-                "falling back to FINALIZE.",
-                info.session_id,
-            )
-            resolve_dirty_session(
-                sessions_root, info.session_id, RecoveryAction.FINALIZE
-            )
+        is_resume_eligible = (
+            info.session_id == most_recent_id and resume_session_id is None
+        )
+        action = _prompt_for_recovery(info, is_resume_eligible=is_resume_eligible)
+        if action is RecoveryAction.RESUME and resume_session_id is None:
+            resume_session_id = info.session_id
+        resolve_dirty_session(sessions_root, info.session_id, action)
+    return resume_session_id
 
 
-def _prompt_for_recovery(info: DirtySessionInfo) -> RecoveryAction:
+def _prompt_for_recovery(
+    info: DirtySessionInfo, *, is_resume_eligible: bool
+) -> RecoveryAction:
     """Run the modal recovery dialog and return the operator's choice."""
-    dialog = RecoveryDialog(info)
+    dialog = RecoveryDialog(info, is_resume_eligible=is_resume_eligible)
     dialog.exec()
     chosen = dialog.chosen_action()
     # `RecoveryDialog` overrides `reject()` to no-op until a button is

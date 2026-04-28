@@ -42,6 +42,44 @@ class SessionManager:
         )
         return session_paths
 
+    def adopt_session(self, session_id: str) -> SessionPaths:
+        """Adopt an existing on-disk session as the active one (§11.4 Resume).
+
+        Used when the operator picks **Resume** in the recovery prompt.
+        The session must already exist on disk (its `session.json`,
+        recording subtree, and SQLite `sessions` row are all expected to
+        be present). Unlike `start_new_session`, this:
+
+        - does not allocate a new `session_id`
+        - does not create directories
+        - does not insert a `sessions` row
+        - starts the state machine at `DIRTY` (matching the on-disk state
+          left by `mark_dirty_sessions`) and immediately transitions to
+          `CREATED` so the operator can hit Start Game Recording and
+          drive `CREATED → RECORDING` like a fresh session.
+
+        Returns the same `SessionPaths` shape as `start_new_session`,
+        pointing at the existing directory tree.
+        """
+        from app.core.session_state import SessionState  # local import — avoids circular at module import time
+
+        session_paths = self._file_manager.session_paths_for_existing(session_id)
+        manifest = SessionManifest(session_paths.root_dir / SESSION_MANIFEST_FILENAME)
+        existing = manifest.read() or {}
+        created_at = existing.get("created_at") or datetime.now(timezone.utc).isoformat()
+        self._active_session_paths = session_paths
+        self._active_session_state = make_session_state_machine(
+            session_id=session_id,
+            manifest=manifest,
+            created_at=str(created_at),
+            initial_state=SessionState.DIRTY,
+        )
+        # DIRTY → CREATED so the rest of the app (which expects to drive
+        # CREATED → RECORDING via toggle_long_session_recording) sees a
+        # familiar starting state.
+        self._active_session_state.transition_to(SessionState.CREATED)
+        return session_paths
+
     def get_active_session_paths(self) -> SessionPaths | None:
         """Return the current active session, if one exists."""
         return self._active_session_paths

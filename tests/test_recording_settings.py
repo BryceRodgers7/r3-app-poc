@@ -119,6 +119,27 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         path = PipelineManager._on_splitmuxsink_format_location(pm, None, 2)
         self.assertTrue(path.endswith("_unrouted_segment_00002.mkv"))
 
+    def test_format_location_honors_seeded_counter_for_resume(self) -> None:
+        # §11.4 Resume: counter starts at the next safe index, e.g. 5.
+        from app.media.pipeline_manager import PipelineManager
+        with TemporaryDirectory() as tmp:
+            session = self._session_paths(Path(tmp))
+            pm = self._build_pm_stub()
+            pm._recording_session_paths = session
+            pm._recording_feed_id = "ndi_main"
+            pm._recording_segment_counter = 5  # post-resume seeded value
+            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
+            self.assertTrue(
+                path.endswith("recording/ndi_main/segment_00005.mkv")
+                or path.endswith("recording\\ndi_main\\segment_00005.mkv")
+            )
+            # Subsequent rotation increments past the seed.
+            path2 = PipelineManager._on_splitmuxsink_format_location(pm, None, 1)
+            self.assertTrue(
+                path2.endswith("recording/ndi_main/segment_00006.mkv")
+                or path2.endswith("recording\\ndi_main\\segment_00006.mkv")
+            )
+
 
 class RecordingCodecValidationTests(unittest.TestCase):
     def test_mjpeg_mkv_accepted(self) -> None:

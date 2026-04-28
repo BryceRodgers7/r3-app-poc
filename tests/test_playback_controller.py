@@ -257,6 +257,17 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertTrue(self.renderer.frames)
         self.assertEqual(self.renderer.frames[-1].feed_id, self.feed.feed_id)
 
+    def test_rewind_30_seconds_seeks_further_back(self) -> None:
+        self._force_recording_state()
+        self.controller.rewind_30_seconds()
+        self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
+        # Latest replayable PTS = 20s; rewind 30s clamps at earliest_pts=0.
+        # 0s falls in segment 0 (start_pts=0s, end_pts=4s), offset 0s.
+        self.assertTrue(self.stub_decoder.decode_calls)
+        rendered_path, rendered_offset = self.stub_decoder.decode_calls[-1]
+        self.assertIn("segment_00000.mkv", rendered_path)
+        self.assertEqual(rendered_offset, 0)
+
     def test_pause_freezes_replay_clock_and_renders_freeze_frame(self) -> None:
         self._force_recording_state()
         self.controller.rewind_10_seconds()

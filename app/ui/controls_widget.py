@@ -11,6 +11,7 @@ class ControlsWidget(QWidget):
 
     pause_requested = Signal()
     rewind_requested = Signal()
+    rewind_30_requested = Signal()
     live_requested = Signal()
     half_speed_requested = Signal()
     quarter_speed_requested = Signal()
@@ -21,6 +22,7 @@ class ControlsWidget(QWidget):
         super().__init__(parent)
         self.pause_button = QPushButton("Pause", self)
         self.rewind_button = QPushButton("Rewind 10s", self)
+        self.rewind_30_button = QPushButton("Rewind 30s", self)
         self.half_speed_button = QPushButton("Slow 1/2x", self)
         self.quarter_speed_button = QPushButton("Slow 1/4x", self)
         self.live_button = QPushButton("Jump to Live", self)
@@ -30,6 +32,7 @@ class ControlsWidget(QWidget):
         for button in (
             self.pause_button,
             self.rewind_button,
+            self.rewind_30_button,
             self.half_speed_button,
             self.quarter_speed_button,
             self.live_button,
@@ -44,6 +47,7 @@ class ControlsWidget(QWidget):
         layout.setSpacing(12)
         layout.addWidget(self.pause_button)
         layout.addWidget(self.rewind_button)
+        layout.addWidget(self.rewind_30_button)
         layout.addWidget(self.half_speed_button)
         layout.addWidget(self.quarter_speed_button)
         layout.addWidget(self.live_button)
@@ -52,6 +56,7 @@ class ControlsWidget(QWidget):
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
         self.rewind_button.clicked.connect(self.rewind_requested.emit)
+        self.rewind_30_button.clicked.connect(self.rewind_30_requested.emit)
         self.half_speed_button.clicked.connect(self.half_speed_requested.emit)
         self.quarter_speed_button.clicked.connect(self.quarter_speed_requested.emit)
         self.live_button.clicked.connect(self.live_requested.emit)

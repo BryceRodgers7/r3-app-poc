@@ -25,6 +25,10 @@ from app.media.preview_output import PreviewOutput
 from app.media.recording_manager import RecordingManager
 from app.media.source_factory import build_source_for_feed
 from app.storage.session_manager import SessionManager
+from app.storage.session_recovery import (
+    find_next_fragment_index,
+    load_segment_index_for_session,
+)
 
 
 class ApplicationCoordinator:
@@ -148,8 +152,26 @@ class ApplicationCoordinator:
             self.operator_controller.signals.status_message.emit("Game recording stopped.")
             return
         recording_sm.transition_to(RecordingState.STARTING_RECORDING)
+        db = self._session_manager.get_metadata_db()
         for runtime in self._feed_runtimes.values():
-            runtime.pipeline_manager.enable_file_recording(session_paths, feed_id=runtime.feed.feed_id)
+            # Always seed past the high-water mark. For a new session
+            # this starts at 0; for a resumed session it starts past
+            # pre-crash files (and any quarantined-but-DB-present rows
+            # whose fragment_index would otherwise collide); for any
+            # Stop/Start cycle, it starts past whatever the previous
+            # cycle wrote, so segment files never collide.
+            feed_paths = session_paths.get_feed_paths(runtime.feed.feed_id)
+            start_index = find_next_fragment_index(
+                feed_paths.recording_dir,
+                db=db,
+                session_id=session_paths.session_id,
+                feed_id=runtime.feed.feed_id,
+            )
+            runtime.pipeline_manager.enable_file_recording(
+                session_paths,
+                feed_id=runtime.feed.feed_id,
+                start_fragment_index=start_index,
+            )
         recording_sm.transition_to(RecordingState.RECORDING)
         if session_sm is not None and session_sm.state == SessionState.CREATED:
             session_sm.transition_to(SessionState.RECORDING)
@@ -176,7 +198,7 @@ class ApplicationCoordinator:
             "Short-clip advance is paused while §6.5 segment cadence is splitmuxsink-driven."
         )
 
-    def initialize(self) -> None:
+    def initialize(self, *, resume_session_id: str | None = None) -> None:
         """Start storage, ingest, and playback sessions.
 
         Crash-recovery scan + §11.4 dirty-session prompt run *before*
@@ -184,10 +206,24 @@ class ApplicationCoordinator:
         resolve each dirty session before a new one is created. By the
         time `initialize` runs, all manifests on disk are in
         `finalized` / `created` / `archived` states.
+
+        `resume_session_id`: when set, the coordinator adopts the named
+        session instead of creating a new one. The §11.4 Resume action
+        wires this through. The pre-crash `SegmentIndex` is rebuilt
+        from SQLite so replay queries can address surviving segments,
+        and each feed's `PipelineManager` is told to start its segment
+        counter past the highest existing `segment_NNNNN.mkv` on disk
+        so resumed recording doesn't collide.
         """
         if self._session_started:
             return
-        session_paths = self._session_manager.start_new_session(self.feed_registry.build_session_label())
+        if resume_session_id is not None:
+            session_paths = self._session_manager.adopt_session(resume_session_id)
+            self._populate_segment_index_from_resume(session_paths.session_id)
+        else:
+            session_paths = self._session_manager.start_new_session(
+                self.feed_registry.build_session_label()
+            )
         default_health_log().open(
             session_paths.root_dir / "logs" / "health_events.jsonl",
             session_paths.session_id,
@@ -199,6 +235,21 @@ class ApplicationCoordinator:
         self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
+
+    def _populate_segment_index_from_resume(self, session_id: str) -> None:
+        """Seed the in-memory `SegmentIndex` from SQLite for an adopted session.
+
+        Without this, replay queries against the resumed session would
+        only see segments produced *after* resume — pre-crash segments
+        would be invisible until they were re-added by some other path.
+        Loads `complete` and `dirty` rows; quarantined / corrupt rows
+        stay excluded.
+        """
+        db = self._session_manager.get_metadata_db()
+        loaded = load_segment_index_for_session(db, session_id)
+        for feed_id in loaded.feed_ids():
+            for segment in loaded.all_for_feed(feed_id):
+                self.segment_index.add(segment)
 
     def shutdown(self) -> None:
         """Stop playback sessions and feed runtimes."""

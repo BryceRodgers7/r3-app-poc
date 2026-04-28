@@ -21,6 +21,7 @@ from app.storage.session_recovery import (
     RecoveryAction,
     SegmentValidationResult,
     find_dirty_sessions,
+    find_next_fragment_index,
     load_segment_index_for_session,
     mark_dirty_sessions,
     resolve_dirty_session,
@@ -431,11 +432,16 @@ class ResolveDirtySessionTests(unittest.TestCase):
         self.assertEqual(manifest["state"], "created")
         self.assertIsNone(manifest["finalized_at"])
 
-    def test_resume_raises_not_implemented(self) -> None:
-        with self.assertRaises(NotImplementedError):
-            resolve_dirty_session(
-                self.sessions_root, "session_001", RecoveryAction.RESUME
-            )
+    def test_resume_writes_created_state_like_discard(self) -> None:
+        # §11.4 Resume normalizes the manifest to `created` so the
+        # downstream `SessionManager.adopt_session` call sees a
+        # consistent on-disk state. The bootstrap is what actually
+        # adopts the session; resolve_dirty_session itself just writes
+        # the manifest.
+        resolve_dirty_session(self.sessions_root, "session_001", RecoveryAction.RESUME)
+        manifest = _read_manifest(self.sessions_root / "session_001")
+        self.assertEqual(manifest["state"], "created")
+        self.assertIsNone(manifest["finalized_at"])
 
     def test_missing_manifest_raises_file_not_found(self) -> None:
         with self.assertRaises(FileNotFoundError):
@@ -509,6 +515,112 @@ class RunStartupScanTests(unittest.TestCase):
         )
         report = run_startup_scan(self.sessions_root, self.db)
         self.assertEqual(report.dirty_sessions_marked, [])
+
+
+class FindNextFragmentIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+        self.feed_dir = self.tmp / "recording" / "ndi_main"
+        self.feed_dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._temp_dir.cleanup()
+
+    def test_empty_dir_returns_zero(self) -> None:
+        self.assertEqual(find_next_fragment_index(self.feed_dir), 0)
+
+    def test_missing_dir_returns_zero(self) -> None:
+        self.assertEqual(
+            find_next_fragment_index(self.tmp / "does_not_exist"), 0
+        )
+
+    def test_returns_max_plus_one_from_disk(self) -> None:
+        for i in (0, 1, 2):
+            (self.feed_dir / f"segment_{i:05d}.mkv").write_bytes(b"\0")
+        self.assertEqual(find_next_fragment_index(self.feed_dir), 3)
+
+    def test_skips_non_segment_files(self) -> None:
+        (self.feed_dir / "segment_00000.mkv").write_bytes(b"\0")
+        (self.feed_dir / "stray.txt").write_bytes(b"\0")
+        (self.feed_dir / "segment_99999.mkv.tmp").write_bytes(b"\0")
+        self.assertEqual(find_next_fragment_index(self.feed_dir), 1)
+
+    def test_db_consult_picks_max_when_higher(self) -> None:
+        # Disk has 0, 1, 2 but DB has a quarantined row at 5.
+        for i in (0, 1, 2):
+            (self.feed_dir / f"segment_{i:05d}.mkv").write_bytes(b"\0")
+        db = MetadataDb(self.tmp / "metadata.db")
+        try:
+            db.create_session(
+                session_id="session_001",
+                source_name="Test",
+                started_at="2026-04-28T00:00:00+00:00",
+            )
+            db.insert_segment(
+                _segment(file_path="/q/5.mkv", fragment_index=5, state="quarantined")
+            )
+            self.assertEqual(
+                find_next_fragment_index(
+                    self.feed_dir,
+                    db=db,
+                    session_id="session_001",
+                    feed_id="ndi_main",
+                ),
+                6,
+            )
+        finally:
+            db.close()
+
+
+class SessionManagerAdoptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+
+    def tearDown(self) -> None:
+        self._temp_dir.cleanup()
+
+    def test_adopt_session_loads_existing_paths_and_transitions_to_created(self) -> None:
+        from app.config.settings import AppSettings
+        from app.core.session_state import SessionState
+        from app.storage.file_manager import FileManager
+        from app.storage.session_manager import SessionManager
+
+        # Build a settings object pointed at the tmp dir.
+        settings = AppSettings(base_data_dir=self.tmp)
+        file_manager = FileManager(settings)
+        # Pre-create the session on disk with a DIRTY manifest.
+        session_dir = settings.sessions_root / "session_001"
+        _write_manifest(
+            session_dir,
+            session_id="session_001",
+            state="dirty",
+            finalized_at=None,
+        )
+        for sub in ("recording", "rolling", "clips"):
+            (session_dir / sub).mkdir(parents=True, exist_ok=True)
+        db = MetadataDb(settings.metadata_db_path)
+        try:
+            db.create_session(
+                session_id="session_001",
+                source_name="Resume Test",
+                started_at="2026-04-28T00:00:00+00:00",
+            )
+            sm = SessionManager(file_manager, db)
+            paths = sm.adopt_session("session_001")
+            self.assertEqual(paths.session_id, "session_001")
+            self.assertEqual(paths.root_dir, session_dir)
+            # State machine should have driven DIRTY → CREATED.
+            state = sm.get_active_session_state()
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.state, SessionState.CREATED)
+            # Manifest reflects the transition.
+            manifest = _read_manifest(session_dir)
+            self.assertEqual(manifest["state"], "created")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

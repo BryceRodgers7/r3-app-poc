@@ -106,8 +106,15 @@ def make_session_state_machine(
     session_id: str,
     manifest: SessionManifest,
     created_at: str | None = None,
+    initial_state: SessionState = SessionState.CREATED,
 ) -> StateMachine[SessionState]:
-    """Build a `StateMachine[SessionState]` that persists on every transition."""
+    """Build a `StateMachine[SessionState]` that persists on every transition.
+
+    `initial_state` defaults to `CREATED` (the brand-new-session path).
+    The §11.4 Resume action passes `DIRTY` so the machine starts at the
+    on-disk state and the operator can drive `DIRTY → CREATED → RECORDING`
+    through the normal transition table.
+    """
 
     state_created_at = created_at or datetime.now(timezone.utc).isoformat()
     finalized_holder: dict[str, str | None] = {"value": None}
@@ -144,12 +151,12 @@ def make_session_state_machine(
             )
 
     sm = StateMachine[SessionState](
-        initial=SessionState.CREATED,
+        initial=initial_state,
         transitions=_SESSION_TRANSITIONS,
         name=f"session_state[{session_id}]",
         on_enter=on_enter,
     )
     # Persist the initial state immediately so a crash before the first
     # transition still leaves a manifest behind.
-    persist(SessionState.CREATED)
+    persist(initial_state)
     return sm
