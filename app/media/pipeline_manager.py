@@ -120,6 +120,12 @@ class PipelineManager:
         self._splitmuxsink: Any | None = None
         self._recording_session_paths: SessionPaths | None = None
         self._recording_feed_id: str | None = None
+        # Per-recording-session segment counter. Reset to 0 each time the
+        # operator clicks Start, so segments land as
+        # segment_00000.mkv, segment_00001.mkv, …. Splitmuxsink's own
+        # `fragment_id` parameter is unreliable for this — it increments
+        # during startup state transitions before any buffer is written.
+        self._recording_segment_counter: int = 0
         self._recording_segment_duration_seconds: float = max(
             0.5, float(recording_segment_duration_seconds)
         )
@@ -166,6 +172,11 @@ class PipelineManager:
             return
         self._recording_session_paths = session_paths
         self._recording_feed_id = feed_id or self._source.get_feed_id()
+        # Reset our private segment counter so each recording session
+        # starts at `segment_00000.mkv` regardless of splitmuxsink's
+        # internal fragment_id (which may already be non-zero from
+        # startup state transitions).
+        self._recording_segment_counter = 0
         feed_paths = session_paths.get_feed_paths(self._recording_feed_id)
         feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
         self._set_branch_enabled("record", True)
@@ -850,6 +861,20 @@ class PipelineManager:
         queue = self._make_element("queue", f"{branch_name}_queue")
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
+        # Force the input to jpegenc to be BT.601 I420. JPEG has no
+        # standardized colorimetry tag; players decode assuming BT.601.
+        # If we let the BT.709 source flow straight to jpegenc, players
+        # will use the wrong matrix to convert YUV→RGB and colors will
+        # shift visibly. Pinning caps here pushes videoconvert to do the
+        # 709→601 conversion before encoding, so the JPEG content
+        # actually matches what decoders expect.
+        encode_caps = self._make_element("capsfilter", f"{branch_name}_encode_caps")
+        encode_caps.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                "video/x-raw,format=I420,colorimetry=bt601"
+            ),
+        )
         jpegenc = self._make_element("jpegenc", f"{branch_name}_jpegenc")
         splitmuxsink = self._make_element("splitmuxsink", f"{branch_name}_splitmuxsink")
 
@@ -863,13 +888,14 @@ class PipelineManager:
         self._set_property_if_supported(splitmuxsink, "async-finalize", True)
         splitmuxsink.connect("format-location", self._on_splitmuxsink_format_location)
 
-        for element in (queue, valve, convert, jpegenc, splitmuxsink):
+        for element in (queue, valve, convert, encode_caps, jpegenc, splitmuxsink):
             self._pipeline.add(element)
 
         if not (
             queue.link(valve)
             and valve.link(convert)
-            and convert.link(jpegenc)
+            and convert.link(encode_caps)
+            and encode_caps.link(jpegenc)
             and jpegenc.link(splitmuxsink)
         ):
             raise RuntimeError(f"Failed to link the {branch_name} branch.")
@@ -891,7 +917,7 @@ class PipelineManager:
                 None,
             )
 
-        for element in (queue, valve, convert, jpegenc, splitmuxsink):
+        for element in (queue, valve, convert, encode_caps, jpegenc, splitmuxsink):
             element.sync_state_with_parent()
 
         self._branch_valves[branch_name] = valve
@@ -900,12 +926,18 @@ class PipelineManager:
     def _on_splitmuxsink_format_location(self, _splitmuxsink: Any, fragment_id: int) -> str:
         """Pick a per-segment filename based on the active recording session.
 
-        `splitmuxsink` calls this whenever it needs to open a new segment
-        file. Until `enable_file_recording` stores a session, the valve
-        upstream is closed and no buffers reach `splitmuxsink` — so this
-        callback is not invoked. If it ever fires without an active
-        session (defensive), fall back to a temp path so the caller doesn't
-        crash.
+        Uses our own `_recording_segment_counter` rather than splitmuxsink's
+        `fragment_id` argument — splitmuxsink's counter increments during
+        pipeline startup events (caps propagation, muxer reset, state
+        changes) before any buffer is actually written, which would make
+        the first real segment land as `segment_00003.mkv` or similar.
+        Resetting our counter on each `enable_file_recording` call keeps
+        filenames predictable: every new recording session starts at
+        `segment_00000.mkv`.
+
+        If the callback fires without an active session (defensive — the
+        upstream valve should be closed in that case), fall back to a temp
+        path so the caller doesn't crash.
         """
         if self._recording_session_paths is None or self._recording_feed_id is None:
             tmp = Path(f"./_unrouted_segment_{fragment_id:05d}.mkv").resolve()
@@ -917,9 +949,13 @@ class PipelineManager:
             return str(tmp)
         feed_paths = self._recording_session_paths.get_feed_paths(self._recording_feed_id)
         feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
-        path = feed_paths.recording_dir / f"segment_{fragment_id:05d}.mkv"
+        index = self._recording_segment_counter
+        self._recording_segment_counter += 1
+        path = feed_paths.recording_dir / f"segment_{index:05d}.mkv"
         LOGGER.info(
-            "splitmuxsink opening segment fragment_id=%d feed_id=%s path=%s",
+            "splitmuxsink opening segment index=%d (gst fragment_id=%d) "
+            "feed_id=%s path=%s",
+            index,
             fragment_id,
             self._recording_feed_id,
             path,
@@ -990,6 +1026,12 @@ class PipelineManager:
             self._audio_appsrc = appsrc
 
         self._add_live_audio_branch()
+        # Audio recording (audio muxed into the splitmuxsink segments) was
+        # attempted as 4.A.bis but caused the video pipeline to freeze on
+        # this hardware. Reverted; audio recording is fully deferred to a
+        # later slice with its own scoping. For now the audio record
+        # branch drains via a no-op appsink and the segment files are
+        # video-only.
         self._add_audio_appsink_branch("record", self._on_record_audio_sample)
         self._add_audio_appsink_branch("replay", self._on_replay_audio_sample)
 

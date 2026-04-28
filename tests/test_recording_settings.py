@@ -62,6 +62,7 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         pm._recording_feed_id = None
         pm._recording_codec = codec
         pm._recording_container = container
+        pm._recording_segment_counter = 0
         return pm
 
     def _session_paths(self, root: Path) -> SessionPaths:
@@ -78,17 +79,29 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
             clips_dir=clips_dir,
         )
 
-    def test_path_format_with_active_session(self) -> None:
+    def test_path_format_uses_local_counter_not_gst_fragment_id(self) -> None:
+        # Splitmuxsink's `fragment_id` parameter is ignored — we use our
+        # own `_recording_segment_counter` so each recording session
+        # starts at segment_00000 regardless of pipeline-startup state
+        # transitions that may have already incremented gst's counter.
         from app.media.pipeline_manager import PipelineManager
         with TemporaryDirectory() as tmp:
             session = self._session_paths(Path(tmp))
             pm = self._build_pm_stub()
             pm._recording_session_paths = session
             pm._recording_feed_id = "ndi_main"
-            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 7)
+            # Pass arbitrarily high gst fragment_id; the filename should
+            # ignore it and use our counter (currently 0).
+            path1 = PipelineManager._on_splitmuxsink_format_location(pm, None, 7)
             self.assertTrue(
-                path.endswith("recording/ndi_main/segment_00007.mkv")
-                or path.endswith("recording\\ndi_main\\segment_00007.mkv")
+                path1.endswith("recording/ndi_main/segment_00000.mkv")
+                or path1.endswith("recording\\ndi_main\\segment_00000.mkv")
+            )
+            # Counter increments per call.
+            path2 = PipelineManager._on_splitmuxsink_format_location(pm, None, 8)
+            self.assertTrue(
+                path2.endswith("recording/ndi_main/segment_00001.mkv")
+                or path2.endswith("recording\\ndi_main\\segment_00001.mkv")
             )
             # Calling format-location creates the per-feed recording dir.
             feed_recording_dir = session.recording_dir / "ndi_main"

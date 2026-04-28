@@ -29,13 +29,20 @@ class RecordingManager:
         return self._recorders[feed_id]
 
     def is_recording(self, feed_id: str) -> bool:
-        """Return whether the feed recorder is active."""
-        recorder = self._recorders.get(feed_id)
-        return recorder.is_recording() if recorder is not None else False
+        """Return whether long-form recording is currently active.
+
+        Per-feed recording isn't tracked separately in Phase 4.A — the
+        operator's toggle drives all feeds together via the global
+        `RecordingState` machine. Returns the same value as
+        `is_any_recording`. Slice 4.A bypassed the legacy
+        `Recorder.is_recording()` flag, so reading from there would
+        always say 'idle' even mid-recording.
+        """
+        return self.recording_state.state == RecordingState.RECORDING
 
     def is_any_recording(self) -> bool:
-        """Return whether any recorder is active."""
-        return any(recorder.is_recording() for recorder in self._recorders.values())
+        """Return whether long-form recording is currently active."""
+        return self.recording_state.state == RecordingState.RECORDING
 
     def stop_all(self) -> None:
         """Stop all registered recorders."""

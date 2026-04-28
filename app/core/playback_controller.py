@@ -304,6 +304,9 @@ class PlaybackController:
                 self._state.current_source_name = frame_overlay.source_name
                 if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST and all_connected:
                     self._state.current_playback_mode = PlaybackMode.LIVE
+                    # Clear the startup "Unable to connect to source" placeholder
+                    # once frames actually start arriving.
+                    self._state.error_message = None
                 if self._state.current_playback_mode == PlaybackMode.LIVE:
                     self._playback_timestamp = frame_overlay.capture_timestamp
                     self._state.frame_overlay = frame_overlay
@@ -333,6 +336,9 @@ class PlaybackController:
             self._sync_all_source_status_locked()
             if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST and self._state.source_connected:
                 self._state.current_playback_mode = PlaybackMode.LIVE
+                # Clear the startup "Unable to connect to source" placeholder
+                # once frames actually start arriving.
+                self._state.error_message = None
             if self._state.current_playback_mode == PlaybackMode.LIVE:
                 self._playback_timestamp = frame_overlay.capture_timestamp
                 self._state.frame_overlay = frame_overlay
@@ -340,10 +346,14 @@ class PlaybackController:
         self._emit_state()
 
     def _refresh_recording_state_locked(self) -> None:
-        if len(self._feed_runtimes) > 1:
-            self._state.is_recording = self._recording_manager.is_any_recording()
-        else:
-            self._state.is_recording = self._recording_manager.is_recording(self._primary_feed_id)
+        # Slice 2.B introduced the RecordingState machine; slice 4.A bypassed
+        # the legacy `Recorder.is_recording()` path that the older check
+        # used. Read the recording flag from the state machine — it's the
+        # one piece of state both the toggle button and the diagnostics
+        # widget agree on.
+        self._state.is_recording = (
+            self._recording_manager.recording_state.state == RecordingState.RECORDING
+        )
         self._sync_replay_state_with_recording_locked()
 
     def _sync_replay_state_with_recording_locked(self) -> None:
