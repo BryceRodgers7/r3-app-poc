@@ -537,6 +537,39 @@ class FeedMetricsDroppedTests(unittest.TestCase):
         self.assertEqual(snap.recording_fps, 0.0)
 
 
+class FeedMetricsPipelineModeTests(unittest.TestCase):
+    def test_default_pipeline_mode_is_python_push(self) -> None:
+        m = FeedMetrics("cam_a", "A")
+        self.assertEqual(m.pipeline_mode, "python_push")
+        self.assertEqual(m.snapshot().pipeline_mode, "python_push")
+
+    def test_set_pipeline_mode_propagates_to_snapshot(self) -> None:
+        m = FeedMetrics("cam_a", "A")
+        m.set_pipeline_mode("native")
+        self.assertEqual(m.snapshot().pipeline_mode, "native")
+
+    def test_python_frames_counter_independent_from_other_counters(self) -> None:
+        clock = FakeClock()
+        m = FeedMetrics("cam_a", "A", window_seconds=1.0, clock=clock)
+        for _ in range(20):
+            m.tick_python_frame()
+        snap = m.snapshot()
+        self.assertGreater(snap.python_frames_per_sec, 0.0)
+        self.assertEqual(snap.preview_fps, 0.0)
+        self.assertEqual(snap.recording_fps, 0.0)
+        self.assertEqual(snap.source_fps, 0.0)
+
+    def test_native_source_reports_zero_python_frames(self) -> None:
+        m = FeedMetrics("cam_a", "A", pipeline_mode="native")
+        # Tick everything except python_frame.
+        m.tick_source()
+        m.tick_preview()
+        m.tick_recording()
+        snap = m.snapshot()
+        self.assertEqual(snap.python_frames_per_sec, 0.0)
+        self.assertEqual(snap.pipeline_mode, "native")
+
+
 class LatencySamplerTests(unittest.TestCase):
     def test_empty_sampler_reports_zero_count(self) -> None:
         clock = FakeClock()

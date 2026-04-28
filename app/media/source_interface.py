@@ -3,16 +3,33 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 
 from app.core.models import AudioChunk, AudioFormat, IngestTelemetry, MediaFrame
+
+
+class PipelineMode(str, Enum):
+    """How a source delivers frames into the per-feed graph.
+
+    - `python_push`: the source pulls frames into Python (numpy BGR via
+      `read_frame()`) and `PipelineManager` pushes them into an `appsrc`
+      head. The synthetic dev source is the only intended user after
+      Phase 3.A.2.
+    - `native`: the source exposes a configured `Gst.Bin` whose src pad
+      links directly into the per-feed `tee`. Frames never enter Python on
+      the hot path. Production NDI ingest will use this mode after 3.A.2.
+    """
+
+    PYTHON_PUSH = "python_push"
+    NATIVE = "native"
 
 
 class SourceInterface(ABC):
     """Abstract interface for a pluggable live video source.
 
-    `read_frame()` is the temporary frame-delivery contract for the current
-    vertical slice. Later NDI and GStreamer-backed sources should plug in here
-    without changing how replay, recording, or UI playback consume frames.
+    `read_frame()` is the contract for `python_push` mode. Native-mode
+    sources expose a `Gst.Bin` instead and `read_frame()` may return `None`
+    or raise — `PipelineManager` does not call it for native sources.
     """
 
     @abstractmethod
@@ -38,6 +55,26 @@ class SourceInterface(ABC):
     @abstractmethod
     def create_pipeline_fragment(self) -> str:
         """Describe how this source will later plug into a native GStreamer graph."""
+
+    @property
+    def pipeline_mode(self) -> PipelineMode:
+        """Return how the source delivers frames into the per-feed graph.
+
+        Defaults to `python_push` so existing sources keep working. Native
+        sources should override and provide `build_native_bin()`.
+        """
+        return PipelineMode.PYTHON_PUSH
+
+    def build_native_bin(self, gst_module: object) -> object | None:
+        """Build a configured `Gst.Bin` for this source.
+
+        Only meaningful for `pipeline_mode == NATIVE` sources. The returned
+        bin must expose a single video src ghost pad emitting `BGR` raw
+        video at the source's negotiated frame size and rate. Default
+        implementation returns `None` — `PipelineManager` falls back to the
+        Python-push appsrc head.
+        """
+        return None
 
     @abstractmethod
     def read_frame(self) -> MediaFrame | None:

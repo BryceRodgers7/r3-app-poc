@@ -99,8 +99,13 @@ class DiagnosticsWidget(QFrame):
             for s in snaps:
                 fs = self._hub.feed_state(s.feed_id)
                 fs_text = fs.state.value if fs is not None else "?"
+                mode_text = (
+                    "native"
+                    if s.pipeline_mode == "native"
+                    else f"py-push ({s.python_frames_per_sec:4.1f}/s)"
+                )
                 lines.append(
-                    f"{s.feed_id:<12} {fs_text:<13} "
+                    f"{s.feed_id:<12} {fs_text:<13} {mode_text:<22} "
                     f"src {s.source_fps:5.1f}  prv {s.preview_fps:5.1f}  "
                     f"rec {s.recording_fps:5.1f}  drop {s.dropped_per_sec:4.1f}/s"
                 )

@@ -192,6 +192,7 @@ def build_default_application_coordinator(
             live_audio_monitor_enabled=settings.live_audio_monitor_enabled,
         )
         feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
+        feed_metrics.set_pipeline_mode(source.pipeline_mode.value)
         pipeline_manager.set_feed_metrics(feed_metrics)
         feed_state = make_feed_state_machine(feed.feed_id, feed.display_name)
         pipeline_manager.set_feed_state(feed_state)

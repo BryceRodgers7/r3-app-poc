@@ -807,6 +807,11 @@ class PipelineManager:
             if frame is None:
                 continue
 
+            if self._feed_metrics is not None:
+                # Each iteration of this loop is one frame round-tripping
+                # through Python — count it for the §3.A diagnostics readout.
+                self._feed_metrics.tick_python_frame()
+
             if self._appsrc is None:
                 break
 

@@ -92,6 +92,8 @@ class FeedMetricsSnapshot:
     preview_fps: float
     recording_fps: float
     dropped_per_sec: float = 0.0
+    python_frames_per_sec: float = 0.0
+    pipeline_mode: str = "python_push"
 
 
 class FeedMetrics:
@@ -99,28 +101,43 @@ class FeedMetrics:
 
     `tick_source` fires at the head of the per-feed pipeline (one event per
     inbound frame, regardless of branch). `tick_preview` and `tick_recording`
-    fire on the respective tee branch sinks. `tick_dropped` fires once per
-    GStreamer QOS bus message on the live pipeline. `recording_fps` is
-    expected to be zero whenever the operator has not started long-form game
-    recording.
+    fire on the respective tee branch sinks. `tick_python_frame` fires once
+    per frame that round-tripped through Python; native sources never tick
+    it and should report `0.0`. `tick_dropped` fires once per GStreamer QOS
+    bus message on the live pipeline. `recording_fps` is expected to be
+    zero whenever the operator has not started long-form game recording.
+    `pipeline_mode` is a free-form string ("python_push" or "native")
+    surfaced in the diagnostics widget.
     """
 
-    __slots__ = ("feed_id", "display_name", "_source", "_preview", "_recording", "_dropped")
+    __slots__ = (
+        "feed_id",
+        "display_name",
+        "pipeline_mode",
+        "_source",
+        "_preview",
+        "_recording",
+        "_dropped",
+        "_python_frames",
+    )
 
     def __init__(
         self,
         feed_id: str,
         display_name: str,
         *,
+        pipeline_mode: str = "python_push",
         window_seconds: float = 5.0,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.feed_id = feed_id
         self.display_name = display_name
+        self.pipeline_mode = pipeline_mode
         self._source = RateCounter(window_seconds, clock=clock)
         self._preview = RateCounter(window_seconds, clock=clock)
         self._recording = RateCounter(window_seconds, clock=clock)
         self._dropped = RateCounter(window_seconds, clock=clock)
+        self._python_frames = RateCounter(window_seconds, clock=clock)
 
     def tick_source(self) -> None:
         self._source.tick()
@@ -134,6 +151,12 @@ class FeedMetrics:
     def tick_dropped(self) -> None:
         self._dropped.tick()
 
+    def tick_python_frame(self) -> None:
+        self._python_frames.tick()
+
+    def set_pipeline_mode(self, mode: str) -> None:
+        self.pipeline_mode = mode
+
     def snapshot(self) -> FeedMetricsSnapshot:
         return FeedMetricsSnapshot(
             feed_id=self.feed_id,
@@ -142,6 +165,8 @@ class FeedMetrics:
             preview_fps=self._preview.rate(),
             recording_fps=self._recording.rate(),
             dropped_per_sec=self._dropped.rate(),
+            python_frames_per_sec=self._python_frames.rate(),
+            pipeline_mode=self.pipeline_mode,
         )
 
 
