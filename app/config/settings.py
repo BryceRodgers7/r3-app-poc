@@ -65,6 +65,17 @@ class AppSettings:
     audio_bitrate: int = 128_000
     audio_container: str = "mp4"
     replay_audio_segment_seconds: float = 2.0
+    # [recording] block — Phase 4. Native segmented recording via
+    # `splitmuxsink`. MJPEG-in-MKV is the 4.A target codec/container; both
+    # are intra-frame seekable per §15.7 and use elements that ship in
+    # `gst-plugins-good`. ProRes/DNxHR (§5.2 first-choice) are deferred
+    # because their encoders live in `gst-plugins-bad` and aren't always
+    # present on UCRT64. The codec/container fields are read but currently
+    # only `mjpeg` + `mkv` is implemented; other values raise on startup.
+    recording_enabled: bool = True
+    recording_segment_duration_seconds: float = 4.0
+    recording_codec: str = "mjpeg"
+    recording_container: str = "mkv"
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -126,6 +137,20 @@ class AppSettings:
             settings.audio_container = str(app_config["audio_container"]).strip().lower() or "mp4"
         if "replay_audio_segment_seconds" in app_config:
             settings.replay_audio_segment_seconds = float(app_config["replay_audio_segment_seconds"])
+
+        recording_config = cls._as_dict(data.get("recording"))
+        if "enabled" in recording_config:
+            settings.recording_enabled = bool(recording_config["enabled"])
+        if "segment_duration_seconds" in recording_config:
+            settings.recording_segment_duration_seconds = float(
+                recording_config["segment_duration_seconds"]
+            )
+        if "codec" in recording_config:
+            settings.recording_codec = str(recording_config["codec"]).strip().lower()
+        if "container" in recording_config:
+            settings.recording_container = (
+                str(recording_config["container"]).strip().lower()
+            )
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])

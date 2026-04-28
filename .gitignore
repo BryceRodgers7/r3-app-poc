@@ -75,3 +75,6 @@ Thumbs.db
 .fly/
 fly.toml.backup
 .fly/secrets.sh
+
+# video files
+*.mkv

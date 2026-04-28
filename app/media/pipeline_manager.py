@@ -54,6 +54,10 @@ class PipelineManager:
         replay_buffer: ReplayStore,
         audio_enabled: bool = True,
         live_audio_monitor_enabled: bool = True,
+        recording_enabled: bool = True,
+        recording_segment_duration_seconds: float = 4.0,
+        recording_codec: str = "mjpeg",
+        recording_container: str = "mkv",
     ) -> None:
         self._source = source
         self._preview_output = preview_output
@@ -61,6 +65,7 @@ class PipelineManager:
         self._replay_buffer = replay_buffer
         self._audio_enabled = audio_enabled
         self._live_audio_monitor_enabled = live_audio_monitor_enabled
+        self._recording_enabled = recording_enabled
         self._preview_running = False
         self._recording_running = False
         self._replay_running = False
@@ -111,6 +116,21 @@ class PipelineManager:
         self._frame_metadata: OrderedDict[int, _FrameMetadata] = OrderedDict()
         self._metadata_lock = threading.Lock()
         self._live_sample_callback: Callable[[FrameOverlayInfo], None] | None = None
+        # Phase 4.A: native segmented recording state.
+        self._splitmuxsink: Any | None = None
+        self._recording_session_paths: SessionPaths | None = None
+        self._recording_feed_id: str | None = None
+        self._recording_segment_duration_seconds: float = max(
+            0.5, float(recording_segment_duration_seconds)
+        )
+        self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
+        self._recording_container: str = recording_container.strip().lower() or "mkv"
+        if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
+            raise RuntimeError(
+                f"Phase 4.A only supports recording codec='mjpeg' container='mkv'. "
+                f"Got codec={self._recording_codec!r} container={self._recording_container!r}. "
+                f"ProRes/DNxHR support is deferred."
+            )
 
     def describe_architecture(self) -> str:
         """Describe the current transitional tee/fan-out architecture."""
@@ -130,19 +150,47 @@ class PipelineManager:
             self._set_branch_enabled("preview", True)
 
     def enable_file_recording(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
-        """Start writing long session capture; record tee branch stays open for flow control."""
-        self._recorder.begin_long_recording(
-            session_paths=session_paths,
-            source_name=self._source.get_display_name(),
-            fps_hint=self._source.get_nominal_fps(),
-            feed_id=feed_id or self._source.get_feed_id(),
-        )
+        """Open the record branch's valve so segmented recording starts (Phase 4.A).
+
+        The actual writing is done by `splitmuxsink` downstream of the
+        valve; we just need to let buffers through and tell the
+        `format-location` callback which session/feed to write under. The
+        legacy `Recorder` / `MuxedMediaWriter` path is bypassed entirely
+        — they remain in the codebase only until 4.D's cleanup.
+        """
+        if self._splitmuxsink is None:
+            LOGGER.warning(
+                "enable_file_recording called but recording branch is not "
+                "configured; ignoring."
+            )
+            return
+        self._recording_session_paths = session_paths
+        self._recording_feed_id = feed_id or self._source.get_feed_id()
+        feed_paths = session_paths.get_feed_paths(self._recording_feed_id)
+        feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
+        self._set_branch_enabled("record", True)
         self._recording_running = True
+        LOGGER.info(
+            "Recording started for feed_id=%s, segments under %s",
+            self._recording_feed_id,
+            feed_paths.recording_dir,
+        )
 
     def disable_file_recording(self) -> None:
-        """Stop writing to disk; keep draining the record branch so preview is not stalled."""
+        """Close the record branch's valve so segmented recording stops (Phase 4.A).
+
+        The current splitmuxsink segment may be slightly truncated (no
+        explicit EOS); 4.E's startup scan quarantines or repairs incomplete
+        segments. The valve stays closed until the operator clicks Start
+        again, at which point splitmuxsink continues with the next
+        sequential fragment id under the same session/feed.
+        """
         self._recording_running = False
-        self._recorder.end_long_recording()
+        self._set_branch_enabled("record", False)
+        LOGGER.info(
+            "Recording stopped for feed_id=%s",
+            self._recording_feed_id,
+        )
 
     def start_replay_buffer(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
         # temporary disable for diagnostic purposes
@@ -536,6 +584,9 @@ class PipelineManager:
         if branch_name == "preview":
             self._add_preview_branch(branch_name)
             return
+        if branch_name == "record":
+            self._add_record_branch_via_splitmuxsink(branch_name)
+            return
 
         queue = self._make_element("queue", f"{branch_name}_queue")
         valve = self._make_element("valve", f"{branch_name}_valve")
@@ -769,6 +820,119 @@ class PipelineManager:
                 self._live_sample_callback(overlay)
             except Exception:
                 LOGGER.exception("native preview live_sample_callback raised")
+        return Gst.PadProbeReturn.OK
+
+    def _add_record_branch_via_splitmuxsink(self, branch_name: str) -> None:
+        """Native segmented recording branch (Phase 4.A).
+
+        Replaces the old `appsink → MuxedMediaWriter` path. Element shape::
+
+            tee → queue → valve → videoconvert → jpegenc → splitmuxsink
+
+        `splitmuxsink` writes one MKV file per segment under
+        `<session>/recording/<feed_id>/segment_NNNNN.mkv`. Filename is
+        chosen by the `format-location` callback so we can interpolate
+        session paths and feed ids that aren't known until the operator
+        clicks "Start game recording". The valve stays closed (drop=True)
+        until `enable_file_recording` opens it; closing it again on
+        `disable_file_recording` stops feeding the muxer (the current
+        segment's tail may be slightly truncated, acceptable per §6.5
+        — slice 4.E quarantines/recovers incomplete segments).
+
+        A buffer probe on `videoconvert.src` ticks `tick_recording`
+        whenever frames are flowing, so the diagnostics widget continues
+        to show recording activity.
+        """
+        assert self._pipeline is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", f"{branch_name}_queue")
+        valve = self._make_element("valve", f"{branch_name}_valve")
+        convert = self._make_element("videoconvert", f"{branch_name}_convert")
+        jpegenc = self._make_element("jpegenc", f"{branch_name}_jpegenc")
+        splitmuxsink = self._make_element("splitmuxsink", f"{branch_name}_splitmuxsink")
+
+        valve.set_property("drop", True)
+        # `quality` is jpegenc's default 85; can be exposed as a setting later.
+        max_size_time_ns = int(self._recording_segment_duration_seconds * Gst.SECOND)
+        splitmuxsink.set_property("max-size-time", max_size_time_ns)
+        splitmuxsink.set_property("muxer-factory", "matroskamux")
+        # `async-finalize=True` finalizes closed segments on a worker thread
+        # so the streaming thread never blocks on disk flush.
+        self._set_property_if_supported(splitmuxsink, "async-finalize", True)
+        splitmuxsink.connect("format-location", self._on_splitmuxsink_format_location)
+
+        for element in (queue, valve, convert, jpegenc, splitmuxsink):
+            self._pipeline.add(element)
+
+        if not (
+            queue.link(valve)
+            and valve.link(convert)
+            and convert.link(jpegenc)
+            and jpegenc.link(splitmuxsink)
+        ):
+            raise RuntimeError(f"Failed to link the {branch_name} branch.")
+
+        tee_src_pad = self._request_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(
+                f"Failed to link tee output to the {branch_name} branch."
+            )
+
+        # Buffer probe for the recording-fps metric. Runs on the streaming
+        # thread; ticks a counter and returns. No pixel-data work.
+        convert_src_pad = convert.get_static_pad("src")
+        if convert_src_pad is not None:
+            convert_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._on_record_branch_buffer_probe,
+                None,
+            )
+
+        for element in (queue, valve, convert, jpegenc, splitmuxsink):
+            element.sync_state_with_parent()
+
+        self._branch_valves[branch_name] = valve
+        self._splitmuxsink = splitmuxsink
+
+    def _on_splitmuxsink_format_location(self, _splitmuxsink: Any, fragment_id: int) -> str:
+        """Pick a per-segment filename based on the active recording session.
+
+        `splitmuxsink` calls this whenever it needs to open a new segment
+        file. Until `enable_file_recording` stores a session, the valve
+        upstream is closed and no buffers reach `splitmuxsink` — so this
+        callback is not invoked. If it ever fires without an active
+        session (defensive), fall back to a temp path so the caller doesn't
+        crash.
+        """
+        if self._recording_session_paths is None or self._recording_feed_id is None:
+            tmp = Path(f"./_unrouted_segment_{fragment_id:05d}.mkv").resolve()
+            LOGGER.warning(
+                "splitmuxsink requested format-location without an active "
+                "recording session; writing to %s",
+                tmp,
+            )
+            return str(tmp)
+        feed_paths = self._recording_session_paths.get_feed_paths(self._recording_feed_id)
+        feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
+        path = feed_paths.recording_dir / f"segment_{fragment_id:05d}.mkv"
+        LOGGER.info(
+            "splitmuxsink opening segment fragment_id=%d feed_id=%s path=%s",
+            fragment_id,
+            self._recording_feed_id,
+            path,
+        )
+        return str(path)
+
+    def _on_record_branch_buffer_probe(self, _pad: Any, _info: Any, _user: Any) -> Any:
+        """Tick the recording-fps metric when the operator is actively recording."""
+        Gst = self._Gst
+        if Gst is None:
+            return 0  # Gst.PadProbeReturn.OK
+        if self._recording_running and self._feed_metrics is not None:
+            self._feed_metrics.tick_recording()
         return Gst.PadProbeReturn.OK
 
     def _build_audio_path_locked(self) -> None:
@@ -1391,15 +1555,12 @@ class PipelineManager:
         return Gst.FlowReturn.OK
 
     def _on_record_sample(self, sink: Any) -> Any:
+        # Phase 4.A: the record branch is now driven by splitmuxsink, not an
+        # appsink — this method is no longer wired to a `new-sample` signal
+        # in the new branch shape. Kept as a stub so existing references in
+        # tests and `_add_branch` don't break; will be deleted in 4.D.
         Gst = self._Gst
         assert Gst is not None
-
-        sample = sink.emit("pull-sample")
-        frame = self._sample_to_media_frame(sample)
-        if frame is not None and self._recording_running:
-            if self._feed_metrics is not None:
-                self._feed_metrics.tick_recording()
-            self._recorder.write_frame(frame)
         return Gst.FlowReturn.OK
 
     def _on_replay_sample(self, sink: Any) -> Any:
@@ -1413,13 +1574,14 @@ class PipelineManager:
         return Gst.FlowReturn.OK
 
     def _on_record_audio_sample(self, sink: Any) -> Any:
+        # Phase 4.A: audio recording is deferred to a 4.A.bis follow-up
+        # (when audio is wired into the same `splitmuxsink` for muxed
+        # video+audio segments). For now drain the appsink so it doesn't
+        # back-pressure the audio tee, but don't call the legacy Recorder
+        # path (which would deadlock via MuxedMediaWriter).
         Gst = self._Gst
         assert Gst is not None
-
-        sample = sink.emit("pull-sample")
-        chunk = self._sample_to_audio_chunk(sample)
-        if chunk is not None and self._recording_running:
-            self._recorder.write_audio_chunk(chunk)
+        sink.emit("pull-sample")
         return Gst.FlowReturn.OK
 
     def _on_replay_audio_sample(self, sink: Any) -> Any:
