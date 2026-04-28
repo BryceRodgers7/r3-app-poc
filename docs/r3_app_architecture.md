@@ -2020,6 +2020,65 @@ Transitional note:
 
 - The current code's single `replay_buffer_seconds` setting (a fixed rolling-window duration over JPEG thumbs + short muxed segments) is replaced by `segment_duration_seconds` plus a segment-availability query. The UI's "rewind 10s" / "rewind 30s" shortcuts become convenience time ranges (§15.3) rather than buffer-size limits. `replay_buffer_seconds` should be removed from `AppSettings` once the new path is in place.
 
+### Slices
+
+Phase 4 lands in five slices. 4.A is the unblock — it replaces `MuxedMediaWriter` with a native segmented sink and lets the app actually record. 4.B-E build the segment-metadata, replay-query, cleanup, and crash-recovery layers on top.
+
+A pragmatic codec choice up front: §5.2 prefers ProRes/DNxHR/MJPEG, with ProRes as the first-choice. **4.A targets MJPEG-in-MKV** rather than ProRes. Reason: `jpegenc` lives in `gst-plugins-good` (universally available on the UCRT64 stack), while `proresenc` is in `gst-plugins-bad` and not always present. MJPEG is intra-frame, frame-accurately seekable per §15.7, and acceptable per §5.2's fallback list. A later slice can introduce a `[recording] codec` knob that switches between MJPEG/ProRes/DNxHR based on detected element availability; the design assumption is that it's a config swap, not a rearchitecture.
+
+**4.A — Native segmented recording (the deadlock unblock)**
+
+- Replace the recording branch's `appsink → MuxedMediaWriter.write_frame` path with `splitmuxsink` writing directly into `<session>/recording/<feed_id>/segment_%05d.mkv` from the recording tee branch. Internal element shape: `record_tee_pad → queue → videoconvert → jpegenc → splitmuxsink (max-size-time = segment_duration_seconds * Gst.SECOND)`.
+- `splitmuxsink`'s `format-location` signal picks per-segment filenames; `split-file-closed` (or `format-location-full`) fires when each segment finalizes — for 4.A just log it, 4.B captures metadata.
+- New `[recording]` config block per §13: `enabled`, `segment_duration_seconds` (default `4`), `codec` (default `"mjpeg"`), `container` (default `"mkv"`). Read into `AppSettings`.
+- `_on_record_sample` becomes a buffer-counter only — it ticks `feed_metrics.tick_recording()` and returns. No `Recorder.write_frame` call. The old `Recorder` and `MuxedMediaWriter` classes stay in the tree (used by 4.D's deletion pass) but are no longer driven by the recording hot path.
+- **Audio recording is deferred to a 4.A.bis follow-up.** Today the user's NDI Tools Screen Capture has no audio anyway; synthetic also has none. Wiring audio into `splitmuxsink` (so the segment files mux audio + video) is mechanical but adds a second branch that has to handle the no-audio case gracefully. Easier as a separate slice once 4.A's video path is solid.
+- Tests: `splitmuxsink` element configuration (max-size-time, format-location callback round-trip); `[recording]` config parsing; `_on_record_sample` no longer calls `Recorder.write_frame`.
+
+**Exit criteria:** "Start game recording" button no longer deadlocks; clicking it produces a stream of `segment_NNNNN.mkv` files under `<session>/recording/<feed_id>/` while recording is active, sized roughly `(segment_duration_seconds × bitrate)` each.
+
+**4.B — Segment metadata model + persistence + in-memory index**
+
+- New `Segment` dataclass matching §6.3 (minus audio fields for now): `segment_id`, `session_id`, `feed_id`, `file_path`, `codec`, `container`, `start_pts_ns`, `end_pts_ns`, `start_session_time_ns`, `end_session_time_ns`, `duration_ns`, `start_wall_clock_utc`, `end_wall_clock_utc`, `frame_count_estimate`, `size_bytes`, `state` (writing | complete | dirty | corrupt | quarantined), `created_at`, `finalized_at`, `pts_to_session_offset_ns`.
+- Capture metadata on `splitmuxsink`'s `split-file-closed` signal — each finalized segment becomes a `Segment` row.
+- Persist to SQLite (extend `app/storage/metadata_db.py` with a `segments` table). Per-session SQLite remains the durable source of truth (§6.4).
+- `SegmentIndex` in-memory class keyed by `(feed_id, start_pts_ns)`, providing range queries: `segments_overlapping(feed_id, t_start, t_end)`, `latest_replayable_pts(feed_id)`, `earliest_pts(feed_id)`.
+- Tests: synthesized `split-file-closed` populates a row; SQLite round-trip; `SegmentIndex` range-query correctness over an interval set with gaps.
+
+**4.C — Replay query API + operator transport integration**
+
+- New `RecordingSegmentReplayStore` implementing the `ReplayStore` interface (or replacing it): given a `(feed_id, target_pts_ns)`, returns a `(segment_path, offset_in_segment_ns)`. Refuses requests outside `[earliest, latest_replayable]` per §6.6 / §15.2. Refuses all requests when `recording_state != RECORDING` per §10.4.
+- Operator's `PlaybackController` transport methods (`rewind_10_seconds`, `pause_playback`, `set_playback_rate`, `jump_to_live`) continue to drive `ReplayState` (slice 2.C); their data lookups are rerouted from `ReplayBuffer.get_frame_ref_at_or_before` to the new replay store's `resolve(target_pts)`.
+- The operator's replay rendering switches from "decode JPEG thumbnail in Python and `show_frame()` it" to "set `_replay_pipeline`'s `playbin` URI to the resolved segment file with a seek offset". The existing `_replay_pipeline` + `d3d11videosink` machinery already exists — this just changes what we feed it.
+- Tests: replay-store eligibility queries (in-window, before-earliest, after-latest, while-not-recording); transport-method integration uses the new store.
+
+**Exit criteria:** Operator can press Rewind 10s during an active recording and see ~10s-old video play back from a segment file. Slow-motion / pause / jump-to-live continue to work.
+
+**4.D — Delete the rolling JPEG buffer + cleanup pass**
+
+- Delete `app/media/replay_buffer.py` (`ReplayBuffer`, `ReplayStore`, `ReplayFrameRef`, `ReplayMediaSegmentRef`, `ReplayStoreManager`). The new `RecordingSegmentReplayStore` replaces them.
+- Delete `app/media/muxed_writer.py` (`MuxedMediaWriter`) and the parts of `app/media/recorder.py` that drive it.
+- Remove the `_add_branch("replay", ...)` call and `_on_replay_sample` handler from `pipeline_manager.py`. The replay tee branch is gone — replay no longer fans off the live tee, it reads from segment files via `_replay_pipeline`.
+- Remove the diagnostic early-return at the top of `pipeline_manager.start_replay_buffer`; the method becomes a no-op or is deleted.
+- Remove `replay_buffer_seconds`, `replay_buffer_jpeg_quality`, `replay_audio_segment_seconds`, `recording_filename`, `short_segments_subdir`, `short_segment_filename_prefix`, `audio_container` from `AppSettings`. They are obsolete.
+- Update tests that referenced the deleted classes; either delete the tests or rewrite against the new types.
+- Update `ARCHITECTURE.md` to remove the "JPEG-thumb rolling replay" language.
+
+**4.E — Crash recovery + startup segment scan**
+
+- On `SessionManager.start_new_session`, scan all *prior* session directories' `recording/<feed_id>/` for incomplete segments. Validate each segment file: open via `gst-discoverer` (or equivalent), confirm duration, frame count, container integrity. Quarantine corrupt files per §6.5 (move to `<session>/quarantine/`).
+- For prior sessions whose `session.json` state is `RECORDING` or `STOPPED` without a `finalized_at`, transition to `DIRTY` per §10.6. (The §11.4 recovery-prompt UI is still deferred — this slice just does the *marking* so the prompt has something to react to when it lands.)
+- Rebuild the `SegmentIndex` from on-disk segments + SQLite metadata for any session the operator opens for replay or post-session export.
+- Tests: startup scan against a fixture session containing a mix of complete / partial / corrupt segments; dirty-session detection from a `session.json` missing `finalized_at`.
+
+### Out of scope for Phase 4 (deferred)
+
+- **Audio in segments.** First addressed by a 4.A.bis follow-up (audio sink wired into the same `splitmuxsink`), or as a Phase 9 task per the existing plan.
+- **ProRes / DNxHR codec selection.** §5.2's first-choice codecs require `gst-plugins-bad` elements that aren't always available on UCRT64. Add a config-driven codec selector once MJPEG path is solid; this becomes a small Phase-4-bis or a Phase 11 task (hardware acceleration ties into encoder choice).
+- **§11.4 recovery prompt UI.** 4.E marks `DIRTY` sessions correctly so the prompt has data to react to, but the prompt itself ("Resume / End and finalize / Discard") is its own slice.
+- **Phase 3.B and 3.C resumption.** Once Phase 4 lands and recording works end-to-end, queue policies (3.B) and the transitional banner (3.C) become meaningful again.
+- **Native preview video sink (3.A.3 retry).** Same — revisit after Phase 4 reduces concurrent unknowns.
+
 ---
 
 ## Phase 5 – Shared Session Timeline
