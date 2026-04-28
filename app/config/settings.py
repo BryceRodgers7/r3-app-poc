@@ -37,7 +37,6 @@ class AppSettings:
     operator_window_title: str = "Sports Replay Operator"
     program_window_title: str = "Sports Replay Program"
     base_data_dir: Path = Path(r"C:\SportsReplay")
-    replay_buffer_seconds: int = 120
     touch_button_height: int = 72
     default_feed_id: str = "feed_main"
     default_source_name: str = "Test Source"
@@ -53,18 +52,11 @@ class AppSettings:
     target_frame_width: int = 1280
     target_frame_height: int = 720
     target_fps: float = 30.0
-    replay_buffer_jpeg_quality: int = 80
-    recording_filename: str = "session_recording.mp4"
-    recording_manifest_filename: str = "recording_manifest.json"
-    short_segments_subdir: str = "segments"
-    short_segment_filename_prefix: str = "segment"
     enable_embedded_audio: bool = True
     live_audio_monitor_enabled: bool = True
     audio_sample_rate: int = 48_000
     audio_channels: int = 2
     audio_bitrate: int = 128_000
-    audio_container: str = "mp4"
-    replay_audio_segment_seconds: float = 2.0
     # [recording] block — Phase 4. Native segmented recording via
     # `splitmuxsink`. MJPEG-in-MKV is the 4.A target codec/container; both
     # are intra-frame seekable per §15.7 and use elements that ship in
@@ -103,8 +95,6 @@ class AppSettings:
             settings.program_window_title = str(app_config["program_window_title"])
         if "base_data_dir" in app_config:
             settings.base_data_dir = Path(str(app_config["base_data_dir"]))
-        if "replay_buffer_seconds" in app_config:
-            settings.replay_buffer_seconds = int(app_config["replay_buffer_seconds"])
         if "touch_button_height" in app_config:
             settings.touch_button_height = int(app_config["touch_button_height"])
         if "target_frame_width" in app_config:
@@ -113,16 +103,6 @@ class AppSettings:
             settings.target_frame_height = int(app_config["target_frame_height"])
         if "target_fps" in app_config:
             settings.target_fps = float(app_config["target_fps"])
-        if "replay_buffer_jpeg_quality" in app_config:
-            settings.replay_buffer_jpeg_quality = int(app_config["replay_buffer_jpeg_quality"])
-        if "recording_filename" in app_config:
-            settings.recording_filename = str(app_config["recording_filename"])
-        if "recording_manifest_filename" in app_config:
-            settings.recording_manifest_filename = str(app_config["recording_manifest_filename"])
-        if "short_segments_subdir" in app_config:
-            settings.short_segments_subdir = str(app_config["short_segments_subdir"])
-        if "short_segment_filename_prefix" in app_config:
-            settings.short_segment_filename_prefix = str(app_config["short_segment_filename_prefix"])
         if "enable_embedded_audio" in app_config:
             settings.enable_embedded_audio = bool(app_config["enable_embedded_audio"])
         if "live_audio_monitor_enabled" in app_config:
@@ -133,10 +113,6 @@ class AppSettings:
             settings.audio_channels = int(app_config["audio_channels"])
         if "audio_bitrate" in app_config:
             settings.audio_bitrate = int(app_config["audio_bitrate"])
-        if "audio_container" in app_config:
-            settings.audio_container = str(app_config["audio_container"]).strip().lower() or "mp4"
-        if "replay_audio_segment_seconds" in app_config:
-            settings.replay_audio_segment_seconds = float(app_config["replay_audio_segment_seconds"])
 
         recording_config = cls._as_dict(data.get("recording"))
         if "enabled" in recording_config:

@@ -9,10 +9,11 @@ The current codebase is a good vertical slice, not a finished foundation. Severa
 **Implemented today (as of this document’s last pass against the code):**
 
 - Pluggable ingest via `SourceInterface`
-- **Feed-oriented** graph: `FeedRegistry`, one `FeedRuntime` per enabled feed, each with its own `PipelineManager`, `Recorder`, and `ReplayBuffer` / `ReplayStore`
+- **Feed-oriented** graph: `FeedRegistry`, one `FeedRuntime` per enabled feed, each with its own `PipelineManager`
 - **Two output channels:** `ApplicationCoordinator` wires an **operator** and **program** `PlaybackController`, each with its own `MultiFeedOutputRenderer` and `MainWindow` (`main.py`)
-- **Per-feed recording:** `RecordingManager` holds one `Recorder` per `feed_id`; session paths use `recording/{feed_id}/` under each session
-- Separation between ingest, replay storage, recording, UI, and session storage
+- **Native segmented recording:** each feed’s `PipelineManager` runs a `tee → valve → videoconvert → jpegenc → splitmuxsink` branch that writes one MKV per segment under `recording/{feed_id}/segment_NNNNN.mkv`; segment metadata (PTS span, frame count, file size) is persisted to a SQLite `segments` table and indexed in-memory by `SegmentIndex` (slices 4.A / 4.B)
+- **Replay query layer:** `RecordingSegmentReplayStore` (slice 4.C) wraps `SegmentIndex` and is the single eligibility / lookup contract used by `PlaybackController`. Actual segment-file replay rendering is deferred to slice **4.C.tail**
+- Separation between ingest, recording (segments), replay query, UI, and session storage
 - GStreamer-centered `tee`/fan-out direction in each feed’s `PipelineManager`
 - Controllers that track playback mode and transport (not raw button events only)
 
@@ -59,14 +60,14 @@ Responsibilities:
 
 ### `FeedIngestService` (conceptual name)
 
-**Current code:** one `FeedRuntime` per feed wraps `SourceInterface` + `PipelineManager` + `PreviewOutput` + shared `Recorder` / `ReplayStore` for that feed.
+**Current code:** one `FeedRuntime` per feed wraps `SourceInterface` + `PipelineManager` + `PreviewOutput`.
 
 Responsibilities:
 
 - Connect to a single source
 - Normalize timestamps and frame metadata (ongoing)
 - Drive a per-feed GStreamer ingest pipeline
-- Fan out frames to recording, replay buffering, and optional monitoring paths
+- Fan out frames to the live preview path and the splitmuxsink-driven segment recorder
 
 Notes:
 
@@ -75,33 +76,26 @@ Notes:
 
 ### `RecordingManager`
 
-Coordinates per-feed `Recorder` instances (`app/media/recording_manager.py`).
+Owns the global `RecordingState` machine (`app/media/recording_manager.py`).
 
 Responsibilities:
 
-- Register one `Recorder` per `feed_id`
-- Expose whether any feed is recording for UI state
-- Stop all recorders on shutdown
+- Track whether long-form recording is active across all feeds
+- Drive the start/stop transitions exposed to the operator UI
 
-**On disk today:** under each session, `recording/{feed_id}/` holds that feed’s muxed outputs and manifest when long recording is enabled (see `SessionPaths.get_feed_paths`).
+**On disk today:** under each session, `recording/{feed_id}/segment_NNNNN.mkv` holds that feed’s segmented MJPEG-in-MKV recording (slice 4.A). Segment metadata is persisted in the session’s SQLite `segments` table (slice 4.B). Slice 4.D removed the previous per-feed `Recorder` writer and `MuxedMediaWriter`/`ReplayBuffer` rolling-frame stores; recording is now driven entirely from inside each feed’s `PipelineManager` via `splitmuxsink`.
 
-The recorded files may contain burned-in timestamp/source overlays if desired. That does not conflict with this architecture.
+### `RecordingSegmentReplayStore` (slice 4.C)
 
-### `ReplayStoreManager`
-
-Owns rolling replay storage per feed.
+Read-only query layer over `SegmentIndex` (`app/storage/segment_replay_store.py`).
 
 Responsibilities:
 
-- Maintain a replay buffer for each feed
-- Resolve frames or timeline positions by timestamp
-- Report oldest/latest available timestamps per feed
-- Support replay window alignment across all feeds
+- Enforce the §10.4 / §15.2 eligibility rule: replay is only available while `recording_state == RECORDING`
+- Resolve a target PTS to `(segment_file, offset_in_segment_ns)` for completed segments only (§6.6)
+- Report `(earliest_pts, latest_replayable_pts)` per feed for the operator UI
 
-Important:
-
-- Replay should be modeled as timeline-based, not as a special UI trick
-- Every feed should expose a timestamp-addressable replay timeline
+This is the only contract `PlaybackController` uses for replay eligibility. The actual decode/render of segment files into the operator output is **slice 4.C.tail** (deferred).
 
 ### `PlaybackSession` (target; not a separate class yet)
 
@@ -142,7 +136,8 @@ Owns the full runtime graph (see `app/core/application_coordinator.py`).
 Responsibilities:
 
 - Start feeds (`FeedRuntime.start` per enabled feed)
-- Register per-feed recorders and replay stores with `RecordingManager` / `ReplayStoreManager`
+- Drive `RecordingManager.recording_state` transitions and call each feed’s `PipelineManager.enable_file_recording` / `disable_file_recording`
+- Own the shared `SegmentIndex` and `RecordingSegmentReplayStore`, threading the index into each `PipelineManager` for segment-row inserts
 - Own program and operator `PlaybackController` instances and route long recording / clip actions
 - Keep the program controller in **live-only** mode while the operator controller handles pause/replay
 
@@ -205,9 +200,9 @@ The earlier “single shared surface swapping live/replay” limitation is **no 
 
 ## Multiple Per-Feed Recordings
 
-**Implemented:** one `Recorder` per feed, registered in `RecordingManager`, with per-feed directories under `recording/{feed_id}/`.
+**Implemented:** each feed’s `PipelineManager` writes its own `splitmuxsink` segment chain under `recording/{feed_id}/segment_NNNNN.mkv`. Segment metadata is persisted to a shared SQLite `segments` table and indexed in-memory (slice 4.B).
 
-Session-level manifests and multi-feed policy (when to start/stop all feeds together) live in `ApplicationCoordinator.toggle_long_session_recording` and related UI.
+Multi-feed policy (when to start/stop all feeds together) lives in `ApplicationCoordinator.toggle_long_session_recording`.
 
 This does not require recorded video to be raw/unprocessed. A "copy of the live feed" with overlays is fine as long as:
 
@@ -230,12 +225,15 @@ Conclusion:
 ## Recommended Near-Term Refactor Order
 
 1. ~~Introduce feed identifiers and a feed registry~~ — `FeedRegistry` and `[[feeds]]` configuration exist
-2. ~~Split ingest/record/replay ownership into per-feed services~~ — `FeedRuntime` + per-feed `PipelineManager` / `Recorder` / `ReplayStore`
-3. Introduce `PlaybackSession` (or factor state out of `PlaybackController`) as an explicit per-output model
-4. ~~Per-window output renderers and a second window~~ — operator + program `MainWindow` and renderers
-5. Extend replay to **true** per-feed (or cross-feed) timeline semantics, not only primary-feed replay where applicable
-6. Add slow-motion playback rates consistently with a timeline + rate model
-7. Convert NDI ingest to a native GStreamer source bin (Phase 3.A); `TestSource` is the dev-only fallback and remains Python-push by design
+2. ~~Split ingest ownership into per-feed services~~ — `FeedRuntime` + per-feed `PipelineManager`
+3. ~~Replace the rolling JPEG buffer with native segmented muxers~~ — `splitmuxsink` recording branch + `SegmentIndex` + `RecordingSegmentReplayStore` (slices 4.A / 4.B / 4.C)
+4. **Wire segment-file replay into the operator output (slice 4.C.tail)** — pick a rendering target (single decoder vs per-segment), define the replay clock, and bridge wall-clock timestamps to PTS nanoseconds
+5. Introduce `PlaybackSession` (or factor state out of `PlaybackController`) as an explicit per-output model
+6. ~~Per-window output renderers and a second window~~ — operator + program `MainWindow` and renderers
+7. Extend replay to **true** per-feed (or cross-feed) timeline semantics, not only primary-feed replay where applicable
+8. Add slow-motion playback rates consistently with a timeline + rate model
+9. Convert NDI ingest to a native GStreamer source bin (Phase 3.A); `TestSource` is the dev-only fallback and remains Python-push by design
+10. Re-introduce embedded audio in segments (slice 4.F)
 
 ## Architectural Verdict
 

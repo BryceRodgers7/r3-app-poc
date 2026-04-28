@@ -14,12 +14,10 @@ from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, Playback
 from app.core.recording_state import RecordingState
 from app.core.replay_state import ACTIVE_REPLAY_STATES, ReplayState, make_replay_state_machine
 from app.core.signals import AppSignals
-from app.core.telemetry import time_block
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import MultiFeedOutputRenderer, OutputRenderer
 from app.media.recording_manager import RecordingManager
-from app.media.replay_buffer import ReplayFrameRef
-from app.media.replay_store_manager import ReplayStoreManager
+from app.storage.segment_replay_store import RecordingSegmentReplayStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +30,7 @@ class PlaybackController:
         feed_runtimes: Sequence[FeedRuntime],
         output_renderer: OutputRenderer | MultiFeedOutputRenderer,
         recording_manager: RecordingManager,
-        replay_store_manager: ReplayStoreManager,
+        replay_store: RecordingSegmentReplayStore,
         default_source_name: str,
         session_role: str,
         live_only: bool = False,
@@ -44,8 +42,12 @@ class PlaybackController:
         self._primary_feed_id = self._primary_runtime.feed.feed_id
         self._output_renderer = output_renderer
         self._recording_manager = recording_manager
-        self._replay_store_manager = replay_store_manager
-        self._replay_buffer = replay_store_manager.get(self._primary_feed_id)
+        # Slice 4.D: replaced the legacy `ReplayStoreManager` /
+        # `ReplayBuffer` rolling-frame store with the segment-index-backed
+        # `RecordingSegmentReplayStore`. Eligibility checks use the new
+        # store's `is_replay_available` gate; actual segment-file replay
+        # rendering is deferred to slice 4.C.tail (see `r3_app_architecture.md`).
+        self._replay_store = replay_store
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
@@ -54,7 +56,6 @@ class PlaybackController:
         self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
         self._latest_live_frame: MediaFrame | None = None
         self._latest_live_by_feed: dict[str, MediaFrame] = {}
-        self._display_replay_ref: ReplayFrameRef | None = None
         self._latest_live_overlay = FrameOverlayInfo()
         self._latest_live_timestamp: float | None = None
         self._playback_timestamp: float | None = None
@@ -97,7 +98,7 @@ class PlaybackController:
         return self._primary_feed_id
 
     def pause_playback(self) -> None:
-        """Pause only the viewed playback state."""
+        """Pause replay (state-machine only — segment-file rendering pending 4.C.tail)."""
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -114,25 +115,27 @@ class PlaybackController:
                 self._state.error_message = "Cannot pause while the source is unavailable."
                 self._emit_state()
                 return
-            pause_ref = self._replay_buffer.get_frame_ref_at_or_before(base_timestamp)
-            if pause_ref is None:
-                self._state.error_message = "Replay frame is not available yet."
-                self._emit_state()
-                return
             assert self.replay_state is not None
             self.replay_state.transition_to(ReplayState.PAUSED)
             self._playback_timestamp = base_timestamp
             self._playback_rate = 0.0
-            self._display_replay_ref = pause_ref
             self._state.current_playback_mode = PlaybackMode.PAUSED
             self._state.error_message = None
             self._update_state_timestamps_locked()
-            ts = base_timestamp
-        self._render_all_replay_at_timestamp(ts)
+        # TODO(4.C.tail): render the paused frame from the segment file at
+        # `base_timestamp`. For now the renderer keeps showing the most
+        # recent live frame.
         self._emit_state("Playback paused")
 
     def rewind_10_seconds(self) -> None:
-        """Move the viewed output back by ten seconds without stopping ingest."""
+        """Move the viewed output back by ten seconds without stopping ingest.
+
+        Slice 4.D: uses `replay_store.is_replay_available` as the eligibility
+        gate but does not yet decode segment files. Frame rendering for the
+        rewound timeline lands in slice 4.C.tail. Until then this method
+        only drives the replay state machine and the playback clock — the
+        renderer continues to display the latest live frame.
+        """
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -140,17 +143,6 @@ class PlaybackController:
             self._emit_state("Replay unavailable: start game recording first.")
             return
         with self._lock:
-            if not self._replay_buffer.is_running():
-                self._state.error_message = "Replay buffer is not active."
-                self._emit_state()
-                return
-
-            oldest_timestamp, _ = self._replay_buffer.get_buffer_range()
-            if oldest_timestamp is None:
-                self._state.error_message = "Replay frame is not available yet."
-                self._emit_state()
-                return
-
             if self._state.current_playback_mode == PlaybackMode.LIVE:
                 base_timestamp = self._latest_live_timestamp
             else:
@@ -162,25 +154,16 @@ class PlaybackController:
 
             assert self.replay_state is not None
             self.replay_state.transition_to(ReplayState.SEEKING)
-            target_timestamp = max(oldest_timestamp, base_timestamp - 10.0)
-            with time_block("replay_seek"):
-                replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
-            if replay_ref is None:
-                self._state.error_message = "Replay frame is not available yet."
-                # Fall back to live so we don't strand the machine in SEEKING.
-                self.replay_state.transition_to(ReplayState.LIVE_WHILE_RECORDING)
-                self._emit_state()
-                return
+            target_timestamp = base_timestamp - 10.0
             self.replay_state.transition_to(ReplayState.REPLAYING)
             self._playback_timestamp = target_timestamp
             self._playback_rate = 1.0
-            self._display_replay_ref = replay_ref
             self._state.current_playback_mode = PlaybackMode.REPLAY
             self._state.error_message = None
             self._start_replay_clock_locked(target_timestamp)
             self._update_state_timestamps_locked()
-            ts = target_timestamp
-        self._render_all_replay_at_timestamp(ts)
+        # TODO(4.C.tail): seek the segment-file player to `target_timestamp`
+        # and render frames from there.
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def jump_to_live(self) -> None:
@@ -195,7 +178,6 @@ class PlaybackController:
                     self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
             self._playback_timestamp = self._latest_live_timestamp
             self._playback_rate = 1.0
-            self._display_replay_ref = None
             self._state.current_playback_mode = (
                 PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
             )
@@ -277,13 +259,17 @@ class PlaybackController:
         self._emit_state()
 
     def get_display_frame(self) -> MediaFrame | None:
-        """Return the frame the UI should currently display (primary feed)."""
+        """Return the frame the UI should currently display (primary feed).
+
+        Slice 4.D: replay-mode frame retrieval is stubbed pending 4.C.tail
+        — the rolling JPEG buffer is gone and segment-file replay is not
+        yet wired in. For now we always return the latest live frame; the
+        operator UI will continue to render live pixels even while the
+        controller is in REPLAY/PAUSED state. The replay overlay still
+        reports the seek target via `playback_overlay`.
+        """
         with self._lock:
-            if self._state.current_playback_mode == PlaybackMode.LIVE:
-                return self._latest_live_frame
-            if self._playback_timestamp is None:
-                return None
-            return self._replay_buffer.get_frame_at_or_before(self._playback_timestamp)
+            return self._latest_live_frame
 
     def shutdown(self) -> None:
         """Stop timers owned by this output session."""
@@ -380,7 +366,6 @@ class PlaybackController:
             self._stop_replay_clock_locked()
             self._playback_timestamp = self._latest_live_timestamp
             self._playback_rate = 1.0
-            self._display_replay_ref = None
             self._state.current_playback_mode = (
                 PlaybackMode.LIVE
                 if self._state.source_connected
@@ -392,15 +377,14 @@ class PlaybackController:
     def _replay_actions_allowed(self) -> bool:
         """Return True when replay transport is permitted by recording state.
 
-        Per §10.4 / §15.2: replay is bound to long recording. Until the
-        operator presses Start Game Recording the rolling buffer still fills,
-        but transport actions (pause / rewind / slow / jump-to-live) are
-        rejected by the doc's contract and surfaced to the operator.
+        Per §10.4 / §15.2: replay is bound to long recording. The
+        `RecordingSegmentReplayStore` mirrors this rule via
+        `is_replay_available(recording_state=...)`.
         """
         if self.replay_state is None:
             return False
-        return (
-            self._recording_manager.recording_state.state == RecordingState.RECORDING
+        return self._replay_store.is_replay_available(
+            recording_state=self._recording_manager.recording_state.state
         )
 
     def _emit_state(self, status_message: str | None = None) -> None:
@@ -429,6 +413,11 @@ class PlaybackController:
             LOGGER.info("Replay clock stopped")
 
     def _on_replay_timer_tick(self) -> None:
+        """Advance the replay-clock playback timestamp.
+
+        Slice 4.D: the clock advances and `playback_overlay` reports
+        progress, but no frames are decoded — that wires up in 4.C.tail.
+        """
         with self._lock:
             if self._state.current_playback_mode != PlaybackMode.REPLAY:
                 self._stop_replay_clock_locked()
@@ -437,23 +426,16 @@ class PlaybackController:
             anchor_monotonic = self._replay_clock_anchor_monotonic
         if anchor_timestamp is None or anchor_monotonic is None:
             return
-        oldest_timestamp, latest_timestamp = self._replay_buffer.get_buffer_range()
-        if oldest_timestamp is None or latest_timestamp is None:
-            return
         elapsed_seconds = max(0.0, time.monotonic() - anchor_monotonic) * self._playback_rate
-        target_timestamp = min(latest_timestamp, max(oldest_timestamp, anchor_timestamp + elapsed_seconds))
-        replay_ref = self._replay_buffer.get_frame_ref_at_or_before(target_timestamp)
-        if replay_ref is None:
-            return
+        target_timestamp = anchor_timestamp + elapsed_seconds
+        if self._latest_live_timestamp is not None:
+            target_timestamp = min(target_timestamp, self._latest_live_timestamp)
         with self._lock:
             if self._state.current_playback_mode != PlaybackMode.REPLAY:
                 return
             self._playback_timestamp = target_timestamp
-            self._display_replay_ref = replay_ref
             self._state.error_message = None
             self._update_state_timestamps_locked()
-            ts = target_timestamp
-        self._render_all_replay_at_timestamp(ts)
         self._emit_state()
 
     def _on_overlay_timer_tick(self) -> None:
@@ -465,17 +447,21 @@ class PlaybackController:
 
     def _update_state_timestamps_locked(self) -> None:
         self._state.last_frame_timestamp = self._latest_live_timestamp
-        self._state.replay_buffer_span_seconds = self._replay_buffer.get_available_duration()
+        # Slice 4.D: rolling-buffer span no longer exists. The
+        # segment-index store tracks coverage in PTS nanoseconds; mapping
+        # that to wall-clock seconds for the operator UI lands in
+        # 4.C.tail. Report 0.0 until then.
+        self._state.replay_buffer_span_seconds = 0.0
         if self._state.current_playback_mode == PlaybackMode.LIVE or self._playback_timestamp is None:
             self._state.seconds_behind_live = 0.0
-        else:
-            self._state.seconds_behind_live = self._replay_buffer.get_seconds_behind_live(
-                self._playback_timestamp
+        elif self._latest_live_timestamp is not None:
+            self._state.seconds_behind_live = max(
+                0.0, self._latest_live_timestamp - self._playback_timestamp
             )
+        else:
+            self._state.seconds_behind_live = 0.0
         if self._state.current_playback_mode == PlaybackMode.LIVE:
             self._state.frame_overlay = self._latest_live_overlay
-        elif self._display_replay_ref is not None:
-            self._state.frame_overlay = self._frame_overlay_from_replay_ref(self._display_replay_ref)
         else:
             self._state.frame_overlay = FrameOverlayInfo(
                 feed_id=self._latest_live_overlay.feed_id,
@@ -492,14 +478,6 @@ class PlaybackController:
             status_text=self._build_overlay_status_locked(),
         )
 
-    def _frame_overlay_from_replay_ref(self, replay_ref: ReplayFrameRef) -> FrameOverlayInfo:
-        return FrameOverlayInfo(
-            feed_id=replay_ref.feed_id,
-            source_name=replay_ref.source_name,
-            frame_id=replay_ref.frame_id,
-            capture_timestamp=replay_ref.timestamp,
-        )
-
     def _build_overlay_status_locked(self) -> str | None:
         if self._state.current_playback_mode == PlaybackMode.PAUSED:
             return "Capture, recording, and replay buffering continue"
@@ -511,15 +489,3 @@ class PlaybackController:
         if self._state.current_playback_mode == PlaybackMode.SOURCE_LOST:
             return self._state.error_message or "Waiting for the selected source"
         return self._state.warning_message
-
-    def _render_all_replay_at_timestamp(self, timestamp: float) -> None:
-        """Draw each feed at the same logical timeline position (primary clock)."""
-        for runtime in self._feed_runtimes:
-            feed_id = runtime.feed.feed_id
-            buf = self._replay_store_manager.get(feed_id)
-            ref = buf.get_frame_ref_at_or_before(timestamp)
-            if ref is None:
-                continue
-            frame = buf.get_frame_at_or_before(ref.timestamp)
-            if frame is not None:
-                self._output_renderer.show_frame(frame)

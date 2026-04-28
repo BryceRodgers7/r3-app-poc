@@ -9,7 +9,13 @@
       "Bash(python -c ' *)",
       "Bash(grep -E \"^Ran|FAIL|OK$|ERROR\")",
       "Read(//tmp/**)",
-      "Bash(python -m unittest discover -s tests -b)"
+      "Bash(python -m unittest discover -s tests -b)",
+      "Bash(python -m pytest tests/ -x --tb=short)",
+      "Bash(python -c \"from app.core.application_coordinator import build_default_application_coordinator, ApplicationCoordinator; print\\('coordinator imports OK'\\)\")",
+      "Bash(python -c \"from app.media import PipelineManager, NDIReceiver, PreviewOutput, SourceInterface, TestSource; print\\('media imports OK'\\)\")",
+      "Bash(python -c \"from app.main import main; print\\('app.main imports OK'\\)\")",
+      "Bash(python -c \"import main; print\\('main imports OK'\\)\")",
+      "Bash(python -m pytest tests/ --tb=short)"
     ]
   }
 }

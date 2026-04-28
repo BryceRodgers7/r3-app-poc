@@ -33,8 +33,6 @@ live_audio_monitor_enabled = false
 audio_sample_rate = 44100
 audio_channels = 1
 audio_bitrate = 96000
-audio_container = "mp4"
-replay_audio_segment_seconds = 1.5
 
 [source]
 kind = "ndi"
@@ -58,8 +56,6 @@ ndi_name = "OBS-PC (Camera)"
         self.assertEqual(settings.audio_sample_rate, 44100)
         self.assertEqual(settings.audio_channels, 1)
         self.assertEqual(settings.audio_bitrate, 96000)
-        self.assertEqual(settings.audio_container, "mp4")
-        self.assertEqual(settings.replay_audio_segment_seconds, 1.5)
 
     def test_load_rejects_legacy_auto_kind_with_migration_hint(self) -> None:
         with TemporaryDirectory() as temp_dir:

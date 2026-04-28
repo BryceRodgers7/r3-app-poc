@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from app.config.settings import AppSettings
-from app.core.models import FeedPaths, SessionPaths
+from app.core.models import SessionPaths
 
 
 class RecordingSettingsTests(unittest.TestCase):

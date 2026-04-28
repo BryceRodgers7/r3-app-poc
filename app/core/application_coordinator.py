@@ -18,10 +18,7 @@ from app.storage.segment_replay_store import RecordingSegmentReplayStore
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
-from app.media.recorder import Recorder
 from app.media.recording_manager import RecordingManager
-from app.media.replay_buffer import ReplayBuffer
-from app.media.replay_store_manager import ReplayStoreManager
 from app.media.source_factory import build_source_for_feed
 from app.storage.session_manager import SessionManager
 
@@ -36,7 +33,6 @@ class ApplicationCoordinator:
         feed_registry: FeedRegistry,
         feed_runtimes: dict[str, FeedRuntime],
         recording_manager: RecordingManager,
-        replay_store_manager: ReplayStoreManager,
         telemetry_hub: TelemetryHub,
         operator_renderer: MultiFeedOutputRenderer,
         program_renderer: MultiFeedOutputRenderer,
@@ -47,7 +43,6 @@ class ApplicationCoordinator:
         self.feed_registry = feed_registry
         self._feed_runtimes = feed_runtimes
         self._recording_manager = recording_manager
-        self._replay_store_manager = replay_store_manager
         self.telemetry_hub = telemetry_hub
         self.operator_renderer = operator_renderer
         self.program_renderer = program_renderer
@@ -67,7 +62,7 @@ class ApplicationCoordinator:
             feed_runtimes=enabled_runtimes,
             output_renderer=operator_renderer,
             recording_manager=recording_manager,
-            replay_store_manager=replay_store_manager,
+            replay_store=self.replay_store,
             default_source_name=primary_feed.display_name,
             session_role="operator",
             live_only=False,
@@ -76,7 +71,7 @@ class ApplicationCoordinator:
             feed_runtimes=enabled_runtimes,
             output_renderer=program_renderer,
             recording_manager=recording_manager,
-            replay_store_manager=replay_store_manager,
+            replay_store=self.replay_store,
             default_source_name=primary_feed.display_name,
             session_role="program",
             live_only=True,
@@ -159,13 +154,23 @@ class ApplicationCoordinator:
         self.operator_controller.signals.status_message.emit("Game recording started.")
 
     def advance_short_segments(self) -> None:
-        """Close the current rally clip and start the next on every feed."""
+        """Close the current rally clip and start the next on every feed.
+
+        Slice 4.D: short-clip "advance segment" was driven by the legacy
+        `Recorder.advance_short_segment()` writer-rotation. Recording now
+        rotates segments inside `splitmuxsink` on a fixed cadence
+        (§6.5 — `recording_segment_duration_seconds`); manual advancement
+        will be re-introduced via splitmuxsink's `split-now` action signal
+        in a later slice. For now this method only emits status.
+        """
         if not self._recording_manager.is_any_recording():
             self.operator_controller.signals.status_message.emit("Start game recording before starting a clip.")
             return
-        for runtime in self._feed_runtimes.values():
-            runtime.recorder.advance_short_segment()
-        self.operator_controller.signals.status_message.emit("Started next clip.")
+        # TODO(post-4.D): emit `splitmuxsink.split-now` per-feed when
+        # short-clip boundaries are reattached to the operator UI.
+        self.operator_controller.signals.status_message.emit(
+            "Short-clip advance is paused while §6.5 segment cadence is splitmuxsink-driven."
+        )
 
     def initialize(self) -> None:
         """Start storage, ingest, and playback sessions."""
@@ -192,8 +197,6 @@ class ApplicationCoordinator:
         self.program_controller.shutdown()
         for runtime in self._feed_runtimes.values():
             runtime.stop()
-        self._recording_manager.stop_all()
-        self._replay_store_manager.stop_all()
         self._session_manager.close()
         default_health_log().close()
 
@@ -208,26 +211,16 @@ def build_default_application_coordinator(
     """Build the default coordinator graph for the current app."""
     feed_registry = FeedRegistry.build_default(settings)
     recording_manager = RecordingManager()
-    replay_store_manager = ReplayStoreManager()
     telemetry_hub = TelemetryHub()
     segment_index = SegmentIndex()
     feed_runtimes: dict[str, FeedRuntime] = {}
 
     for feed in feed_registry.get_enabled_feeds():
         source = build_source_for_feed(settings, feed)
-        recorder = Recorder(settings=settings)
-        replay_store = ReplayBuffer(
-            buffer_duration_seconds=settings.replay_buffer_seconds,
-            jpeg_quality=settings.replay_buffer_jpeg_quality,
-            audio_segment_seconds=settings.replay_audio_segment_seconds,
-            audio_bitrate=settings.audio_bitrate,
-        )
         preview_output = PreviewOutput()
         pipeline_manager = PipelineManager(
             source=source,
             preview_output=preview_output,
-            recorder=recorder,
-            replay_buffer=replay_store,
             audio_enabled=settings.enable_embedded_audio,
             live_audio_monitor_enabled=settings.live_audio_monitor_enabled,
             recording_enabled=settings.recording_enabled,
@@ -250,13 +243,9 @@ def build_default_application_coordinator(
             feed=feed,
             source=source,
             pipeline_manager=pipeline_manager,
-            recorder=recorder,
-            replay_store=replay_store,
             feed_state=feed_state,
         )
         feed_runtimes[feed.feed_id] = runtime
-        recording_manager.register(feed.feed_id, recorder)
-        replay_store_manager.register(feed.feed_id, replay_store)
 
     return ApplicationCoordinator(
         settings=settings,
@@ -264,7 +253,6 @@ def build_default_application_coordinator(
         feed_registry=feed_registry,
         feed_runtimes=feed_runtimes,
         recording_manager=recording_manager,
-        replay_store_manager=replay_store_manager,
         telemetry_hub=telemetry_hub,
         operator_renderer=operator_renderer,
         program_renderer=program_renderer,

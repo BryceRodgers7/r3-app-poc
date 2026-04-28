@@ -2047,22 +2047,37 @@ A pragmatic codec choice up front: §5.2 prefers ProRes/DNxHR/MJPEG, with ProRes
 
 **4.C — Replay query API + operator transport integration**
 
-- New `RecordingSegmentReplayStore` implementing the `ReplayStore` interface (or replacing it): given a `(feed_id, target_pts_ns)`, returns a `(segment_path, offset_in_segment_ns)`. Refuses requests outside `[earliest, latest_replayable]` per §6.6 / §15.2. Refuses all requests when `recording_state != RECORDING` per §10.4.
-- Operator's `PlaybackController` transport methods (`rewind_10_seconds`, `pause_playback`, `set_playback_rate`, `jump_to_live`) continue to drive `ReplayState` (slice 2.C); their data lookups are rerouted from `ReplayBuffer.get_frame_ref_at_or_before` to the new replay store's `resolve(target_pts)`.
-- The operator's replay rendering switches from "decode JPEG thumbnail in Python and `show_frame()` it" to "set `_replay_pipeline`'s `playbin` URI to the resolved segment file with a seek offset". The existing `_replay_pipeline` + `d3d11videosink` machinery already exists — this just changes what we feed it.
-- Tests: replay-store eligibility queries (in-window, before-earliest, after-latest, while-not-recording); transport-method integration uses the new store.
+Split into two parts during execution; the data layer was committed cleanly, the operator integration was deferred:
 
-**Exit criteria:** Operator can press Rewind 10s during an active recording and see ~10s-old video play back from a segment file. Slow-motion / pause / jump-to-live continue to work.
+- ✅ **4.C (data layer, committed):** New `RecordingSegmentReplayStore` (`app/storage/segment_replay_store.py`) over the slice 4.B `SegmentIndex`. API: `is_replay_available(recording_state)`, `resolve(feed_id, target_pts_ns, recording_state) -> SegmentReplayLocation | None`, `earliest_pts(feed_id)`, `latest_replayable_pts(feed_id)`, `available_pts_range(feed_id)`. Enforces §10.4 (replay refused when not RECORDING) and §6.6 (in-progress segments excluded). Wired into `ApplicationCoordinator.replay_store`. 13 tests.
+- ⏳ **4.C.tail (deferred):** Operator's `PlaybackController` transport methods (`rewind_10_seconds`, `pause_playback`, `set_playback_rate`, `jump_to_live`) reroute from the legacy `ReplayBuffer.get_frame_ref_at_or_before` to `replay_store.resolve(target_pts)`. Replay rendering switches from "decode JPEG thumbnail and QImage it" to "seek a segment file in `_replay_pipeline` and render via `d3d11videosink`."
 
-**4.D — Delete the rolling JPEG buffer + cleanup pass**
+**Why 4.C.tail was deferred:** the integration has multiple coupled unknowns that are easier to design with the dead replay-buffer code already removed (i.e. after 4.D):
 
-- Delete `app/media/replay_buffer.py` (`ReplayBuffer`, `ReplayStore`, `ReplayFrameRef`, `ReplayMediaSegmentRef`, `ReplayStoreManager`). The new `RecordingSegmentReplayStore` replaces them.
-- Delete `app/media/muxed_writer.py` (`MuxedMediaWriter`) and the parts of `app/media/recorder.py` that drive it.
-- Remove the `_add_branch("replay", ...)` call and `_on_replay_sample` handler from `pipeline_manager.py`. The replay tee branch is gone — replay no longer fans off the live tee, it reads from segment files via `_replay_pipeline`.
-- Remove the diagnostic early-return at the top of `pipeline_manager.start_replay_buffer`; the method becomes a no-op or is deleted.
-- Remove `replay_buffer_seconds`, `replay_buffer_jpeg_quality`, `replay_audio_segment_seconds`, `recording_filename`, `short_segments_subdir`, `short_segment_filename_prefix`, `audio_container` from `AppSettings`. They are obsolete.
-- Update tests that referenced the deleted classes; either delete the tests or rewrite against the new types.
-- Update `ARCHITECTURE.md` to remove the "JPEG-thumb rolling replay" language.
+1. **Replay rendering target.** Two reasonable options. (a) Decode segment frames in Python and feed through the existing `OutputRenderer.show_frame` QImage path — preserves UX, sidesteps the d3d11videosink window-handle complexity that 3.A.3 hit. (b) Reconfigure `_replay_pipeline`'s `uridecodebin` URI at runtime and bind its `d3d11videosink` to the operator's video widget — proper production path, but reopens the 3.A.3 binding issue.
+2. **Replay clock.** The existing `_on_replay_timer_tick` advances `_playback_timestamp` and looks up frames per tick. With segment files, "look up a frame" becomes "decode at offset" — a one-shot decode per tick is wasteful. A persistent decoder pipeline that we feed seeks into is better but more complex.
+3. **Segment boundary handling.** The replay clock might cross from segment N into N+1. The decoder needs to switch files seamlessly. `splitmuxsrc` (the playback counterpart of `splitmuxsink`) does this; using it means another long-lived pipeline.
+4. **Slow-motion.** `set_playback_rate(0.5)` needs the decoder to play at half-speed, or for the clock to advance at half rate while the decoder seeks frame-accurately.
+
+**Behavior in the working tree until 4.C.tail lands:** the operator's transport buttons drive `ReplayState` cleanly (status bar updates, Replay/Slow/Pause indicators reflect state) but do not produce visible video changes. The operator window keeps showing the most recent live frame. After 4.D removes the legacy code, the transport methods are stubbed to call the new replay store but skip rendering — `_render_all_replay_at_timestamp` is a no-op until 4.C.tail.
+
+**Tests delivered:** replay-store eligibility queries (in-window, before-earliest, after-latest, while-not-recording, in-progress-segment-excluded); range queries with mixed complete/writing segments.
+
+**Exit criteria for 4.C.tail (when picked up):** Operator can press Rewind 10s during an active recording and see ~10s-old video play back from a segment file. Slow-motion / pause / jump-to-live continue to work.
+
+**4.D — Delete the rolling JPEG buffer + cleanup pass — ✅ committed**
+
+- ✅ Deleted `app/media/replay_buffer.py` (`ReplayBuffer`, `ReplayStore`, `ReplayFrameRef`, `ReplayMediaSegmentRef`), `app/media/replay_store_manager.py`, `app/media/muxed_writer.py`, and `app/media/recorder.py`. `RecordingSegmentReplayStore` replaces them.
+- ✅ Removed the `_add_branch("replay", ...)` call, `_on_replay_sample` / `_on_replay_audio_sample` / `_on_record_sample` handlers, the entire `_build_replay_pipeline` / `_build_replay_audio_pipeline` / `_teardown_replay_pipeline_locked` block, and the `start_replay_buffer` / `stop_replay_buffer` methods from `pipeline_manager.py`. Replay no longer fans off the live tee; segment-file replay rendering will land in 4.C.tail.
+- ✅ `PipelineManager` constructor signature simplified — `recorder` and `replay_buffer` parameters removed. `FeedRuntime` no longer holds `recorder` / `replay_store` either.
+- ✅ `RecordingManager` simplified to just owning the `RecordingState` machine — no longer holds per-feed `Recorder` instances.
+- ✅ `PlaybackController` now takes `replay_store: RecordingSegmentReplayStore` instead of `replay_store_manager: ReplayStoreManager`. Eligibility checks go through `replay_store.is_replay_available(...)`. Replay rendering paths are stubbed with `TODO(4.C.tail)` markers — the operator's transport buttons drive `ReplayState` and the replay clock cleanly but no frames are decoded yet.
+- ✅ Removed obsolete `AppSettings` fields: `replay_buffer_seconds`, `replay_buffer_jpeg_quality`, `replay_audio_segment_seconds`, `recording_filename`, `recording_manifest_filename`, `short_segments_subdir`, `short_segment_filename_prefix`, `audio_container`.
+- ✅ Deleted `tests/test_recorder.py` and `tests/test_replay_store.py`. Rewrote `tests/test_playback_controller.py` against the new types. Updated `tests/test_app_settings.py` and `tests/test_recording_settings.py`.
+- ✅ Updated `ARCHITECTURE.md` and `CLAUDE.md` to drop "JPEG-thumb rolling replay" language and reflect the segmented-recording + replay-query architecture.
+- ✅ All 189 tests pass.
+
+**Exit criteria for 4.D:** the legacy classes (`ReplayBuffer`, `MuxedMediaWriter`, `Recorder`, `ReplayStoreManager`) are gone; `PlaybackController` compiles and runs against `RecordingSegmentReplayStore`; the live preview path and `splitmuxsink` recording branch are unaffected.
 
 **4.E — Crash recovery + startup segment scan**
 

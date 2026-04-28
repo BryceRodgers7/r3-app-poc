@@ -8,8 +8,6 @@ from app.core.feed_state import FeedState, make_feed_state_machine
 from app.core.models import FeedDefinition, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
 from app.core.state_machine import StateMachine
 from app.media.pipeline_manager import PipelineManager
-from app.media.recorder import Recorder
-from app.media.replay_buffer import ReplayStore
 from app.media.source_interface import SourceInterface
 
 
@@ -21,15 +19,11 @@ class FeedRuntime:
         feed: FeedDefinition,
         source: SourceInterface,
         pipeline_manager: PipelineManager,
-        recorder: Recorder,
-        replay_store: ReplayStore,
         feed_state: StateMachine[FeedState] | None = None,
     ) -> None:
         self.feed = feed
         self.source = source
         self.pipeline_manager = pipeline_manager
-        self.recorder = recorder
-        self.replay_store = replay_store
         self.feed_state = feed_state if feed_state is not None else make_feed_state_machine(
             feed.feed_id, feed.display_name
         )
@@ -45,7 +39,6 @@ class FeedRuntime:
         self.pipeline_manager.set_live_sample_callback(self._on_live_overlay)
         self.feed_state.transition_to(FeedState.CONNECTING)
         connected = self.pipeline_manager.connect_source()
-        self.pipeline_manager.start_replay_buffer(session_paths, feed_id=self.feed.feed_id)
         self.pipeline_manager.start_preview()
         self._started = True
         if not connected:

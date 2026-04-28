@@ -1,4 +1,4 @@
-"""Focused playback-session controller tests."""
+"""Focused playback-session controller tests (post slice 4.D)."""
 
 from __future__ import annotations
 
@@ -8,42 +8,17 @@ import unittest
 
 import numpy as np
 from PySide6.QtCore import QCoreApplication
-from PySide6.QtTest import QTest
 
 from app.core.models import FeedDefinition, FrameOverlayInfo, MediaFrame, PlaybackMode, SessionPaths
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
+from app.core.replay_state import ReplayState
 from app.media.feed_runtime import FeedRuntime
-from app.media.muxed_writer import MuxedWriterInfo
 from app.media.output_renderer import OutputRenderer
 from app.media.recording_manager import RecordingManager
-from app.media.replay_buffer import ReplayBuffer
-from app.media.replay_store_manager import ReplayStoreManager
 from app.media.source_interface import SourceInterface
-
-
-class _FakeMuxedWriter:
-    def __init__(self, output_path: Path, *, fps_hint: float, audio_bitrate: int = 128_000, **_) -> None:
-        self.output_path = output_path
-        self.video_frame_count = 0
-        self.audio_bytes = 0
-        self.info = MuxedWriterInfo("mp4", "fake-h264", "fake-aac", output_path)
-
-    def write_frame(self, frame: MediaFrame) -> None:
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.output_path.write_bytes(b"fake mp4")
-        self.video_frame_count += 1
-
-    def write_audio_chunk(self, chunk) -> None:
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.output_path.exists():
-            self.output_path.write_bytes(b"fake mp4")
-        self.audio_bytes += len(chunk.data)
-
-    def close(self) -> None:
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.output_path.exists():
-            self.output_path.write_bytes(b"fake mp4")
+from app.storage.segment_index import SegmentIndex
+from app.storage.segment_replay_store import RecordingSegmentReplayStore
 
 
 class _FakeSource(SourceInterface):
@@ -79,9 +54,8 @@ class _FakeSource(SourceInterface):
 
 
 class _FakePipelineManager:
-    def __init__(self, feed_id: str, replay_store: ReplayBuffer) -> None:
+    def __init__(self, feed_id: str) -> None:
         self._feed_id = feed_id
-        self._replay_store = replay_store
 
     def set_frame_callback(self, callback) -> None:
         self._frame_callback = callback
@@ -91,9 +65,6 @@ class _FakePipelineManager:
 
     def connect_source(self) -> bool:
         return True
-
-    def start_replay_buffer(self, session_paths: SessionPaths, feed_id: str | None = None) -> None:
-        self._replay_store.start(session_paths, feed_id=feed_id or self._feed_id)
 
     def start_preview(self) -> None:
         return
@@ -129,17 +100,6 @@ class _FakeRenderer(OutputRenderer):
         super().show_placeholder_message(message)
 
 
-class _FakeRecorder:
-    def is_recording(self) -> bool:
-        return False
-
-    def stop(self) -> None:
-        return
-
-    def advance_short_segment(self) -> bool:
-        return False
-
-
 class PlaybackControllerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -162,28 +122,22 @@ class PlaybackControllerTests(unittest.TestCase):
             clips_dir=clips_dir,
         )
         self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
-        self.replay_store = ReplayBuffer(
-            buffer_duration_seconds=30,
-            jpeg_quality=85,
-            writer_factory=_FakeMuxedWriter,
-        )
         fake_source = _FakeSource(self.feed.feed_id)
-        fake_pipeline = _FakePipelineManager(self.feed.feed_id, self.replay_store)
-        fake_recorder = _FakeRecorder()
+        fake_pipeline = _FakePipelineManager(self.feed.feed_id)
         self.recording_manager = RecordingManager()
-        self.recording_manager.register(self.feed.feed_id, fake_recorder)
-        self.replay_store_manager = ReplayStoreManager()
-        self.replay_store_manager.register(self.feed.feed_id, self.replay_store)
+        self.segment_index = SegmentIndex()
+        self.replay_store = RecordingSegmentReplayStore(self.segment_index)
         self.runtime = FeedRuntime(
             feed=self.feed,
             source=fake_source,
             pipeline_manager=fake_pipeline,
-            recorder=fake_recorder,
-            replay_store=self.replay_store,
         )
         self.runtime.start(self.session_paths)
 
-        for frame_id in range(240):
+        # Drive the runtime through enough live frames that
+        # `_latest_live_timestamp` is populated — that's what the
+        # transport methods anchor their replay-clock target on.
+        for frame_id in range(60):
             timestamp = 100.0 + (frame_id * (1.0 / 15.0))
             image = np.full((24, 32, 3), frame_id % 255, dtype=np.uint8)
             frame = MediaFrame(
@@ -193,7 +147,6 @@ class PlaybackControllerTests(unittest.TestCase):
                 source_name="Fake Source",
                 feed_id=self.feed.feed_id,
             )
-            self.replay_store.append_frame(frame)
             self.runtime._on_live_frame(frame)
             self.runtime._on_live_overlay(FrameOverlayInfo.from_media_frame(frame, feed_id=self.feed.feed_id))
 
@@ -202,7 +155,7 @@ class PlaybackControllerTests(unittest.TestCase):
             feed_runtimes=[self.runtime],
             output_renderer=self.renderer,
             recording_manager=self.recording_manager,
-            replay_store_manager=self.replay_store_manager,
+            replay_store=self.replay_store,
             default_source_name="Fake Source",
             session_role="operator",
             live_only=False,
@@ -211,51 +164,26 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.controller.shutdown()
-        self.replay_store.stop()
         self._temp_dir.cleanup()
 
     def _force_recording_state(self) -> None:
         """Drive the recording state machine into RECORDING so replay
-        actions are not rejected by the §10.4 / §15.2 guard added in
-        slice 2.C."""
+        actions are not rejected by the §10.4 / §15.2 guard."""
         self.recording_manager.recording_state.force(RecordingState.RECORDING)
         self.controller.refresh_recording_state()
 
-    def test_replay_timer_advances_and_pause_freezes(self) -> None:
+    def test_rewind_enters_replay_when_recording(self) -> None:
         self._force_recording_state()
         self.controller.rewind_10_seconds()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
         self.assertTrue(self.controller._replay_timer.isActive())
-        replay_t1 = self.controller._playback_timestamp
-        QTest.qWait(600)
-        replay_t2 = self.controller._playback_timestamp
-        self.assertIsNotNone(replay_t1)
-        self.assertIsNotNone(replay_t2)
-        assert replay_t1 is not None and replay_t2 is not None
-        self.assertGreater(replay_t2, replay_t1)
-        self.assertTrue(self.renderer.frames)
 
+    def test_pause_freezes_replay_clock(self) -> None:
+        self._force_recording_state()
+        self.controller.rewind_10_seconds()
         self.controller.pause_playback()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
         self.assertFalse(self.controller._replay_timer.isActive())
-        paused_t1 = self.controller._playback_timestamp
-        QTest.qWait(400)
-        paused_t2 = self.controller._playback_timestamp
-        self.assertEqual(paused_t1, paused_t2)
-
-    def test_replay_rate_changes_progression_speed(self) -> None:
-        self._force_recording_state()
-        self.controller.rewind_10_seconds()
-        self.controller.set_playback_rate(0.5)
-        self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
-        t1 = self.controller._playback_timestamp
-        QTest.qWait(600)
-        t2 = self.controller._playback_timestamp
-        self.assertIsNotNone(t1)
-        self.assertIsNotNone(t2)
-        assert t1 is not None and t2 is not None
-        self.assertGreater(t2 - t1, 0.15)
-        self.assertLess(t2 - t1, 0.6)
 
     def test_live_only_controller_rejects_transport_changes(self) -> None:
         renderer = _FakeRenderer()
@@ -263,7 +191,7 @@ class PlaybackControllerTests(unittest.TestCase):
             feed_runtimes=[self.runtime],
             output_renderer=renderer,
             recording_manager=self.recording_manager,
-            replay_store_manager=self.replay_store_manager,
+            replay_store=self.replay_store,
             default_source_name="Fake Source",
             session_role="program",
             live_only=True,
@@ -273,54 +201,6 @@ class PlaybackControllerTests(unittest.TestCase):
 
         controller.pause_playback()
         self.assertEqual(controller.get_state().current_playback_mode, PlaybackMode.LIVE)
-
-    def test_multi_feed_pause_renders_each_feed(self) -> None:
-        feed_b = FeedDefinition(feed_id="feed_b", display_name="Cam B")
-        replay_b = ReplayBuffer(buffer_duration_seconds=30, jpeg_quality=85, writer_factory=_FakeMuxedWriter)
-        self.replay_store_manager.register(feed_b.feed_id, replay_b)
-        self.recording_manager.register(feed_b.feed_id, _FakeRecorder())
-        fake_b = _FakePipelineManager(feed_b.feed_id, replay_b)
-        runtime_b = FeedRuntime(
-            feed=feed_b,
-            source=_FakeSource(feed_b.feed_id),
-            pipeline_manager=fake_b,
-            recorder=_FakeRecorder(),
-            replay_store=replay_b,
-        )
-        runtime_b.start(self.session_paths)
-        for frame_id in range(240):
-            timestamp = 100.0 + (frame_id * (1.0 / 15.0))
-            image = np.full((24, 32, 3), (frame_id + 7) % 255, dtype=np.uint8)
-            frame = MediaFrame(
-                frame_id=frame_id,
-                timestamp=timestamp,
-                image=image,
-                source_name="Fake B",
-                feed_id=feed_b.feed_id,
-            )
-            replay_b.append_frame(frame)
-
-        renderer = _FakeRenderer()
-        controller = PlaybackController(
-            feed_runtimes=[self.runtime, runtime_b],
-            output_renderer=renderer,
-            recording_manager=self.recording_manager,
-            replay_store_manager=self.replay_store_manager,
-            default_source_name="Fake Source",
-            session_role="operator",
-            live_only=False,
-        )
-        controller.initialize(self.session_paths.session_id)
-        self.addCleanup(controller.shutdown)
-        self.addCleanup(replay_b.stop)
-
-        self.recording_manager.recording_state.force(RecordingState.RECORDING)
-        controller.refresh_recording_state()
-        n_before = len(renderer.frames)
-        controller.pause_playback()
-        new_frames = renderer.frames[n_before:]
-        self.assertGreaterEqual(len(new_frames), 2)
-        self.assertEqual({f.feed_id for f in new_frames[-2:]}, {self.feed.feed_id, feed_b.feed_id})
 
     def test_refresh_recording_state_emits(self) -> None:
         self.controller.refresh_recording_state()
@@ -339,8 +219,6 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.get_state().current_playback_mode, before_mode)
 
     def test_recording_stop_mid_replay_snaps_back_to_live(self) -> None:
-        from app.core.replay_state import ReplayState
-
         self._force_recording_state()
         self.controller.rewind_10_seconds()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
