@@ -153,6 +153,19 @@ class PipelineManager:
         # Slice 5.A: session-clock reference (per-app monotonic origin).
         # Captured at first-buffer of each segment for `pts_to_session_offset_ns`.
         self._session_clock: SessionClock | None = None
+        # Bug-fix flag: set on `disable_file_recording`. The next
+        # `enable_file_recording` checks it and forces splitmuxsink to
+        # rotate via the `split-now` action signal — otherwise
+        # splitmuxsink keeps the previous segment file open across the
+        # disable/enable cycle (no buffers flow while the valve is
+        # closed, so it never reaches `max-size-time` and never opens
+        # a new file). Without the forced rotation, a stop+start cycle
+        # silently appends to the old file until enough fresh PTS time
+        # has flowed for the natural max-size-time threshold to fire,
+        # which can be much later — and crucially, no new segment
+        # filename is generated, so the operator sees "no files on the
+        # second recording".
+        self._recording_was_disabled: bool = False
         self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
         self._recording_container: str = recording_container.strip().lower() or "mkv"
         if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
@@ -211,8 +224,28 @@ class PipelineManager:
         self._recording_segment_counter = max(0, int(start_fragment_index))
         feed_paths = session_paths.get_feed_paths(self._recording_feed_id)
         feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
+        # If a prior `disable_file_recording` transitioned splitmuxsink
+        # to NULL (to write the trailer on the current file), bring it
+        # back to PLAYING here BEFORE opening the valve. Otherwise the
+        # first buffers after re-enable hit a NULL splitmuxsink and
+        # are dropped silently, which produces zero-byte files or
+        # nothing at all.
+        if self._recording_was_disabled and self._splitmuxsink is not None:
+            try:
+                state_change = self._splitmuxsink.sync_state_with_parent()
+                LOGGER.info(
+                    "splitmuxsink synced to parent on re-enable for feed_id=%s, result=%s",
+                    self._recording_feed_id,
+                    state_change,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "splitmuxsink sync_state_with_parent failed on re-enable for feed_id=%s",
+                    self._recording_feed_id,
+                )
         self._set_branch_enabled("record", True)
         self._recording_running = True
+        self._recording_was_disabled = False
         LOGGER.info(
             "Recording started for feed_id=%s, segments under %s",
             self._recording_feed_id,
@@ -233,9 +266,36 @@ class PipelineManager:
         (matroskamux + async-finalize=True), so file size is read with
         best-effort accuracy.
         """
+        # Close the valve first so no more buffers reach splitmuxsink
+        # while we transition it to NULL.
         self._recording_running = False
         self._set_branch_enabled("record", False)
         self._finalize_pending_segment_locked()
+        # Force splitmuxsink to finalize the current file. The
+        # PLAYING → NULL state transition triggers matroskamux's
+        # cleanup path which writes the MKV trailer; until that
+        # happens the on-disk file has no end marker and players
+        # treat it as truncated. `split-now` was insufficient — it
+        # only schedules a rotation on the next buffer, which never
+        # arrives once the valve is closed, so the trailer isn't
+        # written until the entire pipeline shuts down on app exit.
+        # We bring splitmuxsink back to PLAYING in `enable_file_recording`.
+        if self._splitmuxsink is not None and self._Gst is not None:
+            try:
+                state_change = self._splitmuxsink.set_state(self._Gst.State.NULL)
+                LOGGER.info(
+                    "splitmuxsink → NULL on disable for feed_id=%s, result=%s",
+                    self._recording_feed_id,
+                    state_change.value_nick if hasattr(state_change, "value_nick") else state_change,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "splitmuxsink NULL transition failed on disable for feed_id=%s",
+                    self._recording_feed_id,
+                )
+        # Mark for state-restore on the next enable. See the flag
+        # docstring in __init__.
+        self._recording_was_disabled = True
         LOGGER.info(
             "Recording stopped for feed_id=%s",
             self._recording_feed_id,

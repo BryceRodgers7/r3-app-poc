@@ -86,6 +86,10 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         pm._pending_segment = None
         pm._metadata_db = None
         pm._segment_index = None
+        # Slice 5+ fields used by enable_file_recording / disable_file_recording.
+        pm._splitmuxsink = None
+        pm._recording_running = False
+        pm._recording_was_disabled = False
         return pm
 
     def _session_paths(self, root: Path) -> SessionPaths:
@@ -136,6 +140,66 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         # No session set; defensive fallback path.
         path = PipelineManager._on_splitmuxsink_format_location(pm, None, 2)
         self.assertTrue(path.endswith("_unrouted_segment_00002.mkv"))
+
+    def test_splitmuxsink_state_cycles_on_disable_and_re_enable(self) -> None:
+        """Bug fix: splitmuxsink only writes the MKV trailer on the
+        current segment file when it transitions PLAYING → NULL.
+        `split-now` was tried first but didn't reliably close the file
+        because no buffer arrives between the emit and the valve close.
+
+        The fix transitions splitmuxsink to NULL on disable (which
+        triggers matroskamux's finalization path → trailer written)
+        and back to PLAYING (via sync_state_with_parent) on the next
+        enable. First enable is a no-op for the state cycle because
+        splitmuxsink was never disabled."""
+        from app.media.pipeline_manager import PipelineManager
+
+        class _StubGst:
+            class State:
+                NULL = "STATE_NULL"
+
+        class _StubSplitmuxsink:
+            def __init__(self) -> None:
+                self.set_state_calls: list = []
+                self.sync_calls = 0
+
+            def set_state(self, state):
+                self.set_state_calls.append(state)
+                # Mimic StateChangeReturn for log line formatting.
+                class _Result:
+                    value_nick = "success"
+                return _Result()
+
+            def sync_state_with_parent(self):
+                self.sync_calls += 1
+                return True
+
+        with TemporaryDirectory() as tmp:
+            session = self._session_paths(Path(tmp))
+            pm = self._build_pm_stub()
+            pm._splitmuxsink = _StubSplitmuxsink()
+            pm._Gst = _StubGst
+            pm._set_branch_enabled = lambda *_args, **_kwargs: None  # no real valve
+
+            # First enable: no state cycle — splitmuxsink already PLAYING.
+            PipelineManager.enable_file_recording(
+                pm, session, feed_id="ndi_main", start_fragment_index=0
+            )
+            self.assertEqual(pm._splitmuxsink.sync_calls, 0)
+            self.assertFalse(pm._recording_was_disabled)
+
+            # Disable: splitmuxsink → NULL forces trailer write.
+            pm._finalize_pending_segment_locked = lambda: None  # bypass DB writes
+            PipelineManager.disable_file_recording(pm)
+            self.assertTrue(pm._recording_was_disabled)
+            self.assertEqual(pm._splitmuxsink.set_state_calls, ["STATE_NULL"])
+
+            # Re-enable: sync_state_with_parent brings it back to PLAYING.
+            PipelineManager.enable_file_recording(
+                pm, session, feed_id="ndi_main", start_fragment_index=5
+            )
+            self.assertEqual(pm._splitmuxsink.sync_calls, 1)
+            self.assertFalse(pm._recording_was_disabled)
 
     def test_format_location_honors_seeded_counter_for_resume(self) -> None:
         # §11.4 Resume: counter starts at the next safe index, e.g. 5.

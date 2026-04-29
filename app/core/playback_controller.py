@@ -260,15 +260,16 @@ class PlaybackController:
             return
         with self._lock:
             assert self.replay_state is not None
+            entering_from_live = (
+                self._state.current_playback_mode
+                in {PlaybackMode.LIVE, PlaybackMode.SOURCE_LOST}
+                or self._playback_session_time_ns is None
+            )
             # If we're entering replay from LIVE/SOURCE_LOST, snap the
             # playback position to the latest replayable session-time
             # so the operator starts at "now" (minus segment-finalize
             # lag) rather than at -10s.
-            if (
-                self._state.current_playback_mode
-                in {PlaybackMode.LIVE, PlaybackMode.SOURCE_LOST}
-                or self._playback_session_time_ns is None
-            ):
+            if entering_from_live:
                 _, latest = self._replay_store.available_session_time_range()
                 if latest is None:
                     self._state.error_message = "Replay frame is not available yet."
@@ -276,6 +277,15 @@ class PlaybackController:
                     return
                 self._playback_session_time_ns = latest
             self._playback_rate = max(0.0, playback_rate)
+            # The replay state machine only allows direct entry to
+            # PAUSED/REPLAYING from LIVE_WHILE_RECORDING (no direct
+            # path to SLOW_MOTION). When entering from live, bounce
+            # through SEEKING → REPLAYING first so the final transition
+            # to SLOW_MOTION/PAUSED is valid. Matches the path
+            # rewind_10_seconds takes.
+            if entering_from_live and self.replay_state.state == ReplayState.LIVE_WHILE_RECORDING:
+                self.replay_state.transition_to(ReplayState.SEEKING)
+                self.replay_state.transition_to(ReplayState.REPLAYING)
             if self._playback_rate == 0.0:
                 self.replay_state.transition_to(ReplayState.PAUSED)
                 self._state.current_playback_mode = PlaybackMode.PAUSED
@@ -333,9 +343,19 @@ class PlaybackController:
             return self._state
 
     def refresh_recording_state(self) -> None:
-        """Re-read recording flags from the recording manager and notify listeners."""
+        """Re-read recording flags from the recording manager and notify listeners.
+
+        Always rebuilds the playback-overlay snapshot before emitting
+        state, regardless of which internal branch ran. This is
+        defense-in-depth — without it, clicking Start Recording on a
+        controller whose `_sync_replay_state_with_recording_locked`
+        early-returns (live_only controllers, or recording-active
+        path) leaves stale overlay text on screen until the next live
+        frame fires.
+        """
         with self._lock:
             self._refresh_recording_state_locked()
+            self._update_state_timestamps_locked()
         self._emit_state()
 
     def get_display_frame(self) -> MediaFrame | None:
@@ -461,6 +481,10 @@ class PlaybackController:
         - Enter `LIVE_WHILE_RECORDING` when long recording starts.
         - Snap any active replay back to live and then to
           `REPLAY_UNAVAILABLE_NOT_RECORDING` when long recording stops.
+        - Always rebuild the playback-overlay snapshot at the end so
+          the operator UI reflects the current state immediately —
+          without this, the overlay pill keeps stale text from before
+          the recording-state change until the next live frame fires.
         """
         if self.replay_state is None:
             return
@@ -471,21 +495,27 @@ class PlaybackController:
         if recording_active:
             if current == ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING:
                 self.replay_state.transition_to(ReplayState.LIVE_WHILE_RECORDING)
-            return
-        if current in ACTIVE_REPLAY_STATES:
-            self.replay_state.transition_to(ReplayState.JUMPING_TO_LIVE)
-            self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
-            self._stop_replay_clock_locked()
-            self._playback_session_time_ns = None
-            self._playback_rate = 1.0
-            self._state.current_playback_mode = (
-                PlaybackMode.LIVE
-                if self._state.source_connected
-                else PlaybackMode.SOURCE_LOST
-            )
-            self._state.feeds_in_freeze_frame = ()
-        elif current == ReplayState.LIVE_WHILE_RECORDING:
-            self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
+        else:
+            if current in ACTIVE_REPLAY_STATES:
+                self.replay_state.transition_to(ReplayState.JUMPING_TO_LIVE)
+                self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
+                self._stop_replay_clock_locked()
+                self._playback_session_time_ns = None
+                self._playback_rate = 1.0
+                self._state.current_playback_mode = (
+                    PlaybackMode.LIVE
+                    if self._state.source_connected
+                    else PlaybackMode.SOURCE_LOST
+                )
+                self._state.feeds_in_freeze_frame = ()
+            elif current == ReplayState.LIVE_WHILE_RECORDING:
+                self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
+        # Always rebuild the playback-overlay snapshot, regardless of
+        # which branch ran (recording active or not). Without this,
+        # clicking Start Recording while the overlay was last refreshed
+        # in some pre-recording state leaves stale data on screen until
+        # the next live-frame callback fires.
+        self._update_state_timestamps_locked()
 
     def _replay_actions_allowed(self) -> bool:
         """Return True when replay transport is permitted by recording state."""

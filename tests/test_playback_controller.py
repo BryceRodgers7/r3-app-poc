@@ -351,6 +351,56 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
         self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
 
+    def test_set_playback_rate_from_live_lands_in_slow_motion_state(self) -> None:
+        """Bug fix: the replay state machine doesn't allow direct
+        LIVE_WHILE_RECORDING → SLOW_MOTION. set_playback_rate(0.5)
+        from LIVE must bounce through SEEKING → REPLAYING first
+        before reaching SLOW_MOTION, otherwise the state-machine
+        rejects the transition and the controller is left in an
+        inconsistent state (current_playback_mode=REPLAY, replay_state
+        still =LIVE_WHILE_RECORDING)."""
+        self._force_recording_state()
+        self.assertEqual(self.controller.replay_state.state, ReplayState.LIVE_WHILE_RECORDING)
+        self.controller.set_playback_rate(0.5)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.SLOW_MOTION)
+        self.assertEqual(
+            self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY
+        )
+
+    def test_set_playback_rate_pause_from_live_lands_in_paused_state(self) -> None:
+        """Same as above for set_playback_rate(0.0) — bounce through
+        SEEKING → REPLAYING → PAUSED rather than direct
+        LIVE_WHILE_RECORDING → PAUSED (which IS in the table, but
+        we go through the same intermediate path for consistency)."""
+        self._force_recording_state()
+        self.controller.set_playback_rate(0.0)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(
+            self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED
+        )
+
+    def test_start_recording_rebuilds_playback_overlay(self) -> None:
+        """Bug fix: clicking Start Recording used to early-return from
+        `_sync_replay_state_with_recording_locked` without rebuilding
+        the playback_overlay snapshot. The fix moved
+        `_update_state_timestamps_locked` outside the early-return so
+        it runs on every refresh — confirms the overlay reflects the
+        post-Start state."""
+        # Pre-recording: refresh state to set a known overlay baseline.
+        self.controller.refresh_recording_state()
+        before = self.controller.get_state().playback_overlay
+        self.assertIsNotNone(before.wall_clock_timestamp)
+        # Now flip recording on. Sync should rebuild overlay.
+        self._force_recording_state()
+        after = self.controller.get_state().playback_overlay
+        self.assertIsNotNone(after.wall_clock_timestamp)
+        # The wall_clock_timestamp should have updated to a more recent value.
+        self.assertGreaterEqual(after.wall_clock_timestamp, before.wall_clock_timestamp)
+        # Mode is LIVE during recording (no replay action yet).
+        self.assertEqual(after.mode, PlaybackMode.LIVE)
+        # No playback timestamp; we're at the live edge.
+        self.assertIsNone(after.playback_timestamp)
+
     def test_set_playback_rate_from_live_does_not_rewind(self) -> None:
         """Bug fix: Slow 1/2 from LIVE used to call `rewind_10_seconds`
         as a side effect, dropping playback to `latest − 10s`. The new
@@ -443,6 +493,30 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertNotEqual(
             self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY
         )
+
+    def test_stop_recording_clears_stale_pause_overlay(self) -> None:
+        """Bug fix: after pausing then stopping recording, the operator
+        UI's playback overlay should NOT keep showing 'PAUSED' /
+        'Behind live: X' from before the stop. Cleanup must rebuild
+        the playback_overlay snapshot so the operator window looks
+        like it did at startup (mode=LIVE, no playback timestamp,
+        seconds_behind_live=0)."""
+        self._force_recording_state()
+        self.controller.pause_playback()
+        self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
+        # Pause set a non-None playback timestamp; sanity-check.
+        paused_overlay = self.controller.get_state().playback_overlay
+        self.assertEqual(paused_overlay.mode, PlaybackMode.PAUSED)
+        self.assertIsNotNone(paused_overlay.playback_timestamp)
+        # Stop recording.
+        self.recording_manager.recording_state.force(RecordingState.NOT_RECORDING)
+        self.controller.refresh_recording_state()
+        # Overlay snapshot should reflect the post-stop state, not
+        # the pre-stop pause.
+        post_stop = self.controller.get_state().playback_overlay
+        self.assertNotEqual(post_stop.mode, PlaybackMode.PAUSED)
+        self.assertIsNone(post_stop.playback_timestamp)
+        self.assertEqual(post_stop.seconds_behind_live, 0.0)
 
     def test_replay_buffer_span_seconds_reflects_segment_index_coverage(self) -> None:
         self._force_recording_state()

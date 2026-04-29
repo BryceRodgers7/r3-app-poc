@@ -27,7 +27,10 @@
       "Bash(python -m pytest tests/test_session_time_queries.py -v --tb=short)",
       "Bash(python -m pytest tests/test_session_time_queries.py tests/test_playback_controller.py tests/test_native_preview.py --tb=short)",
       "Bash(python -m pytest tests/test_session_time_queries.py tests/test_playback_controller.py tests/test_native_preview.py --tb=short -v)",
-      "Bash(python -m pytest tests/test_native_preview.py::VideoWidgetRenderModeFlipTests::test_freeze_badge_toggles_via_set_freeze_indicator -v --tb=long)"
+      "Bash(python -m pytest tests/test_native_preview.py::VideoWidgetRenderModeFlipTests::test_freeze_badge_toggles_via_set_freeze_indicator -v --tb=long)",
+      "Bash(python -m pytest tests/test_playback_controller.py::PlaybackControllerTests::test_stop_recording_clears_stale_pause_overlay -v --tb=short)",
+      "Bash(python -m pytest tests/test_recording_settings.py tests/test_playback_controller.py --tb=short)",
+      "Bash(python -m pytest tests/test_recording_settings.py::SplitmuxsinkFormatLocationTests::test_split_now_emitted_on_re_enable_only -v --tb=long)"
     ]
   }
 }
