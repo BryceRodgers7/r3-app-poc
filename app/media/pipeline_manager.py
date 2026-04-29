@@ -233,8 +233,20 @@ class PipelineManager:
         # we always pick the filename ourselves via the
         # `format-location` callback.
         self._recording_segment_counter = max(0, int(start_fragment_index))
-        feed_paths = session_paths.get_feed_paths(self._recording_feed_id)
-        feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
+        # Pre-create the per-feed dir so format-location's mkdir is a
+        # no-op cache hit on the streaming thread. When `game_subdir` is
+        # set, nest under `<recording>/<game_subdir>/<feed_id>/` so we
+        # don't leave a stray empty `<recording>/<feed_id>/` alongside
+        # the game folder.
+        if game_subdir:
+            target_dir = (
+                session_paths.recording_dir / game_subdir / self._recording_feed_id
+            )
+        else:
+            target_dir = (
+                session_paths.get_feed_paths(self._recording_feed_id).recording_dir
+            )
+        target_dir.mkdir(parents=True, exist_ok=True)
         # If a prior `disable_file_recording` shut down splitmuxsink
         # (NULL state, file got its trailer), rebuild it as a fresh
         # element. The state-cycle approach (NULL → PLAYING) didn't
@@ -256,7 +268,7 @@ class PipelineManager:
         LOGGER.info(
             "Recording started for feed_id=%s, segments under %s",
             self._recording_feed_id,
-            feed_paths.recording_dir,
+            target_dir,
         )
 
     def disable_file_recording(self) -> None:

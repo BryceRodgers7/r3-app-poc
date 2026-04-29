@@ -93,6 +93,10 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         # Per-game folder field — None falls back to the legacy flat
         # layout that this stub expects in its assertions.
         pm._recording_game_subdir = None
+        # disable_file_recording sends EOS via this jpegenc's src pad's
+        # peer. Stays None in tests so the EOS-dispatch branch becomes a
+        # no-op (avoids fabricating a fake pad chain).
+        pm._record_branch_jpegenc = None
         return pm
 
     def _session_paths(self, root: Path) -> SessionPaths:
