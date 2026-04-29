@@ -95,7 +95,12 @@ class MultiFeedVideoPanel(QWidget):
         *,
         program_live_only: bool,
     ) -> None:
-        """Toggle each tile between active preview styling and placeholder-style chrome."""
+        """Toggle each tile between active preview styling and placeholder-style chrome.
+
+        Slice 3.A.3 added the `live` flag so native-mode tiles can
+        switch between the d3d11 surface (LIVE) and the QLabel layer
+        (REPLAY/PAUSED — replay frames arrive via `display_frame`).
+        """
         show_video = True
         if program_live_only:
             show_video = mode is not PlaybackMode.SOURCE_LOST
@@ -105,8 +110,9 @@ class MultiFeedVideoPanel(QWidget):
                 PlaybackMode.PAUSED,
                 PlaybackMode.REPLAY,
             }
+        live = mode == PlaybackMode.LIVE
         for tile in self._tiles.values():
-            tile.set_video_surface_visible(show_video)
+            tile.set_video_surface_visible(show_video, live=live)
 
     def set_global_placeholder(self, text: str) -> None:
         """Apply the same placeholder to every tile (e.g. source lost)."""

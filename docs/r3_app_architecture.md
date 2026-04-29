@@ -1862,7 +1862,10 @@ Notes:
 
 ## Phase 3 – Native GStreamer Data Path for One Feed
 
-**Status: 🟡 In progress, partially blocked.** 3.A.1 and 3.A.2 are complete; 3.B and 3.C landed after Phase 4 (queue policies, queue-depth metrics, saturation-driven health rules, and the transitional pipeline banner are all committed). 3.A.3 (native preview video sink) was attempted and reverted — see slice notes — and remains the only Phase 3 item still open.
+**Status: 🟢 Complete.** All slices land:
+- 3.A.1, 3.A.2: native NDI ingest + pipeline-mode contract.
+- 3.A.3 retry: native preview video sink committed (see slice notes — the original "third window" symptom turned out to be the legacy replay pipeline's d3d11videosink, which Phase 4.D removed; the retry adds leaky per-window queues + a live↔replay surface flip in the widget).
+- 3.B / 3.C: queue policies, queue-depth metrics, saturation-driven health rules, transitional pipeline banner, `app_mode` setting.
 
 ### Blocker discovered during 3.A.3 testing (drives Phase 4 acceleration)
 
@@ -1941,7 +1944,21 @@ A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python o
 
 **Limitation discovered, deferred to 3.A.3:** the **preview** path still pulls every frame into Python via the appsink+`new-sample` signal handler for QImage rendering. At full source resolution and rate (e.g. 2560×1440@60 from a desktop NDI sender) that drowns the GIL and freezes the Qt event loop. Mitigated for now by capping the source-side `videoscale`/`videorate` chain at the operator-configured `target_frame_*` defaults (720p@30); production-grade 1080p@30 needs 3.A.3.
 
-**3.A.3 — Native preview video sink** *(⚠️ Attempted, reverted — needs another approach)*
+**3.A.3 — Native preview video sink** *(✅ Committed on retry after Phase 4)*
+
+**Original failure mode:** the first attempt (pre-Phase 4) hit a "third Direct3D11 renderer" top-level window that kept appearing despite a working `prepare-window-handle` bus handler, and the preview tee fan-out froze within seconds. The most likely root cause was the legacy replay pipeline's own `d3d11videosink` (a third sink we weren't binding), which Phase 4.D removed entirely along with the rolling-replay buffer. With only operator + program sinks remaining, the binding race shrinks to a tractable set.
+
+**Retry shape (committed):**
+
+- `PipelineManager._add_preview_branch` dispatches based on `source.pipeline_mode`: NATIVE → `_add_native_preview_branch` (the d3d11 path), `python_push` → `_add_python_push_preview_branch` (the legacy appsink → QImage path). Synthetic dev source remains on the python_push path because it has no native GStreamer source to feed d3d11 anyway.
+- Per-window queues in `_add_native_preview_branch` are now `leaky=2 (downstream)` + `max-size-time=200ms` + `max-size-buffers=4` so a blocked window (minimized, occluded, dead d3d11 device) drops frames rather than back-pressuring the source tee. This is the single most likely fix for the "tee fan-out froze within seconds" symptom.
+- `VideoWidget` got a live↔replay flip: in native render mode, `set_video_surface_visible(enabled, live=...)` picks `_live_surface` for LIVE and the `_frame_label` QLabel for REPLAY/PAUSED. `display_frame()` also auto-flips to QLabel because receiving a Python frame in native mode means the playback controller is showing a non-live timestamp via `SegmentDecoder`. `MultiFeedVideoPanel.apply_tile_visibility(mode, ...)` derives the `live` flag from `mode == LIVE` and passes it through.
+- `MainWindow` binds the d3d11 sinks for native feeds before `coordinator.initialize()` runs. The role (operator vs program) is derived from `program_live_only`. The bind goes through `coordinator.bind_native_preview_window_handle` which checks `is_native_preview_active(feed_id)` so python_push feeds and the `force_python_push_preview` escape hatch are both honored.
+- `AppSettings.force_python_push_preview` (default `False`) is the operator-level escape hatch — flip to `true` in `[app]` if d3d11 still misbehaves on the local hardware. The qimage path keeps preview Python-bound (~720p ceiling) but is proven stable.
+
+**10 new tests** in `tests/test_native_preview.py`: settings parsing (default / explicit / missing), VideoWidget render-mode flip matrix (qimage default, native live → live_surface, native replay → frame_label, display_frame in native mode flips to qimage, return-to-live flips back, qimage mode ignores live flag, SOURCE_LOST always shows placeholder).
+
+**Outstanding follow-up:** if the tee freeze symptom returns on hardware, the next direction the doc previously suggested still applies — investigate gst-plugins-bad d3d11videosink version-specific behavior, or try gst-plugins-rs `d3d12sink` as a drop-in.
 
 The intended design: replace the operator-window preview path's `appsink → numpy → QImage` round-trip with a native GStreamer video sink (`d3d11videosink` on Windows) that renders directly into each VideoWidget's native window handle. Two sinks per feed (operator + program), bound via `GstVideoOverlay.set_window_handle()` to the per-window `WId()` returned by Qt. A buffer pad probe on `videoconvert.src` would tick metrics and synthesize `FrameOverlayInfo` so the operator's `PlaybackController` state machine still sees frame-arrival events. No pixel data into Python on the preview hot path.
 
@@ -2115,7 +2132,7 @@ The coordinator's `initialize` gained a `resume_session_id` keyword. When set, i
 - **ProRes / DNxHR codec selection.** §5.2's first-choice codecs require `gst-plugins-bad` elements that aren't always available on UCRT64. Add a config-driven codec selector once MJPEG path is solid; this becomes a small Phase-4-bis or a Phase 11 task (hardware acceleration ties into encoder choice).
 - ~~**§11.4 recovery-prompt Resume action.**~~ ✅ Committed. `SessionManager.adopt_session` adopts the existing session_id; `find_next_fragment_index` consults disk + DB to seed the next safe segment index; the bootstrap threads the chosen session_id into `coordinator.initialize(resume_session_id=...)`.
 - ~~**Phase 3.B and 3.C resumption.**~~ ✅ Committed after Phase 4 (queue policies, queue-depth metrics, saturation-driven health rules, transitional pipeline banner, `app_mode` setting).
-- **Native preview video sink (3.A.3 retry).** Same — revisit after Phase 4 reduces concurrent unknowns.
+- ~~**Native preview video sink (3.A.3 retry).**~~ ✅ Committed. NATIVE feeds use d3d11videosink with leaky per-window queues; replay flips the QStackedLayout to the QImage layer so segment-decoder frames remain visible. `force_python_push_preview` config knob is the escape hatch.
 
 ---
 

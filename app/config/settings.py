@@ -42,6 +42,13 @@ class AppSettings:
     # "production" surfaces it loudly so refactors don't accidentally
     # ship a Python-bound preview path.
     app_mode: str = "development"
+    # Slice 3.A.3 escape hatch. When True, the preview path uses the
+    # python_push appsink → QImage chain even for NATIVE-mode sources,
+    # bypassing the d3d11videosink path. Use this when d3d11 binding
+    # misbehaves on the local hardware (third window appearing, tee
+    # fan-out freezes); the cost is keeping preview Python-bound (the
+    # 720p@30 ceiling stays).
+    force_python_push_preview: bool = False
     touch_button_height: int = 72
     default_feed_id: str = "feed_main"
     default_source_name: str = "Test Source"
@@ -117,6 +124,10 @@ class AppSettings:
                     f"valid values are 'development' or 'production'."
                 )
             settings.app_mode = mode
+        if "force_python_push_preview" in app_config:
+            settings.force_python_push_preview = bool(
+                app_config["force_python_push_preview"]
+            )
         if "touch_button_height" in app_config:
             settings.touch_button_height = int(app_config["touch_button_height"])
         if "target_frame_width" in app_config:

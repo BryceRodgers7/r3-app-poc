@@ -68,6 +68,7 @@ class PipelineManager:
         recording_container: str = "mkv",
         recording_audio_enabled: bool = True,
         audio_bitrate: int = 128_000,
+        force_python_push_preview: bool = False,
     ) -> None:
         self._source = source
         self._preview_output = preview_output
@@ -78,6 +79,9 @@ class PipelineManager:
         # explicitly opted in AND the source has audio capability.
         self._recording_audio_enabled = recording_audio_enabled
         self._audio_bitrate = max(8_000, int(audio_bitrate))
+        # Slice 3.A.3 escape hatch — when True, force the appsink/QImage
+        # path even on NATIVE-mode sources.
+        self._force_python_push_preview = force_python_push_preview
         self._preview_running = False
         self._recording_running = False
         self._frame_callback: Callable[[MediaFrame], None] | None = None
@@ -348,21 +352,61 @@ class PipelineManager:
             self._bind_named_video_sink_locked(sink, int(window_handle))
 
     def _bind_named_video_sink_locked(self, sink: Any, window_handle: int) -> None:
-        """Bind one specific sink to a window handle via GstVideoOverlay."""
+        """Bind one specific sink to a window handle via GstVideoOverlay.
+
+        Slice 3.A.3 retry: logs the sink name + handle + binding path
+        taken so when something goes sideways on hardware we can see
+        which sink actually got a usable handle. The two paths are:
+
+        - direct `sink.set_window_handle(handle)` — works on some
+          PyGObject builds where the GstVideoOverlay introspection
+          attaches the method directly.
+        - `GstVideo.VideoOverlay.set_window_handle(sink, handle)` —
+          the canonical interface call; works everywhere but only if
+          GstVideo was loaded.
+        """
+        sink_name = sink.get_name() if sink is not None else "<None>"
         if sink is None or window_handle is None:
+            LOGGER.warning(
+                "video-sink bind skipped: sink=%s handle=%r",
+                sink_name,
+                window_handle,
+            )
             return
         try:
             sink.set_window_handle(window_handle)
+            LOGGER.info(
+                "video-sink bound via direct: sink=%s handle=0x%x",
+                sink_name,
+                int(window_handle),
+            )
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug(
+                "video-sink direct set_window_handle failed for %s: %s",
+                sink_name,
+                exc,
+            )
         GstVideo = self._GstVideo
         if GstVideo is None:
+            LOGGER.warning(
+                "video-sink bind skipped: GstVideo unavailable, sink=%s",
+                sink_name,
+            )
             return
         try:
             GstVideo.VideoOverlay.set_window_handle(sink, window_handle)
+            LOGGER.info(
+                "video-sink bound via GstVideoOverlay: sink=%s handle=0x%x",
+                sink_name,
+                int(window_handle),
+            )
         except Exception:
-            LOGGER.exception("Failed to bind video sink to window handle")
+            LOGGER.exception(
+                "Failed to bind video sink %s to window handle 0x%x",
+                sink_name,
+                int(window_handle),
+            )
 
     def refresh_active_video_output(self) -> None:
         """Ask the active embedded video sink to redraw into the current window."""
@@ -499,6 +543,17 @@ class PipelineManager:
 
             # If window handles were registered before the pipeline was
             # built, bind them to the freshly-created native preview sinks.
+            # Slice 3.A.3 retry: log pre-bind state so it's clear from
+            # the run log whether both sinks got handles before the
+            # pipeline transitions to PLAYING.
+            LOGGER.info(
+                "native-preview pre-bind: operator_sink=%s operator_handle=%r "
+                "program_sink=%s program_handle=%r",
+                self._operator_preview_sink.get_name() if self._operator_preview_sink else None,
+                self._operator_window_handle,
+                self._program_preview_sink.get_name() if self._program_preview_sink else None,
+                self._program_window_handle,
+            )
             if self._operator_preview_sink is not None and self._operator_window_handle is not None:
                 self._bind_named_video_sink_locked(
                     self._operator_preview_sink, self._operator_window_handle
@@ -598,21 +653,30 @@ class PipelineManager:
         raise RuntimeError(f"Unknown branch_name {branch_name!r}")
 
     def _add_preview_branch(self, branch_name: str) -> None:
-        # 3.A.3 attempted to use d3d11videosink + per-window handle binding
-        # for native sources. On Windows + PySide6 + gst-plugins-bad the
-        # binding was unreliable: a third "Direct3D11 renderer" top-level
-        # window kept appearing despite preemptive `set_window_handle()`
-        # calls and a `prepare-window-handle` sync-bus-message handler, and
-        # the preview branch's tee fan-out froze within seconds. Reverted
-        # to the python_push appsink path until a successful native-preview
-        # approach is found (see Phase 3 plan in
-        # `docs/r3_app_architecture.md`). The native preview branch
-        # (`_add_native_preview_branch`) and surrounding contracts
-        # (`set_render_mode`, `bind_native_preview_window_handle`,
-        # `set_native_preview_window_handle`, the
-        # `_promote_feed_state_on_arrival` helper, the `pipeline_mode`
-        # diagnostics) remain in place so the next attempt can flip this
-        # dispatch back without redoing the wiring.
+        """Pick the preview branch shape based on the source's pipeline mode.
+
+        Slice 3.A.3 (retry): NATIVE sources go through
+        `_add_native_preview_branch` (d3d11videosink rendering directly
+        into the window's child surface — no Python pixel hop). The
+        original 3.A.3 attempt was reverted because of a "third
+        Direct3D11 renderer window" symptom; the most likely cause was
+        the legacy replay pipeline's d3d11videosink (which 4.D removed
+        entirely), so this retry should not reproduce that failure.
+
+        `force_python_push_preview` is the operator-level escape hatch
+        — flip it on in `app_settings.toml` if the d3d11 path
+        misbehaves on the local hardware.
+
+        `python_push` sources (synthetic test source) always take the
+        appsink path; they have no native GStreamer source to feed
+        d3d11videosink anyway.
+        """
+        if (
+            self._source.pipeline_mode == PipelineMode.NATIVE
+            and not self._force_python_push_preview
+        ):
+            self._add_native_preview_branch(branch_name)
+            return
         self._add_python_push_preview_branch(branch_name)
 
     def _add_python_push_preview_branch(self, branch_name: str) -> None:
@@ -697,6 +761,7 @@ class PipelineManager:
             f"{branch_name}_program_sink"
         )
 
+        self._configure_preview_queue(queue, branch_name)
         valve.set_property("drop", True)
         for sink in (operator_sink, program_sink):
             self._set_property_if_supported(sink, "sync", False)
@@ -710,11 +775,26 @@ class PipelineManager:
             raise RuntimeError(f"Failed to link the {branch_name} branch head.")
 
         # Each window's sink consumes its own request-pad off the per-branch tee.
+        # Each per-window queue is leaky-downstream + time-bounded so a
+        # blocked window (minimized, occluded, dead d3d11 device) drops
+        # frames rather than back-pressuring the source tee and freezing
+        # the whole pipeline. This is the §4.3 policy applied to the
+        # native-preview window queues — the head queue already has it
+        # via _configure_preview_queue.
         for sink, label in (
             (operator_sink, "operator"),
             (program_sink, "program"),
         ):
             sink_queue = self._make_element("queue", f"{branch_name}_{label}_queue")
+            try:
+                sink_queue.set_property("leaky", 2)  # GST_QUEUE_LEAK_DOWNSTREAM
+                sink_queue.set_property("max-size-buffers", 4)
+                sink_queue.set_property("max-size-time", 200_000_000)  # 200 ms
+                sink_queue.set_property("max-size-bytes", 0)
+            except Exception:
+                LOGGER.exception(
+                    "Failed to configure %s native-preview queue policy", label
+                )
             self._pipeline.add(sink_queue)
             if not sink_queue.link(sink):
                 raise RuntimeError(
@@ -1587,11 +1667,25 @@ class PipelineManager:
         # asking for a window handle, matched against the stored per-role
         # handles. This is the canonical GstVideoOverlay protocol — without
         # it d3d11videosink creates its own top-level window.
+        src_name = message.src.get_name() if message.src is not None else "<None>"
+        LOGGER.info(
+            "prepare-window-handle from sink=%s; "
+            "operator_handle=%r program_handle=%r",
+            src_name,
+            self._operator_window_handle,
+            self._program_window_handle,
+        )
         if (
             self._operator_preview_sink is not None
             and message.src == self._operator_preview_sink
-            and self._operator_window_handle is not None
         ):
+            if self._operator_window_handle is None:
+                LOGGER.warning(
+                    "prepare-window-handle for operator sink but no "
+                    "operator handle stored yet (likely Qt winId race) — "
+                    "d3d11videosink will create its own window."
+                )
+                return
             with self._pipeline_lock:
                 self._bind_named_video_sink_locked(
                     self._operator_preview_sink, self._operator_window_handle
@@ -1600,8 +1694,14 @@ class PipelineManager:
         if (
             self._program_preview_sink is not None
             and message.src == self._program_preview_sink
-            and self._program_window_handle is not None
         ):
+            if self._program_window_handle is None:
+                LOGGER.warning(
+                    "prepare-window-handle for program sink but no "
+                    "program handle stored yet (likely Qt winId race) — "
+                    "d3d11videosink will create its own window."
+                )
+                return
             with self._pipeline_lock:
                 self._bind_named_video_sink_locked(
                     self._program_preview_sink, self._program_window_handle
@@ -1611,6 +1711,11 @@ class PipelineManager:
             with self._pipeline_lock:
                 self._bind_video_sink_locked(message.src)
             return
+        LOGGER.warning(
+            "prepare-window-handle from unrecognized sink=%s — likely "
+            "the source of the unintended third window.",
+            src_name,
+        )
 
     def _set_branch_enabled(self, branch_name: str, enabled: bool) -> None:
         valve = self._branch_valves.get(branch_name)

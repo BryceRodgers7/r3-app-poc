@@ -20,7 +20,19 @@ class VideoWidget(QWidget):
         super().__init__(parent)
         self.setObjectName("videoWidgetRoot")
         self._live_surface = QWidget(self)
+        # `WA_NativeWindow` forces Qt to allocate a native child window so
+        # GStreamer's video sink can render directly into it.
+        # `WA_DontCreateNativeAncestors` is the partner flag — without it
+        # Qt may walk up the parent chain creating native windows on
+        # demand, which on Windows can leave the child winId() returning
+        # a not-yet-realized HWND when MainWindow hasn't been shown yet.
+        # That race is the most likely cause of the slice 3.A.3 "third
+        # unintended window" symptom (one d3d11videosink ends up with
+        # an unusable handle and falls back to creating its own window).
         self._live_surface.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self._live_surface.setAttribute(
+            Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True
+        )
         self._live_surface.setStyleSheet("background-color: #101010;")
         # Force Qt to create the native child window up front so GStreamer can bind to it.
         self._live_surface.winId()
@@ -141,16 +153,30 @@ class VideoWidget(QWidget):
         if self._showing_video_surface:
             self.set_video_surface_visible(True)
 
-    def set_video_surface_visible(self, enabled: bool) -> None:
+    def set_video_surface_visible(self, enabled: bool, *, live: bool = True) -> None:
         """Switch between active-video mode and placeholder mode.
 
-        When `enabled` is True, the active widget depends on the configured
-        render mode: `qimage` keeps the legacy QLabel-with-pixmap path,
-        `native` switches to the `_live_surface` child window so a
-        GStreamer video sink can render directly into it.
+        When `enabled` is True, the surface picked depends on render
+        mode and the `live` flag:
+
+        - `qimage` mode: always show the QLabel pixmap layer (legacy
+          path; replay and live both render into the same QLabel via
+          `display_frame`).
+        - `native` mode + `live=True`: show `_live_surface` so the
+          GStreamer d3d11videosink renders directly. No Python frame
+          hop on the live path.
+        - `native` mode + `live=False` (replay/pause): show the
+          QLabel layer because replay frames arrive via `display_frame`
+          from the segment decoder. `restore_live_surface` flips back
+          when the operator returns to live.
+
+        When `enabled` is False, always show the QLabel placeholder
+        (e.g. SOURCE_LOST).
         """
         self._showing_video_surface = enabled
-        if enabled and self._render_mode == "native":
+        if not enabled:
+            self._surface_stack.setCurrentWidget(self._frame_label)
+        elif self._render_mode == "native" and live:
             self._surface_stack.setCurrentWidget(self._live_surface)
         else:
             self._surface_stack.setCurrentWidget(self._frame_label)
@@ -160,7 +186,17 @@ class VideoWidget(QWidget):
         self.video_surface_resized.emit()
 
     def display_frame(self, frame: MediaFrame) -> None:
-        """Render a new frame inside the preview area."""
+        """Render a new frame inside the preview area.
+
+        In native render mode this is the replay path — receiving a
+        frame here means the playback controller is showing a non-live
+        timestamp, so the QStackedLayout flips to the QLabel layer and
+        leaves the d3d11 native surface running invisibly behind it.
+        `restore_live_surface()` flips back when the operator returns
+        to LIVE.
+        """
+        if self._render_mode == "native" and self._showing_video_surface:
+            self._surface_stack.setCurrentWidget(self._frame_label)
         rgb_image = cv2.cvtColor(frame.image_bgr, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb_image.shape
         bytes_per_line = channels * width

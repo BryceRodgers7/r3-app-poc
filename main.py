@@ -76,6 +76,11 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
         window_title=settings.program_window_title,
         show_controls=False,
         program_live_only=True,
+        # Slice 3.A.3 retry: the program window also needs the coordinator
+        # so its MainWindow.__init__ runs the native-preview bind path.
+        # Without this, only the operator sink got a window handle and the
+        # program sink fell back to creating its own d3d11 top-level window.
+        application_coordinator=coordinator,
     )
     coordinator.initialize(resume_session_id=resume_session_id)
     qt_app.aboutToQuit.connect(coordinator.shutdown)

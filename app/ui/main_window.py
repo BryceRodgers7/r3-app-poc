@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMainWindow, QStatusBar, QVBoxLayout, QWidget
 
 from app.config.settings import AppSettings
+
+LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from app.core.application_coordinator import ApplicationCoordinator
@@ -49,14 +52,33 @@ class MainWindow(QMainWindow):
 
         enabled_feeds = [f for f in feeds if f.enabled]
         self.video_panel = MultiFeedVideoPanel(enabled_feeds, self)
-        # Slice 3.A.3 added per-feed native preview wiring here
-        # (set_render_mode("native") + bind_native_preview_window_handle).
-        # That path was reverted while we work the underlying d3d11videosink
-        # binding issue; until a fresh attempt lands, every widget stays in
-        # the default qimage render mode and renders frames via QImage from
-        # the python_push appsink path.
+        # Slice 3.A.3 (retry): per-feed native preview wiring. For each
+        # feed whose source is in NATIVE pipeline mode, flip the
+        # widget's render_mode to "native" and hand the d3d11videosink
+        # the widget's child-window handle BEFORE the pipeline goes to
+        # PLAYING (handles passed in here are stored on PipelineManager
+        # and re-applied during `_build_pipeline`). Sources in
+        # `python_push` mode (synthetic test source) stay in the qimage
+        # path. The `force_python_push_preview` setting overrides this
+        # to keep everyone on the qimage path.
+        role = "program" if program_live_only else "operator"
         for feed_id, widget in self.video_panel.widgets_by_feed_id.items():
             self._output_renderer.bind_feed_widget(feed_id, widget)
+            if (
+                application_coordinator is not None
+                and application_coordinator.is_native_preview_active(feed_id)
+            ):
+                widget.set_render_mode("native")
+                handle = widget.get_video_surface_handle()
+                LOGGER.info(
+                    "native-preview MainWindow bind: role=%s feed=%s handle=0x%x",
+                    role,
+                    feed_id,
+                    int(handle),
+                )
+                application_coordinator.bind_native_preview_window_handle(
+                    role, feed_id, handle
+                )
 
         self.controls_widget = (
             ControlsWidget(button_height=settings.touch_button_height, parent=self)

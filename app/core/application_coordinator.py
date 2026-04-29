@@ -105,14 +105,26 @@ class ApplicationCoordinator:
 
         `role` is `"operator"` or `"program"`. No-op when the feed's source
         runs in `python_push` mode (those sources render via the legacy
-        QImage path and don't have native preview sinks to bind).
+        QImage path and don't have native preview sinks to bind), or when
+        the 3.A.3 `force_python_push_preview` escape hatch is on.
         """
         runtime = self._feed_runtimes.get(feed_id)
         if runtime is None:
             return
         if runtime.source.pipeline_mode != PipelineMode.NATIVE:
             return
+        if self._settings.force_python_push_preview:
+            return
         runtime.pipeline_manager.set_native_preview_window_handle(role, window_handle)
+
+    def is_native_preview_active(self, feed_id: str) -> bool:
+        """Return True when `feed_id` is using the d3d11 native-preview path."""
+        runtime = self._feed_runtimes.get(feed_id)
+        if runtime is None:
+            return False
+        if self._settings.force_python_push_preview:
+            return False
+        return runtime.source.pipeline_mode == PipelineMode.NATIVE
 
     def get_app_state(self) -> AppState:
         """Aggregate the four sub-state machines into the top-level `AppState`."""
@@ -295,6 +307,7 @@ def build_default_application_coordinator(
             recording_container=settings.recording_container,
             recording_audio_enabled=settings.recording_audio_enabled,
             audio_bitrate=settings.audio_bitrate,
+            force_python_push_preview=settings.force_python_push_preview,
         )
         feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
         feed_metrics.set_pipeline_mode(source.pipeline_mode.value)

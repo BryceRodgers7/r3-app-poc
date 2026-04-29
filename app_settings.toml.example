@@ -10,9 +10,14 @@ base_data_dir = "C:\\SportsReplay"
 # surfaces it as a high-contrast warning so refactors don't accidentally
 # regress feeds back to Python push.
 app_mode = "development"
-# Dev defaults at 720p@30. Raising these is safe now that Phase 4 is
-# done (recording is native via splitmuxsink); preview is still
-# Python-bound until slice 3.A.3 lands (native preview video sink).
+# Slice 3.A.3 escape hatch. When true, NATIVE sources still use the
+# legacy appsink → QImage preview path. Useful if d3d11videosink
+# misbehaves on the local hardware (third window appearing, tee
+# fan-out freezes); cost is a Python-bound preview path.
+force_python_push_preview = false
+# Dev defaults at 720p@30. With both Phase 4 (native segmented
+# recording) and slice 3.A.3 (native preview) done, raising these to
+# 1080p@30 is safe for NATIVE sources.
 target_frame_width = 1280
 target_frame_height = 720
 target_fps = 30.0
@@ -58,18 +63,3 @@ enabled = true
 # display_name = "Synthetic Test Pattern"
 # kind = "synthetic"
 # enabled = true
-
-[source]
-# Used only when no [[feeds]] entries are defined.
-# Use "ndi" for production NDI cameras.
-# Use "synthetic" for camera-less development.
-kind = "synthetic"
-
-# User-facing label shown in the UI and session metadata.
-display_name = "Main Feed"
-feed_id = "feed_main"
-
-# Used when kind = "ndi". Format is `HOSTNAME (Source Name)`.
-# Example:
-# ndi_name = "OBS PGM"
-ndi_name = ""
