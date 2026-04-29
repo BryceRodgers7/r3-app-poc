@@ -274,31 +274,77 @@ class PipelineManager:
     def disable_file_recording(self) -> None:
         """Close the record branch's valve so segmented recording stops (Phase 4.A).
 
-        The current splitmuxsink segment may be slightly truncated (no
-        explicit EOS); 4.E's startup scan quarantines or repairs incomplete
-        segments. The valve stays closed until the operator clicks Start
-        again, at which point splitmuxsink continues with the next
-        sequential fragment id under the same session/feed.
+        Three things have to happen for the user-visible last segment of
+        a game to be playable on disk:
 
-        Slice 4.B: flush the in-progress segment's metadata into the DB
-        + index. The on-disk file may still be finalizing asynchronously
-        (matroskamux + async-finalize=True), so file size is read with
-        best-effort accuracy.
+        1. matroskamux must see EOS on its sink pads (otherwise it never
+           writes the EBML trailer — the file becomes a truncated stream
+           with no seek index, which is what produced "no video, time
+           keeps counting" in replay).
+        2. The OLD segment's DB row must be written *with* the trailer
+           in place, so `size_bytes` reflects reality.
+        3. We must NOT then record the post-rotation segment that
+           splitmuxsink opens — that one only contains a few frames at
+           most and would itself be missing a trailer.
+
+        The mechanism is `split-now`: emitted while the valve is still
+        open, splitmuxsink rotates on the next buffer, which sends EOS to
+        the OLD muxer (trailer write) and runs `format-location` for a
+        NEW segment (which calls `_finalize_pending_segment_locked` for
+        the OLD one — properly recording it). After a brief sleep to let
+        the rotation + async-finalize worker thread complete, we close
+        the valve and drop the new (post-split) pending segment.
         """
-        # Close the valve first so no more buffers reach splitmuxsink
-        # while we transition it to NULL.
+        counter_before = self._recording_segment_counter
+
+        # 1. Emit split-now while buffers can still reach splitmuxsink.
+        if self._splitmuxsink is not None:
+            try:
+                self._splitmuxsink.emit("split-now")
+                LOGGER.info(
+                    "split-now emitted on disable for feed_id=%s",
+                    self._recording_feed_id,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "split-now emission failed for feed_id=%s",
+                    self._recording_feed_id,
+                )
+
+        # 2. Wait for the next buffer to arrive at splitmuxsink (so the
+        # split actually fires) plus enough headroom for async-finalize's
+        # worker thread to write the matroskamux trailer to disk. ~300ms
+        # is generous for 30fps + the trailer write itself (a few KB).
+        time.sleep(0.3)
+
+        # 3. Close the valve. Any post-split frames already captured into
+        # the throwaway segment are discarded below.
         self._recording_running = False
         self._set_branch_enabled("record", False)
+
+        # 4. If split-now fired, the OLD segment is already in the DB
+        # (format-location's auto-finalize ran on rotation) and its
+        # trailer is on disk. The current `_pending_segment` is the
+        # post-split throwaway — drop it without recording so we don't
+        # leave a tiny, trailer-less DB row that confuses replay.
+        split_fired = self._recording_segment_counter > counter_before
+        if split_fired:
+            self._pending_segment = None
+            LOGGER.info(
+                "disable: split-now confirmed for feed_id=%s; "
+                "dropping partial post-split segment",
+                self._recording_feed_id,
+            )
+        else:
+            LOGGER.warning(
+                "disable: split-now did not fire for feed_id=%s "
+                "within timeout; finalizing in-flight segment as "
+                "best-effort (may lack trailer)",
+                self._recording_feed_id,
+            )
         self._finalize_pending_segment_locked()
-        # Force splitmuxsink to finalize the current file. The
-        # PLAYING → NULL state transition triggers matroskamux's
-        # cleanup path which writes the MKV trailer; until that
-        # happens the on-disk file has no end marker and players
-        # treat it as truncated. `split-now` was insufficient — it
-        # only schedules a rotation on the next buffer, which never
-        # arrives once the valve is closed, so the trailer isn't
-        # written until the entire pipeline shuts down on app exit.
-        # We bring splitmuxsink back to PLAYING in `enable_file_recording`.
+
+        # 5. Tear splitmuxsink down. enable_file_recording rebuilds it.
         if self._splitmuxsink is not None and self._Gst is not None:
             try:
                 state_change = self._splitmuxsink.set_state(self._Gst.State.NULL)
@@ -312,8 +358,6 @@ class PipelineManager:
                     "splitmuxsink NULL transition failed on disable for feed_id=%s",
                     self._recording_feed_id,
                 )
-        # Mark for state-restore on the next enable. See the flag
-        # docstring in __init__.
         self._recording_was_disabled = True
         LOGGER.info(
             "Recording stopped for feed_id=%s",

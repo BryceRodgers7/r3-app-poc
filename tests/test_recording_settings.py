@@ -172,6 +172,7 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.set_state_calls: list = []
+                self.emit_calls: list = []
                 _StubSplitmuxsink.instance_counter += 1
                 self.instance_id = _StubSplitmuxsink.instance_counter
 
@@ -180,6 +181,14 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
                 class _Result:
                     value_nick = "success"
                 return _Result()
+
+            def emit(self, signal_name, *_args):
+                # `disable_file_recording` emits "split-now" before
+                # tearing the element down. The stub records the call
+                # so the test can assert on it; counter-bumping (which
+                # the real format-location callback would do on the
+                # streaming thread) stays out of scope here.
+                self.emit_calls.append(signal_name)
 
         # Reset class-level counter so test ordering doesn't matter.
         _StubSplitmuxsink.instance_counter = 0
@@ -204,10 +213,12 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
             self.assertIs(pm._splitmuxsink, initial_sink)
             self.assertFalse(pm._recording_was_disabled)
 
-            # Disable: splitmuxsink → NULL forces trailer write.
+            # Disable: splitmuxsink emits split-now (so the OLD muxer
+            # writes its trailer) and then transitions to NULL.
             pm._finalize_pending_segment_locked = lambda: None
             PipelineManager.disable_file_recording(pm)
             self.assertTrue(pm._recording_was_disabled)
+            self.assertEqual(pm._splitmuxsink.emit_calls, ["split-now"])
             self.assertEqual(pm._splitmuxsink.set_state_calls, ["STATE_NULL"])
 
             # Re-enable: a fresh splitmuxsink instance replaces the old.
