@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
 
+from app.core.disk_budget import BudgetVerdict
 from app.core.health_events import default_log
 from app.core.telemetry import TelemetryHub, latency_snapshots
 
@@ -48,12 +49,14 @@ class DiagnosticsWidget(QFrame):
         self._app_state_label = QLabel("-")
         self._feeds_label = QLabel("-")
         self._disk_label = QLabel("-")
+        self._disk_budget_label = QLabel("-")
         self._latency_label = QLabel("-")
         self._health_label = QLabel("-")
         for label in (
             self._app_state_label,
             self._feeds_label,
             self._disk_label,
+            self._disk_budget_label,
             self._latency_label,
             self._health_label,
         ):
@@ -67,6 +70,7 @@ class DiagnosticsWidget(QFrame):
         layout.addWidget(self._app_state_label)
         layout.addWidget(self._feeds_label)
         layout.addWidget(self._disk_label)
+        layout.addWidget(self._disk_budget_label)
         layout.addWidget(self._latency_label)
         layout.addWidget(self._health_label)
 
@@ -141,6 +145,8 @@ class DiagnosticsWidget(QFrame):
                 f"write {disk.write_mb_s_estimate:.1f} MB/s"
             )
 
+        self._update_disk_budget_label()
+
         lat = [s for s in latency_snapshots() if s.count > 0]
         if not lat:
             self._latency_label.setText("latency: (idle)")
@@ -161,6 +167,25 @@ class DiagnosticsWidget(QFrame):
             f"recording_branch_saturated: "
             f"{log.category_count('recording_branch_saturated')}"
         )
+
+    def _update_disk_budget_label(self) -> None:
+        """Render the Phase 7.A `disk: X/Y MB/s est ✓⚠✗` readout."""
+        coord = self._coordinator
+        assessment = getattr(coord, "disk_budget", None) if coord is not None else None
+        if assessment is None:
+            self._disk_budget_label.setText("disk budget: (not assessed)")
+            self._disk_budget_label.setStyleSheet("")
+            return
+        glyph, color = {
+            BudgetVerdict.OK: ("✓", "#9ece6a"),
+            BudgetVerdict.WARN: ("⚠", "#ffd866"),
+            BudgetVerdict.OVER_BUDGET: ("✗", "#ff6e6e"),
+        }[assessment.verdict]
+        self._disk_budget_label.setText(
+            f"disk budget: {assessment.estimated_mb_s:.0f}/"
+            f"{assessment.budget_mb_s:.0f} MB/s est {glyph}"
+        )
+        self._disk_budget_label.setStyleSheet(f"QLabel {{ color: {color}; }}")
 
     def _update_pipeline_banner(self, snaps) -> None:
         """Show / hide the §3.C transitional pipeline banner."""

@@ -9,9 +9,14 @@ from app.core.session_clock import SessionClock
 
 LOGGER = logging.getLogger(__name__)
 from app.core.application_state import AppState, compute_app_state
+from app.core.disk_budget import (
+    BudgetVerdict,
+    DiskBudgetAssessment,
+    assess_disk_budget,
+)
 from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
-from app.core.health_events import default_log as default_health_log
+from app.core.health_events import HealthSeverity, default_log as default_health_log
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
 from app.core.session_state import SessionState
@@ -49,6 +54,7 @@ class ApplicationCoordinator:
         program_renderer: MultiFeedOutputRenderer,
         segment_index: SegmentIndex | None = None,
         session_clock: SessionClock | None = None,
+        disk_budget: DiskBudgetAssessment | None = None,
     ) -> None:
         self._settings = settings
         self._session_manager = session_manager
@@ -58,6 +64,10 @@ class ApplicationCoordinator:
         self.telemetry_hub = telemetry_hub
         self.operator_renderer = operator_renderer
         self.program_renderer = program_renderer
+        # Phase 7.A: stashed for `DiagnosticsWidget` and the health
+        # event emitted from `initialize()`. None when the coordinator
+        # was constructed without budget validation (older test paths).
+        self.disk_budget = disk_budget
         # Slice 4.B: shared per-app in-memory segment index. Each feed's
         # PipelineManager writes finalized segments here as they close.
         self.segment_index = segment_index if segment_index is not None else SegmentIndex()
@@ -263,6 +273,7 @@ class ApplicationCoordinator:
             session_paths.root_dir / "logs" / "health_events.jsonl",
             session_paths.session_id,
         )
+        self._emit_disk_budget_health_event()
         for runtime in self._feed_runtimes.values():
             runtime.start(session_paths)
         self.operator_controller.initialize(session_paths.session_id)
@@ -270,6 +281,42 @@ class ApplicationCoordinator:
         self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
+
+    def _emit_disk_budget_health_event(self) -> None:
+        """Surface a Phase 7.A disk-budget WARN / OVER verdict as a health event.
+
+        The verdict was computed during `build_default_application_coordinator`
+        (so the log line beats any feed startup noise); the JSONL log
+        isn't open until `initialize()` has called `default_log().open(...)`,
+        so the event itself is recorded here.
+        """
+        assessment = self.disk_budget
+        if assessment is None or assessment.verdict is BudgetVerdict.OK:
+            return
+        category = (
+            "disk_budget_over"
+            if assessment.verdict is BudgetVerdict.OVER_BUDGET
+            else "disk_budget_warn"
+        )
+        severity = (
+            HealthSeverity.ERROR
+            if assessment.verdict is BudgetVerdict.OVER_BUDGET
+            else HealthSeverity.WARNING
+        )
+        default_health_log().record(
+            severity=severity,
+            category=category,
+            message=(
+                f"estimated recording write throughput {assessment.estimated_mb_s:.1f} MB/s "
+                f"vs budget {assessment.budget_mb_s:.1f} MB/s "
+                f"({assessment.feed_count} feed(s))"
+            ),
+            metadata={
+                "estimated_mb_s": round(assessment.estimated_mb_s, 3),
+                "budget_mb_s": round(assessment.budget_mb_s, 3),
+                "feed_count": assessment.feed_count,
+            },
+        )
 
     def _populate_segment_index_from_resume(self, session_id: str) -> None:
         """Seed the in-memory `SegmentIndex` from SQLite for an adopted session.
@@ -307,6 +354,14 @@ def build_default_application_coordinator(
 ) -> ApplicationCoordinator:
     """Build the default coordinator graph for the current app."""
     feed_registry = FeedRegistry.build_default(settings)
+    enabled_feeds = feed_registry.get_enabled_feeds()
+
+    # Phase 7.A: estimate aggregate disk-write throughput against the
+    # configured budget and log it before any feed starts. Health-event
+    # emission is deferred until `initialize()` opens the JSONL log.
+    disk_budget = assess_disk_budget(enabled_feeds, settings)
+    _log_disk_budget_assessment(disk_budget)
+
     recording_manager = RecordingManager()
     telemetry_hub = TelemetryHub()
     segment_index = SegmentIndex()
@@ -393,7 +448,33 @@ def build_default_application_coordinator(
         program_renderer=program_renderer,
         segment_index=segment_index,
         session_clock=session_clock,
+        disk_budget=disk_budget,
     )
+
+
+def _log_disk_budget_assessment(assessment: DiskBudgetAssessment) -> None:
+    """Emit one log line per Phase 7.A budget verdict.
+
+    OK → INFO, WARN → WARNING, OVER_BUDGET → ERROR. Recording is still
+    allowed under WARN/OVER (operator-overridable per §13); the
+    diagnostics widget surfaces the verdict so it stays visible.
+    """
+    msg = (
+        "disk budget: estimated %.1f MB/s vs budget %.1f MB/s "
+        "across %d feed(s) — %s"
+    )
+    args = (
+        assessment.estimated_mb_s,
+        assessment.budget_mb_s,
+        assessment.feed_count,
+        assessment.verdict.value,
+    )
+    if assessment.verdict is BudgetVerdict.OVER_BUDGET:
+        LOGGER.error(msg, *args)
+    elif assessment.verdict is BudgetVerdict.WARN:
+        LOGGER.warning(msg, *args)
+    else:
+        LOGGER.info(msg, *args)
 
 
 def _qt_periodic_registrar(interval_seconds: float, callback) -> "callable":

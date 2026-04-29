@@ -39,7 +39,10 @@
       "Bash(python -m unittest tests.test_recording_settings.SplitmuxsinkFormatLocationTests.test_splitmuxsink_finalizes_on_disable_and_rebuilds_on_reenable -v)",
       "Bash(python -m unittest discover -s tests -p \"test_recording_settings.py\" -v)",
       "Bash(python -m unittest tests.test_recording_settings -v)",
-      "Bash(python -m unittest discover -s tests -p test_recording_settings.py -v)"
+      "Bash(python -m unittest discover -s tests -p test_recording_settings.py -v)",
+      "Bash(xargs grep *)",
+      "Bash(python -m unittest discover -s tests -p test_disk_budget.py -v)",
+      "Bash(python -c \"from main import _configure_logging; from app.config.settings import AppSettings; _configure_logging\\(AppSettings.load\\(\\)\\); import logging; logging.getLogger\\('test'\\).info\\('hello'\\); print\\('ok'\\)\")"
     ]
   }
 }

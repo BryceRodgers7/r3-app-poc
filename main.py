@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -30,11 +31,8 @@ from app.ui.recovery_dialog import RecoveryDialog
 
 def build_application() -> tuple[QApplication, ApplicationCoordinator, list[MainWindow]]:
     """Create the Qt application and wire the coordinator and windows together."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
     settings = AppSettings.load()
+    _configure_logging(settings)
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName(settings.app_name)
@@ -88,6 +86,48 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
     coordinator.initialize(resume_session_id=resume_session_id)
     qt_app.aboutToQuit.connect(coordinator.shutdown)
     return qt_app, coordinator, [operator_window, program_window]
+
+
+def _configure_logging(settings: AppSettings) -> None:
+    """Send INFO+ logs to stderr and to a rotating file.
+
+    File lives at `<base_data_dir>/logs/app.log` and rotates at 10 MB
+    keeping 5 backups (~50 MB cap per machine). `logs/health_events.jsonl`
+    stays per-session under the session folder; this file is the
+    cross-session free-form Python log so the user can still see what
+    happened on a previous run after the app exited.
+    """
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Wipe handlers if `_configure_logging` somehow runs twice (e.g. in
+    # tests that import main); avoids duplicated lines on stderr.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setFormatter(fmt)
+    root.addHandler(stderr_handler)
+
+    log_dir = settings.base_data_dir / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_dir / "app.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except OSError:
+        # Fall back to stderr-only if the data dir isn't writable. Don't
+        # crash startup over logging.
+        logging.getLogger(__name__).exception(
+            "could not open file log under %s; continuing with stderr only",
+            log_dir,
+        )
 
 
 def _run_startup_recovery_flow(

@@ -38,6 +38,11 @@ container = "mkv"
 # MUST set this to false — splitmuxsink stalls waiting for audio
 # buffers that never arrive otherwise.
 audio_enabled = true
+# Phase 7.A: aggregate disk write budget in MB/s. The validator at
+# startup compares estimated throughput (feed_count × resolution × fps
+# × codec coefficient) against this number. 200 ≈ conservative SATA
+# SSD; raise for NVMe, lower for spinning disks or shared volumes.
+disk_budget_mb_s = 200.0
 
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera

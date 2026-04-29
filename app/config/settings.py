@@ -89,6 +89,13 @@ class AppSettings:
     # that never arrive otherwise. Production NDI cameras that produce
     # audio can leave this on.
     recording_audio_enabled: bool = True
+    # Phase 7.A: aggregate disk write budget in MB/s. Used by
+    # `app.core.disk_budget` at startup to flag a rig whose configured
+    # feed count × resolution × fps would saturate the disk. 200 MB/s
+    # is a conservative SATA-SSD threshold; raise for NVMe, lower for
+    # spinning rust or shared volumes. Per-deployment override under
+    # `[recording] disk_budget_mb_s = ...`.
+    disk_budget_mb_s: float = 200.0
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -162,6 +169,8 @@ class AppSettings:
             )
         if "audio_enabled" in recording_config:
             settings.recording_audio_enabled = bool(recording_config["audio_enabled"])
+        if "disk_budget_mb_s" in recording_config:
+            settings.disk_budget_mb_s = float(recording_config["disk_budget_mb_s"])
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])
