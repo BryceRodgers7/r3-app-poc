@@ -73,6 +73,15 @@ class AppSettings:
     recording_segment_duration_seconds: float = 4.0
     recording_codec: str = "mjpeg"
     recording_container: str = "mkv"
+    # Slice 4.F: when True, the audio tee feeds opusenc into splitmuxsink
+    # alongside the video branch, so segment files contain audio. When
+    # False (or when the source has no audio), the audio_record branch
+    # drains via a no-op appsink and segments are video-only. Sources
+    # without an audio stream (e.g. NDI Tools Screen Capture) MUST set
+    # this to False — splitmuxsink stalls waiting for audio buffers
+    # that never arrive otherwise. Production NDI cameras that produce
+    # audio can leave this on.
+    recording_audio_enabled: bool = True
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -140,6 +149,8 @@ class AppSettings:
             settings.recording_container = (
                 str(recording_config["container"]).strip().lower()
             )
+        if "audio_enabled" in recording_config:
+            settings.recording_audio_enabled = bool(recording_config["audio_enabled"])
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])

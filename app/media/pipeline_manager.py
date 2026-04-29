@@ -66,12 +66,18 @@ class PipelineManager:
         recording_segment_duration_seconds: float = 4.0,
         recording_codec: str = "mjpeg",
         recording_container: str = "mkv",
+        recording_audio_enabled: bool = True,
+        audio_bitrate: int = 128_000,
     ) -> None:
         self._source = source
         self._preview_output = preview_output
         self._audio_enabled = audio_enabled
         self._live_audio_monitor_enabled = live_audio_monitor_enabled
         self._recording_enabled = recording_enabled
+        # Slice 4.F: only mux audio into segments when the operator has
+        # explicitly opted in AND the source has audio capability.
+        self._recording_audio_enabled = recording_audio_enabled
+        self._audio_bitrate = max(8_000, int(audio_bitrate))
         self._preview_running = False
         self._recording_running = False
         self._frame_callback: Callable[[MediaFrame], None] | None = None
@@ -1116,11 +1122,22 @@ class PipelineManager:
             self._audio_appsrc = appsrc
 
         self._add_live_audio_branch()
-        # Audio recording (audio muxed into the splitmuxsink segments) is
-        # deferred to slice 4.F. For now the audio record branch drains
-        # via a no-op appsink so the audio tee doesn't back-pressure; the
-        # segment files are video-only.
-        self._add_audio_appsink_branch("record", self._on_record_audio_sample)
+        # Slice 4.F: when audio recording is enabled, route the audio
+        # tee into the same splitmuxsink the video record branch is
+        # using so segments are muxed video+audio. Otherwise drain
+        # via a no-op appsink so the audio tee doesn't back-pressure.
+        if self._recording_audio_enabled and self._splitmuxsink is not None:
+            try:
+                self._add_audio_record_branch_to_splitmuxsink()
+            except Exception:
+                LOGGER.exception(
+                    "Failed to wire audio into splitmuxsink; falling back to "
+                    "video-only segments. Set [recording] audio_enabled=false "
+                    "in app_settings.toml to silence this warning."
+                )
+                self._add_audio_appsink_branch("record", self._on_record_audio_sample)
+        else:
+            self._add_audio_appsink_branch("record", self._on_record_audio_sample)
 
     def _add_live_audio_branch(self) -> None:
         assert self._pipeline is not None
@@ -1158,6 +1175,87 @@ class PipelineManager:
         for element in (queue, valve, convert, resample, sink):
             element.sync_state_with_parent()
         self._audio_branch_valves["preview"] = valve
+
+    def _add_audio_record_branch_to_splitmuxsink(self) -> None:
+        """Wire audio into the same splitmuxsink the video record branch uses (slice 4.F).
+
+        Element shape::
+
+            audio_tee → queue → valve → audioconvert → audioresample
+                      → opusenc → splitmuxsink.audio_%u
+
+        Implementation notes:
+
+        - **Pad request order matters.** We request the `audio_%u` pad
+          on `splitmuxsink` *before* linking the encoder so the
+          internal muxer (`matroskamux`) sees the audio pad during caps
+          negotiation. Requesting it after the muxer has already
+          committed to a video-only configuration is what most likely
+          caused the 4.A.bis freeze.
+        - **opusenc** is in `gst-plugins-base` (universally available
+          on UCRT64). Bitrate comes from `audio_bitrate` (matches the
+          live-audio chain).
+        - The valve starts closed (`drop=True`) and is opened in
+          lockstep with the video valve by `enable_file_recording` /
+          `disable_file_recording`. That keeps audio and video segment
+          boundaries aligned.
+        """
+        assert self._pipeline is not None
+        assert self._splitmuxsink is not None
+        Gst = self._Gst
+        assert Gst is not None
+
+        queue = self._make_element("queue", "audio_record_queue")
+        valve = self._make_element("valve", "audio_record_valve")
+        convert = self._make_element("audioconvert", "audio_record_convert")
+        resample = self._make_element("audioresample", "audio_record_resample")
+        encoder = self._make_element("opusenc", "audio_record_opusenc")
+
+        valve.set_property("drop", True)
+        encoder.set_property("bitrate", self._audio_bitrate)
+
+        for element in (queue, valve, convert, resample, encoder):
+            self._pipeline.add(element)
+
+        if not (
+            queue.link(valve)
+            and valve.link(convert)
+            and convert.link(resample)
+            and resample.link(encoder)
+        ):
+            raise RuntimeError("Failed to link the audio_record branch head.")
+
+        # Request the audio_%u pad BEFORE linking the encoder's src.
+        audio_sink_pad = self._splitmuxsink.request_pad_simple("audio_%u")
+        if audio_sink_pad is None:
+            audio_sink_pad = self._splitmuxsink.get_request_pad("audio_%u")
+        if audio_sink_pad is None:
+            raise RuntimeError(
+                "splitmuxsink does not expose an audio_%u request pad — "
+                "muxer-factory likely doesn't support audio."
+            )
+        encoder_src_pad = encoder.get_static_pad("src")
+        if encoder_src_pad is None:
+            raise RuntimeError("opusenc src pad missing")
+        if encoder_src_pad.link(audio_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(
+                "Failed to link opusenc.src to splitmuxsink.audio_%u"
+            )
+
+        tee_src_pad = self._request_audio_tee_pad()
+        queue_sink_pad = queue.get_static_pad("sink")
+        if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(
+                "Failed to link audio tee output to the audio_record branch."
+            )
+
+        for element in (queue, valve, convert, resample, encoder):
+            element.sync_state_with_parent()
+        self._audio_branch_valves["record"] = valve
+        LOGGER.info(
+            "Audio record branch wired into splitmuxsink at %d bps (opus).",
+            self._audio_bitrate,
+        )
 
     def _add_audio_appsink_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
         assert self._pipeline is not None

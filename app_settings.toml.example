@@ -6,16 +6,33 @@ app_name = "Sports Replay POC"
 operator_window_title = "Sports Replay Operator"
 program_window_title = "Sports Replay Program"
 base_data_dir = "C:\\SportsReplay"
-# Dev defaults at 720p@30. End-to-end 1080p needs slice 3.A.3 (native
-# preview sink) + Phase 4 (native segmented recording) to land first;
-# without those, raising these freezes the operator UI under load.
+# "development" hides the python_push transitional banner; "production"
+# surfaces it as a high-contrast warning so refactors don't accidentally
+# regress feeds back to Python push.
+app_mode = "development"
+# Dev defaults at 720p@30. Raising these is safe now that Phase 4 is
+# done (recording is native via splitmuxsink); preview is still
+# Python-bound until slice 3.A.3 lands (native preview video sink).
 target_frame_width = 1280
 target_frame_height = 720
 target_fps = 30.0
-replay_buffer_seconds = 120
-# recording_filename = "session_recording.mp4"
-# short_segments_subdir = "segments"
-# short_segment_filename_prefix = "segment"
+# Live audio monitor (the speakers play whatever the source is sending).
+# Turn off if your source loops back into your own NDI sender (Screen
+# Capture etc.) — otherwise you get an audio feedback loop.
+enable_embedded_audio = true
+live_audio_monitor_enabled = true
+audio_bitrate = 128000
+
+[recording]
+enabled = true
+segment_duration_seconds = 4.0
+codec = "mjpeg"
+container = "mkv"
+# Slice 4.F: when true, audio is muxed into segment files alongside
+# video. Sources with no audio (synthetic, NDI Tools Screen Capture)
+# MUST set this to false — splitmuxsink stalls waiting for audio
+# buffers that never arrive otherwise.
+audio_enabled = true
 
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera

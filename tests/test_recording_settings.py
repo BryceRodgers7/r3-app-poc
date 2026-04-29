@@ -25,6 +25,9 @@ class RecordingSettingsTests(unittest.TestCase):
         self.assertEqual(s.recording_segment_duration_seconds, 4.0)
         self.assertEqual(s.recording_codec, "mjpeg")
         self.assertEqual(s.recording_container, "mkv")
+        # Slice 4.F default — audio in segments is on for production
+        # NDI cameras; sources with no audio must opt out via TOML.
+        self.assertTrue(s.recording_audio_enabled)
 
     def test_load_recording_block_from_toml(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -39,6 +42,7 @@ enabled = true
 segment_duration_seconds = 6.0
 codec = "mjpeg"
 container = "mkv"
+audio_enabled = false
 """.strip(),
                 encoding="utf-8",
             )
@@ -46,6 +50,20 @@ container = "mkv"
         self.assertEqual(s.recording_segment_duration_seconds, 6.0)
         self.assertEqual(s.recording_codec, "mjpeg")
         self.assertEqual(s.recording_container, "mkv")
+        self.assertFalse(s.recording_audio_enabled)
+
+    def test_audio_enabled_defaults_true_when_omitted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
+segment_duration_seconds = 4.0
+""".strip(),
+                encoding="utf-8",
+            )
+            s = AppSettings.load(config_path)
+        self.assertTrue(s.recording_audio_enabled)
 
 
 class SplitmuxsinkFormatLocationTests(unittest.TestCase):

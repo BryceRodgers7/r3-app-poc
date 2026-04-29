@@ -293,6 +293,8 @@ def build_default_application_coordinator(
             recording_segment_duration_seconds=settings.recording_segment_duration_seconds,
             recording_codec=settings.recording_codec,
             recording_container=settings.recording_container,
+            recording_audio_enabled=settings.recording_audio_enabled,
+            audio_bitrate=settings.audio_bitrate,
         )
         feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
         feed_metrics.set_pipeline_mode(source.pipeline_mode.value)
