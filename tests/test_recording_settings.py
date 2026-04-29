@@ -90,6 +90,9 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         pm._splitmuxsink = None
         pm._recording_running = False
         pm._recording_was_disabled = False
+        # Per-game folder field — None falls back to the legacy flat
+        # layout that this stub expects in its assertions.
+        pm._recording_game_subdir = None
         return pm
 
     def _session_paths(self, root: Path) -> SessionPaths:

@@ -27,7 +27,9 @@ from app.media.recording_manager import RecordingManager
 from app.media.source_factory import build_source_for_feed
 from app.storage.session_manager import SessionManager
 from app.storage.session_recovery import (
+    GAME_DIR_FORMAT,
     find_next_fragment_index,
+    find_next_game_index,
     load_segment_index_for_session,
 )
 
@@ -176,16 +178,25 @@ class ApplicationCoordinator:
             return
         recording_sm.transition_to(RecordingState.STARTING_RECORDING)
         db = self._session_manager.get_metadata_db()
+        # Allocate a fresh `game_NNN` subdir under <session>/recording/ so
+        # each press of "Start game recording" gets its own folder. The
+        # index is one past the highest existing `game_NNN` on disk —
+        # see `find_next_game_index`. All feeds share the same subdir so
+        # a game's segments stay grouped across the camera fan-out.
+        game_subdir = GAME_DIR_FORMAT.format(
+            find_next_game_index(session_paths.recording_dir)
+        )
         for runtime in self._feed_runtimes.values():
             # Always seed past the high-water mark. For a new session
             # this starts at 0; for a resumed session it starts past
             # pre-crash files (and any quarantined-but-DB-present rows
             # whose fragment_index would otherwise collide); for any
             # Stop/Start cycle, it starts past whatever the previous
-            # cycle wrote, so segment files never collide.
-            feed_paths = session_paths.get_feed_paths(runtime.feed.feed_id)
+            # cycle wrote, so segment files never collide. The walk is
+            # rooted at `<session>/recording/` (not the per-feed dir) so
+            # the recursive scan finds segments under every game subdir.
             start_index = find_next_fragment_index(
-                feed_paths.recording_dir,
+                session_paths.recording_dir,
                 db=db,
                 session_id=session_paths.session_id,
                 feed_id=runtime.feed.feed_id,
@@ -194,6 +205,7 @@ class ApplicationCoordinator:
                 session_paths,
                 feed_id=runtime.feed.feed_id,
                 start_fragment_index=start_index,
+                game_subdir=game_subdir,
             )
         recording_sm.transition_to(RecordingState.RECORDING)
         if session_sm is not None and session_sm.state == SessionState.CREATED:

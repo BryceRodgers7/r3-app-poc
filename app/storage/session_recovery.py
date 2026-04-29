@@ -58,6 +58,13 @@ LOGGER = logging.getLogger(__name__)
 # callback names it. Used to filter the recording dir during validation.
 _SEGMENT_FILENAME_RE = re.compile(r"^segment_(\d{5})\.mkv$")
 
+# Per-game subdirectory pattern under `<session>/recording/`. Each
+# press of "Start game recording" creates one. Three-digit padding
+# supports up to 999 games per session — well beyond any realistic
+# operator workload.
+_GAME_DIR_RE = re.compile(r"^game_(\d{3})$")
+GAME_DIR_FORMAT = "game_{:03d}"
+
 
 @dataclass(slots=True, frozen=True)
 class SegmentValidationResult:
@@ -167,7 +174,12 @@ def validate_session_segments(
     *,
     validator: SegmentValidator | None = None,
 ) -> SegmentRecoveryReport:
-    """Scan one session's `recording/<feed_id>/` files and reconcile against DB.
+    """Scan one session's segment files (any nesting depth) and reconcile against DB.
+
+    Walks `recording/` recursively — handles both the legacy flat
+    layout (`recording/<feed_id>/segment_*.mkv`) and the per-game
+    nested layout (`recording/<game_subdir>/<feed_id>/segment_*.mkv`).
+    The feed_id is inferred from the immediate parent directory name.
 
     Three cases per file:
 
@@ -188,58 +200,55 @@ def validate_session_segments(
     report = SegmentRecoveryReport(session_id=session_paths.session_id)
     if not session_paths.recording_dir.exists():
         return report
-    for feed_dir in sorted(session_paths.recording_dir.iterdir()):
-        if not feed_dir.is_dir():
+    for file_path in sorted(session_paths.recording_dir.rglob("segment_*.mkv")):
+        if not file_path.is_file():
             continue
-        feed_id = feed_dir.name
+        if not _SEGMENT_FILENAME_RE.match(file_path.name):
+            continue
+        feed_id = file_path.parent.name
         feed_paths = session_paths.get_feed_paths(feed_id)
-        for file_path in sorted(feed_dir.iterdir()):
-            if not file_path.is_file():
-                continue
-            if not _SEGMENT_FILENAME_RE.match(file_path.name):
-                continue
-            report.files_scanned += 1
-            existing = db.get_segment_by_path(str(file_path))
-            try:
-                result = validator(file_path)
-            except Exception:
-                LOGGER.exception("recovery: validator raised for %s", file_path)
-                result = SegmentValidationResult(is_valid=False)
-            if not result.is_valid:
-                quarantined_path = _quarantine_file(file_path, feed_paths.quarantine_dir)
-                report.files_quarantined.append(str(quarantined_path))
-                if existing is not None and existing.segment_id is not None:
-                    db.update_segment_file_path(
-                        existing.segment_id, str(quarantined_path)
-                    )
-                    db.update_segment_state(
-                        existing.segment_id, SEGMENT_STATE_QUARANTINED
-                    )
-                    report.db_rows_marked_corrupt.append(existing.segment_id)
-                continue
-            if existing is None:
-                # Valid file, no DB row — insert as dirty.
-                segment = _build_dirty_segment(
-                    session_id=session_paths.session_id,
-                    feed_id=feed_id,
-                    file_path=file_path,
-                    duration_seconds=result.duration_seconds,
-                    frame_count=result.frame_count,
+        report.files_scanned += 1
+        existing = db.get_segment_by_path(str(file_path))
+        try:
+            result = validator(file_path)
+        except Exception:
+            LOGGER.exception("recovery: validator raised for %s", file_path)
+            result = SegmentValidationResult(is_valid=False)
+        if not result.is_valid:
+            quarantined_path = _quarantine_file(file_path, feed_paths.quarantine_dir)
+            report.files_quarantined.append(str(quarantined_path))
+            if existing is not None and existing.segment_id is not None:
+                db.update_segment_file_path(
+                    existing.segment_id, str(quarantined_path)
                 )
-                try:
-                    db.insert_segment(segment)
-                    report.files_marked_dirty.append(str(file_path))
-                    LOGGER.info(
-                        "recovery: inserted dirty row for unrouted segment %s",
-                        file_path,
-                    )
-                except Exception:
-                    LOGGER.exception(
-                        "recovery: failed to insert dirty row for %s",
-                        file_path,
-                    )
-                continue
-            # Valid file with an existing DB row — nothing to do.
+                db.update_segment_state(
+                    existing.segment_id, SEGMENT_STATE_QUARANTINED
+                )
+                report.db_rows_marked_corrupt.append(existing.segment_id)
+            continue
+        if existing is None:
+            # Valid file, no DB row — insert as dirty.
+            segment = _build_dirty_segment(
+                session_id=session_paths.session_id,
+                feed_id=feed_id,
+                file_path=file_path,
+                duration_seconds=result.duration_seconds,
+                frame_count=result.frame_count,
+            )
+            try:
+                db.insert_segment(segment)
+                report.files_marked_dirty.append(str(file_path))
+                LOGGER.info(
+                    "recovery: inserted dirty row for unrouted segment %s",
+                    file_path,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "recovery: failed to insert dirty row for %s",
+                    file_path,
+                )
+            continue
+        # Valid file with an existing DB row — nothing to do.
     return report
 
 
@@ -487,6 +496,34 @@ def resolve_dirty_session(
     )
 
 
+def find_next_game_index(recording_root: Path) -> int:
+    """Return the next monotonically-increasing game index.
+
+    Scans `recording_root` for `game_NNN` subdirectories and returns
+    `max(NNN) + 1`, or `1` if none exist. Used by the application
+    coordinator to allocate a fresh per-game folder on each press of
+    "Start game recording" — segments for that game land under
+    `<recording_root>/<game_subdir>/<feed_id>/segment_NNNNN.mkv`.
+
+    Disk-driven rather than DB-driven because the `Segment` schema
+    currently doesn't store the game subdir; the directory layout is
+    the source of truth.
+    """
+    if not recording_root.exists():
+        return 1
+    highest = 0
+    for child in recording_root.iterdir():
+        if not child.is_dir():
+            continue
+        match = _GAME_DIR_RE.match(child.name)
+        if match is None:
+            continue
+        index = int(match.group(1))
+        if index > highest:
+            highest = index
+    return highest + 1
+
+
 def find_next_fragment_index(
     recording_dir: Path,
     *,
@@ -496,24 +533,34 @@ def find_next_fragment_index(
 ) -> int:
     """Return the smallest fragment_index a new segment file should use.
 
-    Walks `recording_dir` for `segment_NNNNN.mkv` files and returns
-    `max(NNNNN) + 1` (or 0 if none). When `db`/`session_id`/`feed_id`
-    are all provided, also consults the SQLite `segments` table and
-    takes `max(disk_max, db_max) + 1` — this covers the §11.4 Resume
-    edge case where the recovery scan quarantined the tail segment of
-    a crashed recording: the file is gone from disk but the DB row is
-    still there (state=`quarantined`), so disk-only would reuse the
-    index and trip the `UNIQUE(session_id, feed_id, fragment_index)`
-    constraint when the resumed recording finalizes its first new
-    segment.
+    Walks `recording_dir` **recursively** for `segment_NNNNN.mkv`
+    files and returns `max(NNNNN) + 1` (or 0 if none). The recursive
+    walk handles both the legacy flat layout
+    (`recording/<feed_id>/segment_*.mkv`) and the per-game nested
+    layout (`recording/<game_subdir>/<feed_id>/segment_*.mkv`). When
+    `feed_id` is supplied, only files whose immediate parent directory
+    name matches `feed_id` are counted — that filters out other feeds'
+    segments under nested game dirs.
+
+    When `db`/`session_id`/`feed_id` are all provided, also consults
+    the SQLite `segments` table and takes `max(disk_max, db_max) + 1` —
+    this covers the §11.4 Resume edge case where the recovery scan
+    quarantined the tail segment of a crashed recording (file gone
+    from disk, DB row still present at the original `fragment_index`).
     """
     highest = -1
     if recording_dir.exists():
-        for child in recording_dir.iterdir():
-            if not child.is_file():
+        for path in recording_dir.rglob("segment_*.mkv"):
+            if not path.is_file():
                 continue
-            match = _SEGMENT_FILENAME_RE.match(child.name)
+            match = _SEGMENT_FILENAME_RE.match(path.name)
             if match is None:
+                continue
+            # When a feed_id filter is supplied, only count files
+            # whose immediate parent dir matches. Without the filter
+            # we'd count every feed's segments, which gives a wrong
+            # answer in the multi-feed case.
+            if feed_id is not None and path.parent.name != feed_id:
                 continue
             index = int(match.group(1))
             if index > highest:

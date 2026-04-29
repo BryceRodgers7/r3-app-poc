@@ -17,11 +17,13 @@ from app.core.models import (
 from app.core.session_state import SESSION_MANIFEST_FILENAME
 from app.storage.metadata_db import MetadataDb
 from app.storage.session_recovery import (
+    GAME_DIR_FORMAT,
     DirtySessionInfo,
     RecoveryAction,
     SegmentValidationResult,
     find_dirty_sessions,
     find_next_fragment_index,
+    find_next_game_index,
     load_segment_index_for_session,
     mark_dirty_sessions,
     resolve_dirty_session,
@@ -621,6 +623,225 @@ class SessionManagerAdoptTests(unittest.TestCase):
             self.assertEqual(manifest["state"], "created")
         finally:
             db.close()
+
+
+class FindNextGameIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+        self.recording_root = self.tmp / "recording"
+        self.recording_root.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._temp_dir.cleanup()
+
+    def test_empty_dir_returns_one(self) -> None:
+        self.assertEqual(find_next_game_index(self.recording_root), 1)
+
+    def test_missing_dir_returns_one(self) -> None:
+        self.assertEqual(find_next_game_index(self.tmp / "does_not_exist"), 1)
+
+    def test_returns_max_plus_one(self) -> None:
+        for i in (1, 2, 3):
+            (self.recording_root / GAME_DIR_FORMAT.format(i)).mkdir()
+        self.assertEqual(find_next_game_index(self.recording_root), 4)
+
+    def test_skips_non_game_dirs(self) -> None:
+        # Legacy per-feed dirs at the same level as game subdirs should
+        # not be treated as games.
+        (self.recording_root / GAME_DIR_FORMAT.format(1)).mkdir()
+        (self.recording_root / "ndi_main").mkdir()
+        (self.recording_root / "game_007_extra").mkdir()  # bad suffix
+        self.assertEqual(find_next_game_index(self.recording_root), 2)
+
+    def test_handles_gaps_in_numbering(self) -> None:
+        (self.recording_root / GAME_DIR_FORMAT.format(1)).mkdir()
+        (self.recording_root / GAME_DIR_FORMAT.format(5)).mkdir()
+        self.assertEqual(find_next_game_index(self.recording_root), 6)
+
+
+class FindNextFragmentIndexNestedTests(unittest.TestCase):
+    """Recursive walk over `<recording>/<game_NNN>/<feed_id>/segment_*.mkv`.
+
+    The coordinator now passes `session_paths.recording_dir` (not the
+    per-feed dir) so the scan covers every game subdir. Filtering by
+    `feed_id` keeps multi-feed sessions correct.
+    """
+
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+        self.recording_root = self.tmp / "recording"
+        self.recording_root.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._temp_dir.cleanup()
+
+    def _seed(self, game: int, feed: str, indices: list[int]) -> None:
+        feed_dir = self.recording_root / GAME_DIR_FORMAT.format(game) / feed
+        feed_dir.mkdir(parents=True, exist_ok=True)
+        for i in indices:
+            (feed_dir / f"segment_{i:05d}.mkv").write_bytes(b"\0")
+
+    def test_recursive_walk_aggregates_across_games(self) -> None:
+        self._seed(1, "ndi_main", [0, 1, 2, 3])
+        self._seed(2, "ndi_main", [4, 5])
+        self.assertEqual(
+            find_next_fragment_index(self.recording_root, feed_id="ndi_main"),
+            6,
+        )
+
+    def test_feed_id_filter_excludes_other_feeds(self) -> None:
+        # ndi_main has segments 0-3; ndi_aux has segments 0-9. The
+        # filter should ignore ndi_aux when asking about ndi_main.
+        self._seed(1, "ndi_main", [0, 1, 2, 3])
+        self._seed(1, "ndi_aux", list(range(10)))
+        self.assertEqual(
+            find_next_fragment_index(self.recording_root, feed_id="ndi_main"),
+            4,
+        )
+        self.assertEqual(
+            find_next_fragment_index(self.recording_root, feed_id="ndi_aux"),
+            10,
+        )
+
+    def test_legacy_flat_layout_still_works(self) -> None:
+        # Pre-game-subdir layout: `recording/<feed>/segment_NNNNN.mkv`.
+        flat = self.recording_root / "ndi_main"
+        flat.mkdir()
+        for i in (0, 1, 2):
+            (flat / f"segment_{i:05d}.mkv").write_bytes(b"\0")
+        self.assertEqual(
+            find_next_fragment_index(self.recording_root, feed_id="ndi_main"),
+            3,
+        )
+
+
+class ValidateSessionSegmentsNestedTests(unittest.TestCase):
+    """Recovery scan walks game subdirs; feed_id is inferred from parent dir."""
+
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+        self.session_paths = _build_session_paths(self.tmp / "sessions", "session_001")
+        self.db_path = self.tmp / "metadata.db"
+        self.db = MetadataDb(self.db_path)
+        self.db.create_session(
+            session_id="session_001",
+            source_name="Test",
+            started_at="2026-04-28T00:00:00+00:00",
+        )
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self._temp_dir.cleanup()
+
+    def test_inserts_dirty_rows_for_segments_in_game_subdirs(self) -> None:
+        # Two game subdirs with monotonic segment indexes (matches the
+        # coordinator's `find_next_fragment_index` behavior across Start
+        # cycles — game_002's first segment picks up past game_001's last).
+        layout = [
+            (1, "ndi_main", 0),
+            (1, "ndi_main", 1),
+            (2, "ndi_main", 2),
+        ]
+        for game, feed, idx in layout:
+            feed_dir = (
+                self.session_paths.recording_dir
+                / GAME_DIR_FORMAT.format(game)
+                / feed
+            )
+            feed_dir.mkdir(parents=True, exist_ok=True)
+            (feed_dir / f"segment_{idx:05d}.mkv").write_bytes(b"\0")
+
+        always_valid = lambda _p: SegmentValidationResult(
+            is_valid=True, duration_seconds=4.0, frame_count=120
+        )
+        report = validate_session_segments(
+            self.session_paths, self.db, validator=always_valid
+        )
+        self.assertEqual(report.files_scanned, 3)
+        self.assertEqual(len(report.files_marked_dirty), 3)
+        # All rows landed in the DB with feed_id derived from parent dir.
+        rows = list(self.db.segments_for_feed("session_001", "ndi_main"))
+        self.assertEqual(len(rows), 3)
+        # The recovered rows reflect the recursive walk — file paths
+        # span both game subdirs.
+        paths = {row.file_path for row in rows}
+        self.assertTrue(any("game_001" in p for p in paths))
+        self.assertTrue(any("game_002" in p for p in paths))
+
+
+class FormatLocationGameSubdirTests(unittest.TestCase):
+    """Slice 4.A + game-subdir: `format-location` writes nested per-game files."""
+
+    def _build_pm_stub(self):
+        from app.media.pipeline_manager import PipelineManager
+        from unittest.mock import MagicMock
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._recording_session_paths = None
+        pm._recording_feed_id = None
+        pm._recording_codec = "mjpeg"
+        pm._recording_container = "mkv"
+        pm._recording_segment_counter = 0
+        pm._recording_game_subdir = None
+        pm._pending_segment = None
+        pm._metadata_db = None
+        pm._segment_index = None
+        pm._splitmuxsink = None
+        pm._recording_running = False
+        pm._recording_was_disabled = False
+        return pm
+
+    def _session_paths(self, root: Path) -> SessionPaths:
+        recording = root / "recording"
+        rolling = root / "rolling"
+        clips = root / "clips"
+        for d in (root, recording, rolling, clips):
+            d.mkdir(parents=True, exist_ok=True)
+        return SessionPaths(
+            session_id="session_001",
+            root_dir=root,
+            recording_dir=recording,
+            rolling_dir=rolling,
+            clips_dir=clips,
+        )
+
+    def test_path_includes_game_subdir_when_set(self) -> None:
+        from app.media.pipeline_manager import PipelineManager
+        with TemporaryDirectory() as tmp:
+            session = self._session_paths(Path(tmp))
+            pm = self._build_pm_stub()
+            pm._recording_session_paths = session
+            pm._recording_feed_id = "ndi_main"
+            pm._recording_game_subdir = GAME_DIR_FORMAT.format(3)
+            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
+            self.assertTrue(
+                path.endswith("recording/game_003/ndi_main/segment_00000.mkv")
+                or path.endswith("recording\\game_003\\ndi_main\\segment_00000.mkv"),
+                f"unexpected path: {path}",
+            )
+            # Per-game per-feed dir is created on demand.
+            game_feed_dir = (
+                session.recording_dir / GAME_DIR_FORMAT.format(3) / "ndi_main"
+            )
+            self.assertTrue(game_feed_dir.exists())
+
+    def test_falls_back_to_flat_layout_without_game_subdir(self) -> None:
+        from app.media.pipeline_manager import PipelineManager
+        with TemporaryDirectory() as tmp:
+            session = self._session_paths(Path(tmp))
+            pm = self._build_pm_stub()
+            pm._recording_session_paths = session
+            pm._recording_feed_id = "ndi_main"
+            pm._recording_game_subdir = None
+            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
+            self.assertTrue(
+                path.endswith("recording/ndi_main/segment_00000.mkv")
+                or path.endswith("recording\\ndi_main\\segment_00000.mkv"),
+                f"unexpected path: {path}",
+            )
 
 
 if __name__ == "__main__":

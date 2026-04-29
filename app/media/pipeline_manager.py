@@ -167,6 +167,14 @@ class PipelineManager:
         # `_add_record_branch_via_splitmuxsink`.
         self._record_branch_jpegenc: Any | None = None
         self._record_branch_name: str | None = None
+        # Each press of "Start game recording" gets its own subfolder
+        # under `<session>/recording/`. Captured here at enable time;
+        # `_on_splitmuxsink_format_location` builds the per-segment
+        # path as `<session>/recording/<game_subdir>/<feed_id>/segment_NNNNN.mkv`.
+        # When `None`, segments fall back to the legacy
+        # `<session>/recording/<feed_id>/segment_NNNNN.mkv` layout —
+        # kept for the format-location fallback path and tests.
+        self._recording_game_subdir: str | None = None
         self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
         self._recording_container: str = recording_container.strip().lower() or "mkv"
         if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
@@ -196,6 +204,7 @@ class PipelineManager:
         feed_id: str | None = None,
         *,
         start_fragment_index: int = 0,
+        game_subdir: str | None = None,
     ) -> None:
         """Open the record branch's valve so segmented recording starts (Phase 4.A).
 
@@ -216,6 +225,7 @@ class PipelineManager:
             return
         self._recording_session_paths = session_paths
         self._recording_feed_id = feed_id or self._source.get_feed_id()
+        self._recording_game_subdir = game_subdir
         # Reset our private segment counter so each recording session
         # starts at the requested fragment index. Splitmuxsink's
         # internal `fragment_id` is unreliable (it increments during
@@ -1166,11 +1176,26 @@ class PipelineManager:
                 tmp,
             )
             return str(tmp)
-        feed_paths = self._recording_session_paths.get_feed_paths(self._recording_feed_id)
-        feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
+        # Per-game folder layout: each Start press of "Start game
+        # recording" gets its own subfolder under `recording/`. The
+        # operator can copy a single game's footage off the system by
+        # grabbing one folder. Falls back to the legacy flat layout
+        # when no game_subdir was specified (tests, ad-hoc tooling).
+        if self._recording_game_subdir:
+            base_dir = (
+                self._recording_session_paths.recording_dir
+                / self._recording_game_subdir
+                / self._recording_feed_id
+            )
+        else:
+            feed_paths = self._recording_session_paths.get_feed_paths(
+                self._recording_feed_id
+            )
+            base_dir = feed_paths.recording_dir
+        base_dir.mkdir(parents=True, exist_ok=True)
         index = self._recording_segment_counter
         self._recording_segment_counter += 1
-        path = feed_paths.recording_dir / f"segment_{index:05d}.mkv"
+        path = base_dir / f"segment_{index:05d}.mkv"
         LOGGER.info(
             "splitmuxsink opening segment index=%d (gst fragment_id=%d) "
             "feed_id=%s path=%s",

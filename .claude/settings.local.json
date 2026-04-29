@@ -30,7 +30,12 @@
       "Bash(python -m pytest tests/test_native_preview.py::VideoWidgetRenderModeFlipTests::test_freeze_badge_toggles_via_set_freeze_indicator -v --tb=long)",
       "Bash(python -m pytest tests/test_playback_controller.py::PlaybackControllerTests::test_stop_recording_clears_stale_pause_overlay -v --tb=short)",
       "Bash(python -m pytest tests/test_recording_settings.py tests/test_playback_controller.py --tb=short)",
-      "Bash(python -m pytest tests/test_recording_settings.py::SplitmuxsinkFormatLocationTests::test_split_now_emitted_on_re_enable_only -v --tb=long)"
+      "Bash(python -m pytest tests/test_recording_settings.py::SplitmuxsinkFormatLocationTests::test_split_now_emitted_on_re_enable_only -v --tb=long)",
+      "Bash(python -m unittest tests.test_session_recovery -v)",
+      "Bash(python -m unittest discover -s tests -p \"test_session_recovery.py\" -v)",
+      "Bash(python -m unittest discover -s tests -p \"test_session_recovery.py\")",
+      "Bash(python -m unittest discover -s tests -p \"test_recording_settings.py\")",
+      "Bash(grep -v \"ok$\")"
     ]
   }
 }
