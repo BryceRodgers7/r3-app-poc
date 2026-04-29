@@ -29,24 +29,26 @@ USB / OpenCV / GStreamer-camera ingest was removed in Phase 2.5; `kind = "auto"`
 ## Current vertical slice
 
 - **Two windows:** an **operator** window (live multiview, transport controls) and a **program** window (live multiview only), each with its own `PlaybackController` and `MultiFeedOutputRenderer`.
-- A **new session** is created on startup; rolling replay and preview run for enabled feeds. **Long “game” recording to disk is not started automatically** — use **Start game recording** in the operator UI. Files go under `{base_data_dir}/sessions/{session_id}/recording/{feed_id}/` (default `base_data_dir` is `C:\SportsReplay`, overridable in TOML).
-- **Rolling replay** duration defaults to two minutes (`replay_buffer_seconds` in app settings) and is implemented as on-disk **JPEG** frame metadata, short **muxed** audio/video segments, and in-memory **indices** (see [app/media/replay_buffer.py](app/media/replay_buffer.py)) — not a purely in-RAM buffer.
-- **Pause** freezes the viewed frame (operator output when not in program-live-only mode).
-- **Rewind 10s** switches the view to buffered content while ingest continues; **Jump to live** returns to the newest frame.
-- **Slow 1/2x** and **Slow 1/4x** (operator) adjust replay playback rate; ingest and disk recording are independent of the viewed rate.
+- A **new session** is created on startup; live preview runs for enabled feeds. **Long "game" recording to disk is not started automatically** — use **Start game recording** in the operator UI. Each press of Start allocates a fresh `game_NNN` subdir; segment files land at `{base_data_dir}/sessions/{session_id}/recording/<game_NNN>/<feed_id>/segment_NNNNN.mkv` (default `base_data_dir` is `C:\SportsReplay`, overridable in TOML).
+- **Replay reads from the recorded segments** via `RecordingSegmentReplayStore` and per-feed `SegmentDecoder` (slice 4.C / 4.D). Replay is only available while recording is active; transport returns to the live state when recording stops.
+- **Pause** freezes the viewed frame (operator output when not in program-live-only mode). The "behind live" counter advances at wall-clock rate (1s per real second) while paused or in replay.
+- **Rewind 10s** switches the view to buffered content while ingest continues; repeated clicks accumulate. **Jump to live** returns to the newest frame.
+- **Slow 1/2x** and **Slow 1/4x** (operator) adjust replay playback rate only — they do not auto-rewind. Ingest and disk recording are independent of the viewed rate.
+- **Stop game recording** finalizes the in-flight segment (matroskamux trailer is forced via `splitmuxsink.split-now`) and clears all transport overlays back to fresh-startup state. The next Start creates a new `game_NNN` folder and a fresh splitmuxsink instance — no risk of appending to the previous game's last file. **Caveat:** the split-on-stop sequence leaves one short, trailer-less "dud" file at the tail of each game's folder that is not openable in media players. The startup recovery scan quarantines or marks it dirty on the next launch.
 
 ## Temporary vs intended to remain
 
 **Temporary or transitional for this milestone**
 
 - **Synthetic test source** in [app/media/test_source.py](app/media/test_source.py) — deterministic frame generator for dev environments without NDI hardware. Stays on the `python_push` path by design; not productionized.
-- **NumPy / OpenCV BGR** `MediaFrame` payloads and pushing frames from Python into GStreamer in [app/media/pipeline_manager.py](app/media/pipeline_manager.py) — the graph is still described as transitional until Phase 3 lands native NDI ingest.
-- [app/media/replay_buffer.py](app/media/replay_buffer.py) — rolling replay storage is **JPEG- and file-backed** with a defined `ReplayStore` interface; a future system might replace the mix of thumbs + rolling segments with a different timeline store.
+- **NumPy / OpenCV BGR** `MediaFrame` payloads and pushing frames from Python into GStreamer in [app/media/pipeline_manager.py](app/media/pipeline_manager.py) — the graph is still described as transitional until Phase 3 lands native NDI ingest for production NDI feeds.
+- The trailer-less "dud" file produced at the end of each game (see *Current vertical slice*) is an artifact of the current `split-now`-on-Stop strategy and may be eliminated by a cleaner finalize path later.
 
 **Intended to remain (stable seams)**
 
 - Source abstraction in [app/media/source_interface.py](app/media/source_interface.py)
 - Per-feed `FeedRegistry`, `FeedRuntime`, and media coordination in [app/media/pipeline_manager.py](app/media/pipeline_manager.py)
-- **GStreamer** muxed session recording in [app/media/recorder.py](app/media/recorder.py) via [app/media/muxed_writer.py](app/media/muxed_writer.py) (not OpenCV `VideoWriter`)
-- Per-output view-state / transport in [app/core/playback_controller.py](app/core/playback_controller.py)
-- Separation between preview, optional file recording, and rolling replay responsibilities
+- Native **splitmuxsink-driven** segmented recording owned by each feed's `PipelineManager`; segment metadata persisted via [app/storage/metadata_db.py](app/storage/metadata_db.py) and indexed in-memory by [app/storage/segment_index.py](app/storage/segment_index.py)
+- Replay query layer in [app/storage/segment_replay_store.py](app/storage/segment_replay_store.py) and replay decoding in [app/media/segment_decoder.py](app/media/segment_decoder.py)
+- Per-output view-state / transport in [app/core/playback_controller.py](app/core/playback_controller.py), anchored to [app/core/session_clock.py](app/core/session_clock.py) for smooth wall-clock-resolution overlay timestamps
+- Crash recovery + dirty-session prompt in [app/storage/session_recovery.py](app/storage/session_recovery.py) and [app/ui/recovery_dialog.py](app/ui/recovery_dialog.py)
