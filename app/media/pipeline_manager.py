@@ -154,18 +154,19 @@ class PipelineManager:
         # Captured at first-buffer of each segment for `pts_to_session_offset_ns`.
         self._session_clock: SessionClock | None = None
         # Bug-fix flag: set on `disable_file_recording`. The next
-        # `enable_file_recording` checks it and forces splitmuxsink to
-        # rotate via the `split-now` action signal — otherwise
-        # splitmuxsink keeps the previous segment file open across the
-        # disable/enable cycle (no buffers flow while the valve is
-        # closed, so it never reaches `max-size-time` and never opens
-        # a new file). Without the forced rotation, a stop+start cycle
-        # silently appends to the old file until enough fresh PTS time
-        # has flowed for the natural max-size-time threshold to fire,
-        # which can be much later — and crucially, no new segment
-        # filename is generated, so the operator sees "no files on the
-        # second recording".
+        # `enable_file_recording` checks it and rebuilds the
+        # splitmuxsink element entirely. State-cycling the existing
+        # splitmuxsink (NULL → PLAYING) doesn't fully reset its
+        # internal "current file" pointer — buffers after re-enable
+        # appended to the previous game's file. A fresh element
+        # guarantees a fresh `format-location` call for the new game.
         self._recording_was_disabled: bool = False
+        # Refs needed to rebuild the splitmuxsink in place: jpegenc's
+        # src pad links into splitmuxsink, and the branch name
+        # determines the element's GST name. Captured during
+        # `_add_record_branch_via_splitmuxsink`.
+        self._record_branch_jpegenc: Any | None = None
+        self._record_branch_name: str | None = None
         self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
         self._recording_container: str = recording_container.strip().lower() or "mkv"
         if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
@@ -224,23 +225,19 @@ class PipelineManager:
         self._recording_segment_counter = max(0, int(start_fragment_index))
         feed_paths = session_paths.get_feed_paths(self._recording_feed_id)
         feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
-        # If a prior `disable_file_recording` transitioned splitmuxsink
-        # to NULL (to write the trailer on the current file), bring it
-        # back to PLAYING here BEFORE opening the valve. Otherwise the
-        # first buffers after re-enable hit a NULL splitmuxsink and
-        # are dropped silently, which produces zero-byte files or
-        # nothing at all.
+        # If a prior `disable_file_recording` shut down splitmuxsink
+        # (NULL state, file got its trailer), rebuild it as a fresh
+        # element. The state-cycle approach (NULL → PLAYING) didn't
+        # actually clear splitmuxsink's internal "current file"
+        # pointer, so buffers after re-enable kept appending to the
+        # previous game's last file. A fresh element guarantees
+        # `format-location` fires for the new game's first segment.
         if self._recording_was_disabled and self._splitmuxsink is not None:
             try:
-                state_change = self._splitmuxsink.sync_state_with_parent()
-                LOGGER.info(
-                    "splitmuxsink synced to parent on re-enable for feed_id=%s, result=%s",
-                    self._recording_feed_id,
-                    state_change,
-                )
+                self._rebuild_splitmuxsink_locked()
             except Exception:
                 LOGGER.exception(
-                    "splitmuxsink sync_state_with_parent failed on re-enable for feed_id=%s",
+                    "splitmuxsink rebuild failed on re-enable for feed_id=%s",
                     self._recording_feed_id,
                 )
         self._set_branch_enabled("record", True)
@@ -1002,17 +999,9 @@ class PipelineManager:
             ),
         )
         jpegenc = self._make_element("jpegenc", f"{branch_name}_jpegenc")
-        splitmuxsink = self._make_element("splitmuxsink", f"{branch_name}_splitmuxsink")
+        splitmuxsink = self._build_splitmuxsink_element(branch_name)
 
         valve.set_property("drop", True)
-        # `quality` is jpegenc's default 85; can be exposed as a setting later.
-        max_size_time_ns = int(self._recording_segment_duration_seconds * Gst.SECOND)
-        splitmuxsink.set_property("max-size-time", max_size_time_ns)
-        splitmuxsink.set_property("muxer-factory", "matroskamux")
-        # `async-finalize=True` finalizes closed segments on a worker thread
-        # so the streaming thread never blocks on disk flush.
-        self._set_property_if_supported(splitmuxsink, "async-finalize", True)
-        splitmuxsink.connect("format-location", self._on_splitmuxsink_format_location)
 
         for element in (queue, valve, convert, encode_caps, jpegenc, splitmuxsink):
             self._pipeline.add(element)
@@ -1059,6 +1048,88 @@ class PipelineManager:
 
         self._branch_valves[branch_name] = valve
         self._splitmuxsink = splitmuxsink
+        # Capture refs needed to rebuild the splitmuxsink on the next
+        # disable/enable cycle.
+        self._record_branch_jpegenc = jpegenc
+        self._record_branch_name = branch_name
+
+    def _build_splitmuxsink_element(self, branch_name: str) -> Any:
+        """Create + configure a `splitmuxsink` element.
+
+        Factored out so `_rebuild_splitmuxsink_locked` (called on the
+        second-and-subsequent Start) can reuse identical configuration
+        without duplicating the property/signal wiring.
+        """
+        Gst = self._Gst
+        assert Gst is not None
+        sink = self._make_element("splitmuxsink", f"{branch_name}_splitmuxsink")
+        max_size_time_ns = int(self._recording_segment_duration_seconds * Gst.SECOND)
+        sink.set_property("max-size-time", max_size_time_ns)
+        sink.set_property("muxer-factory", "matroskamux")
+        # `async-finalize=True` finalizes closed segments on a worker thread
+        # so the streaming thread never blocks on disk flush.
+        self._set_property_if_supported(sink, "async-finalize", True)
+        sink.connect("format-location", self._on_splitmuxsink_format_location)
+        return sink
+
+    def _rebuild_splitmuxsink_locked(self) -> None:
+        """Replace the existing splitmuxsink with a fresh instance.
+
+        Called on Start after a previous Stop. State-cycling the
+        existing splitmuxsink (NULL → PLAYING) wasn't enough — its
+        internal "current file" pointer survived the cycle, so
+        post-Start buffers appended to the previous game's last file
+        instead of triggering a fresh `format-location` call. A new
+        element instance has no such state.
+
+        Steps:
+          1. Unlink jpegenc → old splitmuxsink.
+          2. Set old splitmuxsink to NULL (defensive — disable should
+             have done this already, but a no-op repeat is safe).
+          3. Remove old splitmuxsink from the pipeline.
+          4. Build a fresh splitmuxsink with the same config.
+          5. Add to pipeline, link jpegenc → new splitmuxsink.
+          6. `sync_state_with_parent` to bring it to PLAYING.
+          7. Update `self._splitmuxsink` to point at the new instance.
+        """
+        if (
+            self._splitmuxsink is None
+            or self._record_branch_jpegenc is None
+            or self._record_branch_name is None
+            or self._pipeline is None
+            or self._Gst is None
+        ):
+            LOGGER.warning(
+                "rebuild_splitmuxsink: prerequisites missing; skipping rebuild"
+            )
+            return
+        old = self._splitmuxsink
+        jpegenc = self._record_branch_jpegenc
+        branch_name = self._record_branch_name
+        try:
+            jpegenc.unlink(old)
+        except Exception:
+            LOGGER.exception("rebuild_splitmuxsink: unlink jpegenc → old failed")
+        try:
+            old.set_state(self._Gst.State.NULL)
+        except Exception:
+            LOGGER.debug("rebuild_splitmuxsink: old set_state(NULL) raised", exc_info=True)
+        try:
+            self._pipeline.remove(old)
+        except Exception:
+            LOGGER.exception("rebuild_splitmuxsink: pipeline.remove(old) failed")
+        new_sink = self._build_splitmuxsink_element(branch_name)
+        self._pipeline.add(new_sink)
+        if not jpegenc.link(new_sink):
+            raise RuntimeError(
+                "rebuild_splitmuxsink: failed to link jpegenc → new splitmuxsink"
+            )
+        new_sink.sync_state_with_parent()
+        self._splitmuxsink = new_sink
+        LOGGER.info(
+            "splitmuxsink rebuilt for feed_id=%s (fresh format-location callback ready)",
+            self._recording_feed_id,
+        )
 
     def _on_splitmuxsink_format_location(self, _splitmuxsink: Any, fragment_id: int) -> str:
         """Pick a per-segment filename based on the active recording session.
