@@ -23,31 +23,33 @@ from app.storage.segment_replay_store import RecordingSegmentReplayStore
 
 LOGGER = logging.getLogger(__name__)
 
-# Instant-replay shortcuts from §19. The 10s button is the primary
-# transport; the 30s button is mainly for testing the §11.4 Resume
-# flow (lets the operator seek into pre-crash segments without holding
-# down the rewind button).
+# Instant-replay shortcut from §19. Slice 5.C: the 30s button was
+# removed in favor of repeated 10s clicks accumulating from the
+# current playback position.
 _REWIND_10S_NS = 10 * 1_000_000_000
-_REWIND_30S_NS = 30 * 1_000_000_000
 
 
 class PlaybackController:
     """Own playback state for one output session.
 
-    Slice 4.C.tail: replay rendering now decodes the recorded segment
-    files via `SegmentDecoder` (one per controller, scoped to the
-    primary feed). The replay clock operates in PTS-nanoseconds — the
-    same time domain `SegmentIndex` and `RecordingSegmentReplayStore`
-    use — and converts to "seconds behind live" for the operator UI by
-    diffing against the latest replayable PTS.
+    Slice 5.C: the replay clock operates in **session-time** — the
+    `SessionClock`-anchored timeline that every feed maps onto via
+    `pts_to_session_offset_ns` (slice 5.A). Multi-feed render uses
+    `RecordingSegmentReplayStore.nearest_frame_location` per feed
+    (slice 5.B) so every tile renders something on every tick: feeds
+    with coverage at the target time render that exact frame, feeds
+    without coverage freeze on their nearest available frame per the
+    §8.6.1 rule.
 
-    Multi-feed synchronized replay (rewinding all feeds at the same
-    logical timeline position) requires the Phase-5 `SessionClock` to
-    bridge per-feed PTS origins; for now only the primary feed renders
-    rewound video. Other feeds keep showing whatever frame they most
-    recently received (the operator UI will see a "frozen" live frame
-    on the secondary tiles during replay, which is acceptable for the
-    MJPEG-MKV milestone).
+    Each feed gets its own `SegmentDecoder` so per-feed `cv2.VideoCapture`
+    state doesn't fight across tiles. `live_only` outputs (program
+    window) skip allocation entirely — they never replay.
+
+    Rewind anchoring (slice 5.C): a Rewind 10s click anchors on the
+    operator's *current playback position* when in REPLAY/PAUSED so
+    repeated clicks accumulate (10s + 10s = -20s). From LIVE the
+    anchor is the latest replayable session time across all feeds, so
+    the first click from live always lands at "now − 10s".
     """
 
     def __init__(
@@ -79,11 +81,11 @@ class PlaybackController:
         self._latest_live_by_feed: dict[str, MediaFrame] = {}
         self._latest_live_overlay = FrameOverlayInfo()
         self._latest_live_timestamp: float | None = None
-        # Replay clock state — PTS-ns space (slice 4.C.tail).
-        self._playback_pts_ns: int | None = None
+        # Replay clock state — session-time-ns (slice 5.C).
+        self._playback_session_time_ns: int | None = None
         self._playback_rate = 1.0
         self._lock = threading.RLock()
-        self._replay_clock_anchor_pts_ns: int | None = None
+        self._replay_clock_anchor_session_time_ns: int | None = None
         self._replay_clock_anchor_monotonic: float | None = None
         self._session_id: str | None = None
         self._replay_timer = QTimer(self.signals)
@@ -95,18 +97,23 @@ class PlaybackController:
         self.replay_state = (
             None if live_only else make_replay_state_machine(role=session_role)
         )
-        # Segment decoder for the primary feed. Live-only outputs (the
-        # program window) don't replay so they don't allocate one.
+        # Slice 5.C: one SegmentDecoder per feed. Each owns its own
+        # `cv2.VideoCapture` so per-feed seek state doesn't collide
+        # when the multi-feed render decodes all tiles on a single
+        # replay tick. Live-only outputs (program window) skip the
+        # allocation — they never replay.
         if live_only:
-            self._segment_decoder: SegmentDecoder | None = None
+            self._segment_decoders: dict[str, SegmentDecoder] = {}
         else:
             decoder_factory = decoder_factory or (
                 lambda feed_id, source_name: SegmentDecoder(feed_id, source_name)
             )
-            self._segment_decoder = decoder_factory(
-                self._primary_feed_id,
-                self._primary_runtime.feed.display_name,
-            )
+            self._segment_decoders = {
+                runtime.feed.feed_id: decoder_factory(
+                    runtime.feed.feed_id, runtime.feed.display_name
+                )
+                for runtime in self._feed_runtimes
+            }
 
     def initialize(self, session_id: str) -> None:
         """Activate the controller for started feed runtimes."""
@@ -146,30 +153,27 @@ class PlaybackController:
                 return
             assert self.replay_state is not None
             self.replay_state.transition_to(ReplayState.PAUSED)
-            self._playback_pts_ns = base_pts_ns
+            self._playback_session_time_ns = base_pts_ns
             self._playback_rate = 0.0
             self._state.current_playback_mode = PlaybackMode.PAUSED
             self._state.error_message = None
             self._update_state_timestamps_locked()
         # Render the freeze frame outside the lock so the renderer can
         # emit Qt signals without re-entering the controller.
-        self._render_at_pts_ns(base_pts_ns)
+        self._render_at_session_time_ns(base_pts_ns)
         self._emit_state("Playback paused")
 
     def rewind_10_seconds(self) -> None:
-        """Move the viewed output back 10 seconds in the segment timeline."""
-        self._rewind_by_ns(_REWIND_10S_NS)
+        """Rewind 10s in session-time (slice 5.C).
 
-    def rewind_30_seconds(self) -> None:
-        """Move the viewed output back 30 seconds in the segment timeline.
+        From LIVE/SOURCE_LOST: anchor on `latest_replayable_session_time`
+        across all feeds. The first click from live always lands at
+        `now − 10s`.
 
-        Same machinery as `rewind_10_seconds`; just a different anchor.
-        Useful for stepping into pre-crash segments after a §11.4 Resume.
+        From REPLAY/PAUSED: anchor on the operator's current
+        `_playback_session_time_ns`. Repeated clicks accumulate —
+        click twice for `−20s` from live, three times for `−30s`, etc.
         """
-        self._rewind_by_ns(_REWIND_30S_NS)
-
-    def _rewind_by_ns(self, rewind_ns: int) -> None:
-        """Common rewind implementation parameterized by jump distance."""
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -177,21 +181,21 @@ class PlaybackController:
             self._emit_state("Replay unavailable: start game recording first.")
             return
         with self._lock:
-            target_pts_ns = self._resolve_rewind_target_locked(rewind_ns)
-            if target_pts_ns is None:
+            target_session_time_ns = self._resolve_rewind_target_locked(_REWIND_10S_NS)
+            if target_session_time_ns is None:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()
                 return
             assert self.replay_state is not None
             self.replay_state.transition_to(ReplayState.SEEKING)
             self.replay_state.transition_to(ReplayState.REPLAYING)
-            self._playback_pts_ns = target_pts_ns
+            self._playback_session_time_ns = target_session_time_ns
             self._playback_rate = 1.0
             self._state.current_playback_mode = PlaybackMode.REPLAY
             self._state.error_message = None
-            self._start_replay_clock_locked(target_pts_ns)
+            self._start_replay_clock_locked(target_session_time_ns)
             self._update_state_timestamps_locked()
-        self._render_at_pts_ns(target_pts_ns)
+        self._render_at_session_time_ns(target_session_time_ns)
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def jump_to_live(self) -> None:
@@ -204,7 +208,7 @@ class PlaybackController:
                     self.replay_state.transition_to(ReplayState.LIVE_WHILE_RECORDING)
                 else:
                     self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
-            self._playback_pts_ns = None
+            self._playback_session_time_ns = None
             self._playback_rate = 1.0
             self._state.current_playback_mode = (
                 PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
@@ -251,8 +255,8 @@ class PlaybackController:
                 )
                 self.replay_state.transition_to(target)
                 self._state.current_playback_mode = PlaybackMode.REPLAY
-                if self._playback_pts_ns is not None:
-                    self._start_replay_clock_locked(self._playback_pts_ns)
+                if self._playback_session_time_ns is not None:
+                    self._start_replay_clock_locked(self._playback_session_time_ns)
             self._update_state_timestamps_locked()
         self._emit_state(f"Replay speed {self._playback_rate:.2f}x")
 
@@ -301,11 +305,11 @@ class PlaybackController:
             return self._latest_live_frame
 
     def shutdown(self) -> None:
-        """Stop timers owned by this output session."""
+        """Stop timers owned by this output session and close per-feed decoders."""
         self._replay_timer.stop()
         self._overlay_timer.stop()
-        if self._segment_decoder is not None:
-            self._segment_decoder.close()
+        for decoder in self._segment_decoders.values():
+            decoder.close()
 
     def on_new_live_frame(self, frame: MediaFrame) -> None:
         """Update controller-owned playback state for a newly ingested live frame."""
@@ -357,27 +361,46 @@ class PlaybackController:
         self._emit_state()
 
     def _resolve_pause_anchor_locked(self) -> int | None:
-        """Pick a reasonable PTS to freeze on when the operator presses Pause.
+        """Pick a session-time to freeze on when the operator presses Pause.
 
         - In REPLAY mode, freeze at the current playback position.
-        - In LIVE/SOURCE_LOST modes, freeze at the latest replayable PTS
-          so the operator sees something concrete (the freshest fully-
-          finalized segment frame).
+        - In LIVE/SOURCE_LOST modes, freeze at the latest replayable
+          session-time across all feeds so the operator sees something
+          concrete (the freshest fully-finalized segment frame).
         """
         if (
             self._state.current_playback_mode == PlaybackMode.REPLAY
-            and self._playback_pts_ns is not None
+            and self._playback_session_time_ns is not None
         ):
-            return self._playback_pts_ns
-        return self._replay_store.latest_replayable_pts(self._primary_feed_id)
+            return self._playback_session_time_ns
+        _, latest = self._replay_store.available_session_time_range()
+        return latest
 
     def _resolve_rewind_target_locked(self, rewind_ns: int) -> int | None:
-        """Compute a target PTS `rewind_ns` behind the latest replayable point."""
-        latest = self._replay_store.latest_replayable_pts(self._primary_feed_id)
-        if latest is None:
-            return None
-        earliest = self._replay_store.earliest_pts(self._primary_feed_id)
-        target = latest - rewind_ns
+        """Compute a session-time target `rewind_ns` behind the right anchor.
+
+        Slice 5.C: the anchor depends on the current playback mode.
+        From REPLAY/PAUSED, anchor on the operator's current
+        `_playback_session_time_ns` so repeated Rewind 10s clicks
+        accumulate. From LIVE/SOURCE_LOST, anchor on the latest
+        replayable session time across all feeds.
+
+        Result is clamped to the earliest replayable session time so
+        a long rewind from a short recording lands at the start of
+        the timeline rather than going negative.
+        """
+        if (
+            self._state.current_playback_mode in {PlaybackMode.REPLAY, PlaybackMode.PAUSED}
+            and self._playback_session_time_ns is not None
+        ):
+            anchor = self._playback_session_time_ns
+        else:
+            _, latest = self._replay_store.available_session_time_range()
+            if latest is None:
+                return None
+            anchor = latest
+        earliest, _ = self._replay_store.available_session_time_range()
+        target = anchor - rewind_ns
         if earliest is not None:
             target = max(target, earliest)
         return target
@@ -414,7 +437,7 @@ class PlaybackController:
             self.replay_state.transition_to(ReplayState.JUMPING_TO_LIVE)
             self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
             self._stop_replay_clock_locked()
-            self._playback_pts_ns = None
+            self._playback_session_time_ns = None
             self._playback_rate = 1.0
             self._state.current_playback_mode = (
                 PlaybackMode.LIVE
@@ -444,14 +467,14 @@ class PlaybackController:
         self._state.ingest_telemetry = self._primary_runtime.get_ingest_telemetry()
 
     def _start_replay_clock_locked(self, playback_pts_ns: int) -> None:
-        self._replay_clock_anchor_pts_ns = playback_pts_ns
+        self._replay_clock_anchor_session_time_ns = playback_pts_ns
         self._replay_clock_anchor_monotonic = time.monotonic()
         if self._playback_rate > 0.0 and not self._replay_timer.isActive():
             self._replay_timer.start()
         LOGGER.info("Replay clock started at pts=%dns", playback_pts_ns)
 
     def _stop_replay_clock_locked(self) -> None:
-        self._replay_clock_anchor_pts_ns = None
+        self._replay_clock_anchor_session_time_ns = None
         self._replay_clock_anchor_monotonic = None
         if self._replay_timer.isActive():
             self._replay_timer.stop()
@@ -462,23 +485,25 @@ class PlaybackController:
             if self._state.current_playback_mode != PlaybackMode.REPLAY:
                 self._stop_replay_clock_locked()
                 return
-            anchor_pts_ns = self._replay_clock_anchor_pts_ns
+            anchor_session_time_ns = self._replay_clock_anchor_session_time_ns
             anchor_monotonic = self._replay_clock_anchor_monotonic
             rate = self._playback_rate
-        if anchor_pts_ns is None or anchor_monotonic is None:
+        if anchor_session_time_ns is None or anchor_monotonic is None:
             return
         elapsed_ns = max(0.0, time.monotonic() - anchor_monotonic) * rate * 1_000_000_000
-        target_pts_ns = anchor_pts_ns + int(elapsed_ns)
-        latest = self._replay_store.latest_replayable_pts(self._primary_feed_id)
+        target_session_time_ns = anchor_session_time_ns + int(elapsed_ns)
+        # Clamp to the cross-feed latest replayable so we don't run
+        # past the live edge. This is the operator-visible upper bound.
+        _, latest = self._replay_store.available_session_time_range()
         if latest is not None:
-            target_pts_ns = min(target_pts_ns, latest)
+            target_session_time_ns = min(target_session_time_ns, latest)
         with self._lock:
             if self._state.current_playback_mode != PlaybackMode.REPLAY:
                 return
-            self._playback_pts_ns = target_pts_ns
+            self._playback_session_time_ns = target_session_time_ns
             self._state.error_message = None
             self._update_state_timestamps_locked()
-        self._render_at_pts_ns(target_pts_ns)
+        self._render_at_session_time_ns(target_session_time_ns)
         self._emit_state()
 
     def _on_overlay_timer_tick(self) -> None:
@@ -488,50 +513,77 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._emit_state()
 
-    def _render_at_pts_ns(self, target_pts_ns: int) -> None:
-        """Decode and display the segment frame containing `target_pts_ns`.
+    def _render_at_session_time_ns(self, target_session_time_ns: int) -> None:
+        """Decode and display the nearest-available frame on EVERY feed (slice 5.C).
 
-        Resolves through `replay_store` so eligibility (recording-state
-        gate) and segment-state filtering (only `complete` segments) stay
-        in one place. No-op for `live_only` outputs.
+        Per §8.6.1, every operator tile renders something on every
+        tick during replay. For each enabled feed:
+
+        - Ask the replay store for `nearest_frame_location(t)` —
+          returns an exact match when in coverage, the feed's earliest
+          frame as a freeze when before any coverage, or the latest
+          frame ending at-or-before `t` as a freeze when in a gap or
+          after coverage.
+        - Decode via the per-feed `SegmentDecoder` and push the frame
+          into the renderer (which routes by `frame.feed_id`).
+
+        Feeds that have no replayable segment yet (the `nearest_frame_location`
+        returns `None`) keep showing whatever frame they last received.
+        That's the only blank-tile state during replay — it only happens
+        before any segment for that feed has finalized.
+
+        No-op for `live_only` outputs.
         """
-        if self._segment_decoder is None:
+        if not self._segment_decoders:
             return
-        location = self._replay_store.resolve(
-            feed_id=self._primary_feed_id,
-            target_pts_ns=target_pts_ns,
-            recording_state=self._recording_manager.recording_state.state,
-        )
-        if location is None:
-            return
-        frame = self._segment_decoder.decode(location)
-        if frame is None:
-            return
-        self._output_renderer.show_frame(frame)
+        recording_state = self._recording_manager.recording_state.state
+        for runtime in self._feed_runtimes:
+            decoder = self._segment_decoders.get(runtime.feed.feed_id)
+            if decoder is None:
+                continue
+            location = self._replay_store.nearest_frame_location(
+                feed_id=runtime.feed.feed_id,
+                session_time_ns=target_session_time_ns,
+                recording_state=recording_state,
+            )
+            if location is None:
+                continue
+            frame = decoder.decode(location)
+            if frame is None:
+                continue
+            self._output_renderer.show_frame(frame)
 
     def _update_state_timestamps_locked(self) -> None:
         self._state.last_frame_timestamp = self._latest_live_timestamp
-        latest_pts_ns = self._replay_store.latest_replayable_pts(self._primary_feed_id)
-        earliest_pts_ns = self._replay_store.earliest_pts(self._primary_feed_id)
+        # Slice 5.C: replay coverage is now the cross-feed session-time
+        # bound (§8.6) — earliest start across all feeds, latest
+        # complete end across all feeds. Operators reason in session
+        # time so the operator UI bound is the union, not the primary
+        # feed's slice.
+        earliest_session_time_ns, latest_session_time_ns = (
+            self._replay_store.available_session_time_range()
+        )
         if (
-            latest_pts_ns is not None
-            and earliest_pts_ns is not None
-            and latest_pts_ns >= earliest_pts_ns
+            latest_session_time_ns is not None
+            and earliest_session_time_ns is not None
+            and latest_session_time_ns >= earliest_session_time_ns
         ):
             self._state.replay_buffer_span_seconds = (
-                latest_pts_ns - earliest_pts_ns
+                latest_session_time_ns - earliest_session_time_ns
             ) / 1_000_000_000.0
         else:
             self._state.replay_buffer_span_seconds = 0.0
         if (
             self._state.current_playback_mode == PlaybackMode.LIVE
-            or self._playback_pts_ns is None
-            or latest_pts_ns is None
+            or self._playback_session_time_ns is None
+            or latest_session_time_ns is None
         ):
             self._state.seconds_behind_live = 0.0
         else:
             self._state.seconds_behind_live = max(
-                0.0, (latest_pts_ns - self._playback_pts_ns) / 1_000_000_000.0
+                0.0,
+                (latest_session_time_ns - self._playback_session_time_ns)
+                / 1_000_000_000.0,
             )
         if self._state.current_playback_mode == PlaybackMode.LIVE:
             self._state.frame_overlay = self._latest_live_overlay
@@ -545,8 +597,8 @@ class PlaybackController:
         self._state.playback_overlay = PlaybackOverlayInfo(
             mode=self._state.current_playback_mode,
             playback_timestamp=(
-                self._playback_pts_ns / 1_000_000_000.0
-                if self._playback_pts_ns is not None
+                self._playback_session_time_ns / 1_000_000_000.0
+                if self._playback_session_time_ns is not None
                 else None
             ),
             wall_clock_timestamp=time.time(),
