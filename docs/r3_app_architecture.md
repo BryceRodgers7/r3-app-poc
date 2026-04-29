@@ -921,10 +921,34 @@ The system must:
 
 1. Query each feed timeline for matching segments.
 2. Seek each feed to the requested session time.
-3. Handle missing segments independently.
+3. Handle missing segments independently (see §15.5 — never blank a tile).
 4. Start playback in sync as closely as possible.
 5. Keep feeds aligned during slow motion/pause/resume.
 6. Surface degraded status if one feed cannot participate.
+
+### 8.6.1 Per-feed frame clamping rule (catch-up sync)
+
+The replay clock advances in **session time**, not per-feed time. Every operator-window tile renders something on every tick — there is no "blank tile" state during replay. For each feed, on each tick:
+
+- If the current `playback_session_time_ns` falls inside one of the feed's completed segments → decode and render the frame at that offset (normal sync replay).
+- If the current `playback_session_time_ns` is **before** the feed's earliest segment → render the feed's **first** recorded frame as a freeze. The tile holds that freeze frame until the playback clock catches up to where the feed actually has coverage, at which point the same query naturally starts returning exact locations and the tile begins moving.
+- If the current `playback_session_time_ns` is **after** the feed's latest segment, **or** falls in a mid-session gap (disconnect/reconnect) → render the feed's **last** frame from before that point as a freeze. The tile resumes when the playback clock reaches the next segment.
+
+**Worked example.** Feed A starts at session_time=0; Feed B joins at session_time=5. Operator at session_time=10 clicks Rewind 10s:
+
+- session_time=0..5: Feed A plays normally; Feed B's tile shows its first frame (the t=5 frame) frozen.
+- session_time=5: Feed B starts moving from its first frame; both tiles are now in sync.
+- session_time=5..10: Both feeds play in sync.
+
+The rule is symmetric across all three "no-coverage-here" cases (feed-not-yet-started, feed-disconnected-mid-session, feed-ended-early). It collapses to a single primitive at the read layer:
+
+```
+nearest_frame_location(feed_id, session_time_ns) → (segment, offset_in_segment_ns)
+```
+
+returning the exact match when in coverage, the feed's earliest frame when before any coverage, and the latest frame ending at-or-before `session_time_ns` otherwise. Returns `None` only when the feed has zero replayable segments (in which case the tile shows its placeholder until any segment finalizes).
+
+**Rationale.** Operators reason about plays in session time, not per-feed time. A tile that goes blank for 5 seconds during a rewind because that camera joined late is more disorienting than a frozen first-frame held for the same duration. The freeze frame visually communicates "this camera wasn't recording yet" while keeping the multi-feed view legible.
 
 ## 8.7 Late join and reconnect
 
@@ -1532,12 +1556,15 @@ Slow motion must be driven by playback timing, not by duplicating files.
 
 ## 15.5 Missing media behavior
 
-If a feed lacks completed recording media for the requested replay range:
+If a feed lacks completed recording media for the requested session-time during replay:
 
-- show blank/placeholder for that feed
-- continue other feeds
-- surface degraded replay status
+- render the feed's **nearest available frame** as a freeze (its first frame for "before any coverage", its last frame before the gap for "in a gap" or "after coverage ends" — see §8.6.1 for the full clamping rule and worked example)
+- continue other feeds at their actual session time
+- surface degraded replay status (the operator UI should indicate which tiles are frozen vs sync-playing)
 - do not crash
+- do **not** blank the tile while replay is active — operators reason in session time and a frozen first/last frame is more legible than an empty tile
+
+A tile is only blank when the feed has **zero** replayable segments at all (no completed segments yet), or when the source has never connected. Both surface as the standard "Awaiting video" placeholder, not as a per-rewind decision.
 
 ## 15.6 Jump to live
 
@@ -2142,6 +2169,12 @@ Goal:
 
 - Introduce true timestamp-based multi-feed replay.
 
+Normative references:
+
+- §8.1 SessionClock contract.
+- §8.6 / §8.6.1 multi-feed sync rules and the per-feed frame-clamping rule.
+- §15.5 missing media behavior (freeze-on-nearest-frame, not blank).
+
 Tasks:
 
 - Implement `SessionClock`.
@@ -2149,13 +2182,22 @@ Tasks:
 - Map feed PTS to session time.
 - Update replay requests to use session timestamps.
 - Handle feed startup offsets.
-- Handle missing feed ranges.
+- Handle missing feed ranges via the §8.6.1 clamping rule.
 
 Exit criteria:
 
 - Replay request is based on session time.
 - Multiple feeds can be queried for same replay window.
+- Every operator tile renders something on every tick during replay (per §15.5 / §8.6.1) — no blank-during-rewind state.
 - Missing feed media does not crash replay.
+
+### Slices
+
+Phase 5 lands in three slices:
+
+- **5.A — `SessionClock` + per-feed PTS-to-session-time capture — ✅ committed.** New `app/core/session_clock.py` (monotonic anchor, `now_session_time_ns()`). `ApplicationCoordinator` constructs one instance and threads it into each `PipelineManager` alongside the metadata-db and segment index. `_on_jpegenc_buffer_probe` captures `session_time_ns` on the first buffer of each segment; `_finalize_pending_segment_locked` derives `pts_to_session_offset_ns = first_session_time_ns - first_pts_ns` and populates `start_session_time_ns` / `end_session_time_ns` / `pts_to_session_offset_ns` on the `Segment` row. Round-trips through SQLite + `load_segment_index_for_session`. 7 new tests cover the clock origin/advance, the per-feed offset capture, the finalize population, the no-clock fallback, and the recovery-load round-trip. No operator-visible behavior change.
+- **5.B — read-side: session-time queries + `nearest_frame_location` (§8.6.1 clamping rule).** Adds `SegmentIndex.segments_overlapping_session_time` / `feeds_with_coverage_at` / `cross_feed_session_time_range`, plus `RecordingSegmentReplayStore.resolve_session_time` (strict) and `RecordingSegmentReplayStore.nearest_frame_location` (the §8.6.1 clamping rule — exact match in coverage, earliest segment when before any coverage, latest-before-`t` when after coverage or in a gap). Tests against synthesized multi-feed fixtures including the late-joining-feed scenario.
+- **5.C — `PlaybackController` switches to session-time + multi-feed render + UX changes.** `_playback_pts_ns → _playback_session_time_ns`. `_resolve_rewind_target_locked` anchors on current playback position when in REPLAY/PAUSED so repeated Rewind 10s clicks accumulate (LIVE-mode anchor stays "−10s from latest replayable" for the first click). `_render_at_session_time_ns` iterates all enabled feeds, calls `nearest_frame_location` per feed, decodes via per-feed `SegmentDecoder`, and pushes frames into `MultiFeedOutputRenderer.show_frame`. Drops the Rewind 30s button + `rewind_30_seconds` method + its test.
 
 ---
 

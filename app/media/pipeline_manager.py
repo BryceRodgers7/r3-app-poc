@@ -27,6 +27,7 @@ from app.core.models import (
     Segment,
     SessionPaths,
 )
+from app.core.session_clock import SessionClock
 from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
 from app.media.frame_overlay import render_frame_overlay
@@ -149,6 +150,9 @@ class PipelineManager:
         self._pending_segment: dict[str, Any] | None = None
         self._metadata_db: MetadataDb | None = None
         self._segment_index: SegmentIndex | None = None
+        # Slice 5.A: session-clock reference (per-app monotonic origin).
+        # Captured at first-buffer of each segment for `pts_to_session_offset_ns`.
+        self._session_clock: SessionClock | None = None
         self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
         self._recording_container: str = recording_container.strip().lower() or "mkv"
         if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
@@ -317,6 +321,16 @@ class PipelineManager:
     def set_segment_index(self, index: SegmentIndex | None) -> None:
         """Attach the in-memory segment index that finalized segments are added to (slice 4.B)."""
         self._segment_index = index
+
+    def set_session_clock(self, clock: SessionClock | None) -> None:
+        """Attach the per-app monotonic session clock (slice 5.A).
+
+        Used to capture `pts_to_session_offset_ns` at the first buffer
+        of each segment so replay queries can resolve session-time to
+        a `(segment, offset_in_segment_ns)` pair without rerunning a
+        per-feed PTS-mapping query (§8.3 / §6.3).
+        """
+        self._session_clock = clock
 
     def set_video_window_handle(self, window_handle: int) -> None:
         """Attach the active embedded video sink to a Qt-owned native child window."""
@@ -1045,16 +1059,26 @@ class PipelineManager:
             "last_pts_ns": None,
             "frame_count": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            # Slice 5.A — captured by `_on_jpegenc_buffer_probe` on
+            # first buffer; None means "no session_clock attached or
+            # first buffer never arrived". Stays None for sessions
+            # initialized in tests via `__new__` without a clock.
+            "first_session_time_ns": None,
         }
         return str(path)
 
     def _on_jpegenc_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
-        """Track per-segment first/last PTS and frame count (slice 4.B).
+        """Track per-segment first/last PTS and frame count (slice 4.B + 5.A).
 
         Runs on the streaming thread once per encoded JPEG buffer. Reads
         only buffer.pts and increments a counter — no pixel work. The
         captured stats are flushed into a `Segment` row by
         `_finalize_pending_segment_locked` when the segment closes.
+
+        Slice 5.A: also captures `session_time_ns` at the moment of the
+        first buffer of the segment. `_finalize_pending_segment_locked`
+        uses that to compute `pts_to_session_offset_ns` and the segment's
+        `start/end_session_time_ns` (§6.3).
         """
         Gst = self._Gst
         if Gst is None:
@@ -1069,6 +1093,10 @@ class PipelineManager:
             pts_ns = int(buf.pts)
             if pending["first_pts_ns"] is None:
                 pending["first_pts_ns"] = pts_ns
+                if self._session_clock is not None:
+                    pending["first_session_time_ns"] = (
+                        self._session_clock.now_session_time_ns()
+                    )
             pending["last_pts_ns"] = pts_ns
         pending["frame_count"] += 1
         return Gst.PadProbeReturn.OK
@@ -1102,6 +1130,22 @@ class PipelineManager:
             size_bytes = 0
         first_pts = int(pending["first_pts_ns"])
         last_pts = int(pending["last_pts_ns"]) if pending["last_pts_ns"] is not None else first_pts
+        # Slice 5.A: derive session-time fields from the first buffer's
+        # session-time reading (captured at the same moment first_pts
+        # was observed). `pts_to_session_offset_ns` is the additive
+        # offset that maps the segment's PTS-ns timeline onto session
+        # time (§6.3 / §8.3). All three fields stay None when no
+        # session_clock was attached — keeps test stubs that bypass
+        # __init__ working without surprises.
+        first_session_time_ns: int | None = pending.get("first_session_time_ns")
+        if first_session_time_ns is not None:
+            pts_to_session_offset_ns: int | None = first_session_time_ns - first_pts
+            start_session_time_ns: int | None = first_session_time_ns
+            end_session_time_ns: int | None = last_pts + pts_to_session_offset_ns
+        else:
+            pts_to_session_offset_ns = None
+            start_session_time_ns = None
+            end_session_time_ns = None
         segment = Segment(
             session_id=pending["session_id"],
             feed_id=pending["feed_id"],
@@ -1117,6 +1161,9 @@ class PipelineManager:
             state=SEGMENT_STATE_COMPLETE,
             created_at=str(pending["created_at"]),
             finalized_at=datetime.now(timezone.utc).isoformat(),
+            start_session_time_ns=start_session_time_ns,
+            end_session_time_ns=end_session_time_ns,
+            pts_to_session_offset_ns=pts_to_session_offset_ns,
         )
         if self._metadata_db is not None:
             try:

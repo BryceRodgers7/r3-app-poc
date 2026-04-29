@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from app.config.settings import AppSettings
+from app.core.session_clock import SessionClock
 
 LOGGER = logging.getLogger(__name__)
 from app.core.application_state import AppState, compute_app_state
@@ -287,6 +288,11 @@ def build_default_application_coordinator(
     recording_manager = RecordingManager()
     telemetry_hub = TelemetryHub()
     segment_index = SegmentIndex()
+    # Slice 5.A: one monotonic session clock for the whole app run. Each
+    # PipelineManager uses it to stamp `pts_to_session_offset_ns` on
+    # finalized segments so the replay layer can resolve session-time
+    # to a per-feed `(segment, offset)` pair.
+    session_clock = SessionClock()
     feed_runtimes: dict[str, FeedRuntime] = {}
 
     # Slice 3.B: tell the telemetry hub how to drive saturation-based
@@ -345,6 +351,7 @@ def build_default_application_coordinator(
         # rotates files (or recording stops).
         pipeline_manager.set_metadata_db(session_manager.get_metadata_db())
         pipeline_manager.set_segment_index(segment_index)
+        pipeline_manager.set_session_clock(session_clock)
         runtime = FeedRuntime(
             feed=feed,
             source=source,

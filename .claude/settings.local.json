@@ -22,7 +22,8 @@
       "Bash(python -m pytest tests/test_queue_saturation.py -v --tb=short)",
       "Bash(python -m pytest tests/test_recording_settings.py -v --tb=short)",
       "Bash(python -m pytest tests/test_native_preview.py -v --tb=short)",
-      "Bash(taskkill //F //IM python.exe)"
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(python -m pytest tests/test_session_clock.py -v --tb=short)"
     ]
   }
 }

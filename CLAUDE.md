@@ -80,6 +80,7 @@ Key invariants worth knowing before editing:
 - `app/core/` — coordinator, registry, playback controller, app state, signals, dataclasses (`models.py` defines `MediaFrame`, `AudioChunk`, `SessionPaths`, `Segment`, `PlaybackMode`).
 - `app/media/` — sources (`source_interface`, `source_factory`, `ndi_receiver`, `test_source`), pipeline (`pipeline_manager` — owns ingest tee + splitmuxsink-driven recording), `recording_manager` (just the `RecordingState` machine), output (`output_renderer`, `preview_output`), telemetry/overlay helpers.
 - `app/storage/` — filesystem layout (`file_manager`), SQLite metadata (`metadata_db`, with the `segments` table), session lifecycle (`session_manager`), in-memory segment index (`segment_index`), replay query layer (`segment_replay_store`), startup crash recovery (`session_recovery`).
+- `app/core/session_clock.py` — slice 5.A. Monotonic-anchored `SessionClock` (`now_session_time_ns()`). Each `PipelineManager` captures `session_time` on the first buffer of every segment so `_finalize_pending_segment_locked` can stamp `start/end_session_time_ns` + `pts_to_session_offset_ns` on the `Segment` row. The replay layer queries that read those fields land in 5.B and the `PlaybackController` switch to session-time lands in 5.C.
 - `app/ui/` — `MainWindow` (re-used for both operator and program with flags), `controls_widget`, `multi_feed_video_panel`, `status_bar_widget`, `video_widget`.
 - `tests/` — fast unit tests using stdlib `unittest`. They mock or stub GStreamer where needed; do not require real cameras to run.
 
