@@ -42,7 +42,13 @@
       "Bash(python -m unittest discover -s tests -p test_recording_settings.py -v)",
       "Bash(xargs grep *)",
       "Bash(python -m unittest discover -s tests -p test_disk_budget.py -v)",
-      "Bash(python -c \"from main import _configure_logging; from app.config.settings import AppSettings; _configure_logging\\(AppSettings.load\\(\\)\\); import logging; logging.getLogger\\('test'\\).info\\('hello'\\); print\\('ok'\\)\")"
+      "Bash(python -c \"from main import _configure_logging; from app.config.settings import AppSettings; _configure_logging\\(AppSettings.load\\(\\)\\); import logging; logging.getLogger\\('test'\\).info\\('hello'\\); print\\('ok'\\)\")",
+      "Bash(python -m unittest discover -s tests -p test_status_bar_widget.py -v)",
+      "Bash(python -m unittest tests.test_playback_controller -v)",
+      "Bash(python -m unittest discover -s tests -p test_playback_controller.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_replay_store_per_game_scope.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_replay_store_per_game_scope.py)",
+      "Bash(python -m unittest discover -s tests -p test_playback_controller.py)"
     ]
   }
 }

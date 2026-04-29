@@ -548,6 +548,33 @@ class FindNextFragmentIndexTests(unittest.TestCase):
         (self.feed_dir / "segment_99999.mkv.tmp").write_bytes(b"\0")
         self.assertEqual(find_next_fragment_index(self.feed_dir), 1)
 
+    def test_per_game_scope_returns_zero_for_fresh_game_folder(self) -> None:
+        # Phase 7.B-ext: the coordinator scopes find_next_fragment_index
+        # to the per-game folder (`recording/<game_NNN>/<feed_id>/`) so
+        # each new game starts at segment_00000 even when prior games
+        # in the same session wrote later indices.
+        recording_root = self.tmp / "recording"
+        # Pre-existing game 1 with three segments.
+        game1_feed = recording_root / "game_001" / "ndi_main"
+        game1_feed.mkdir(parents=True)
+        for i in (0, 1, 2):
+            (game1_feed / f"segment_{i:05d}.mkv").write_bytes(b"\0")
+        # Fresh game 2 folder doesn't exist yet — that's the path the
+        # coordinator passes on the next Start press.
+        game2_feed = recording_root / "game_002" / "ndi_main"
+        self.assertEqual(find_next_fragment_index(game2_feed), 0)
+
+    def test_per_game_scope_continues_existing_game_folder(self) -> None:
+        # Resume case: a game's folder already has files (e.g. from
+        # before a crash). Scoping to the game folder picks the right
+        # next index past whatever's on disk.
+        recording_root = self.tmp / "recording"
+        game1_feed = recording_root / "game_001" / "ndi_main"
+        game1_feed.mkdir(parents=True)
+        for i in (0, 1, 2, 3):
+            (game1_feed / f"segment_{i:05d}.mkv").write_bytes(b"\0")
+        self.assertEqual(find_next_fragment_index(game1_feed), 4)
+
     def test_db_consult_picks_max_when_higher(self) -> None:
         # Disk has 0, 1, 2 but DB has a quarantined row at 5.
         for i in (0, 1, 2):

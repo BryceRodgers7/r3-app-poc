@@ -34,5 +34,25 @@ class UiState:
     # Empty in LIVE mode and during normal in-coverage replay. Drives
     # the per-tile "FROZEN" badge surfacing in the operator UI.
     feeds_in_freeze_frame: tuple[str, ...] = ()
+    # Phase 7.B: replay-availability surfaces.
+    #
+    # `latest_replayable_session_time_ns` is the cross-feed latest
+    # finalized segment end in session-time. None when no segments have
+    # finalized yet. Already computed for the rewind anchor; exposed
+    # here so the status bar / diagnostics can render it without
+    # reaching back into the replay store.
+    #
+    # `live_lag_behind_replayable_seconds` is the distance between the
+    # session clock's "now" and `latest_replayable_session_time_ns`.
+    # Hovers near `recording_segment_duration_seconds` while recording
+    # is healthy (the in-progress segment hasn't finalized yet);
+    # growing unboundedly = a wedged splitmuxsink.
+    #
+    # `replay_available` is False until the first segment finalizes —
+    # covers the "operator just started recording, no replay yet" UX
+    # gap.
+    latest_replayable_session_time_ns: int | None = None
+    live_lag_behind_replayable_seconds: float = 0.0
+    replay_available: bool = False
 
 

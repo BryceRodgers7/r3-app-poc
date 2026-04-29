@@ -649,6 +649,39 @@ class PlaybackController:
             ) / 1_000_000_000.0
         else:
             self._state.replay_buffer_span_seconds = 0.0
+        # Phase 7.B: surfaces for the status bar + diagnostics. Computed
+        # alongside the existing `replay_buffer_span_seconds` so the
+        # whole UiState replay block updates atomically. `replay_available`
+        # requires both: (a) at least one segment finalized in the
+        # current game (the store's per-game filter has already excluded
+        # prior games' segments from `latest_session_time_ns`), and (b)
+        # recording is active per §10.4. Without the recording-state
+        # gate, the status bar would advertise stale ranges in the
+        # interval between Stop and the next Start press.
+        self._state.latest_replayable_session_time_ns = latest_session_time_ns
+        is_recording = (
+            self._recording_manager.recording_state.state
+            == RecordingState.RECORDING
+        )
+        self._state.replay_available = (
+            latest_session_time_ns is not None and is_recording
+        )
+        if latest_session_time_ns is None:
+            self._state.live_lag_behind_replayable_seconds = 0.0
+        elif self._session_clock is not None:
+            self._state.live_lag_behind_replayable_seconds = max(
+                0.0,
+                (
+                    self._session_clock.now_session_time_ns()
+                    - latest_session_time_ns
+                )
+                / 1_000_000_000.0,
+            )
+        else:
+            # No clock attached (test fixtures): fall back to 0 — there
+            # is no monotonic "now" to compare against the latest
+            # finalized segment.
+            self._state.live_lag_behind_replayable_seconds = 0.0
         if (
             self._state.current_playback_mode == PlaybackMode.LIVE
             or self._playback_session_time_ns is None

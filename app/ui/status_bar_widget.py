@@ -19,6 +19,7 @@ class StatusBarWidget(QFrame):
         self.ingest_value = QLabel("-")
         self.ingest_value.setWordWrap(True)
         self.session_value = QLabel("-")
+        self.replay_value = QLabel("-")
         self.detail_value = QLabel("-")
 
         layout = QGridLayout(self)
@@ -33,6 +34,7 @@ class StatusBarWidget(QFrame):
             ("Source", self.source_value),
             ("Ingest", self.ingest_value),
             ("Session", self.session_value),
+            ("Replay", self.replay_value),
             ("Detail", self.detail_value),
         )
         for row, (title, value_label) in enumerate(labels):
@@ -72,6 +74,7 @@ class StatusBarWidget(QFrame):
         else:
             self.ingest_value.setText("-")
         self.session_value.setText(state.current_session_id or "No session")
+        self.replay_value.setText(_format_replay_coverage(state))
 
         if state.error_message:
             self.detail_value.setText(state.error_message)
@@ -86,3 +89,27 @@ class StatusBarWidget(QFrame):
             )
         else:
             self.detail_value.setText("Showing newest live frame")
+
+
+def _format_mmss(seconds: float) -> str:
+    """Render a non-negative duration in M:SS."""
+    if seconds < 0:
+        seconds = 0.0
+    total_seconds = int(seconds)
+    return f"{total_seconds // 60}:{total_seconds % 60:02d}"
+
+
+def _format_replay_coverage(state: UiState) -> str:
+    """Phase 7.B status-bar replay-coverage indicator."""
+    if not state.replay_available:
+        if state.is_recording:
+            return "not yet available — first segment finalizing"
+        return "not available — start a game recording"
+    latest_ns = state.latest_replayable_session_time_ns
+    assert latest_ns is not None  # implied by replay_available
+    latest_s = latest_ns / 1_000_000_000.0
+    earliest_s = max(0.0, latest_s - state.replay_buffer_span_seconds)
+    return (
+        f"covers {_format_mmss(earliest_s)} – {_format_mmss(latest_s)} "
+        f"(latest finalized −{state.live_lag_behind_replayable_seconds:.0f}s)"
+    )

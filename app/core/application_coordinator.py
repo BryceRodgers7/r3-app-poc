@@ -180,6 +180,11 @@ class ApplicationCoordinator:
                 runtime.pipeline_manager.disable_file_recording()
             recording_sm.transition_to(RecordingState.FINALIZING)
             recording_sm.transition_to(RecordingState.NOT_RECORDING)
+            # Phase 7.B-ext: clear the per-game replay scope so a future
+            # Start re-captures it. (The recording-state gate already
+            # idles replay queries during the gap, but clearing avoids
+            # stale filter state.)
+            self.replay_store.set_current_game_start_session_time(None)
             if session_sm is not None and session_sm.state == SessionState.RECORDING:
                 session_sm.transition_to(SessionState.STOPPED)
             self.operator_controller.refresh_recording_state()
@@ -187,7 +192,6 @@ class ApplicationCoordinator:
             self.operator_controller.signals.status_message.emit("Game recording stopped.")
             return
         recording_sm.transition_to(RecordingState.STARTING_RECORDING)
-        db = self._session_manager.get_metadata_db()
         # Allocate a fresh `game_NNN` subdir under <session>/recording/ so
         # each press of "Start game recording" gets its own folder. The
         # index is one past the highest existing `game_NNN` on disk —
@@ -196,26 +200,30 @@ class ApplicationCoordinator:
         game_subdir = GAME_DIR_FORMAT.format(
             find_next_game_index(session_paths.recording_dir)
         )
+        game_dir = session_paths.recording_dir / game_subdir
         for runtime in self._feed_runtimes.values():
-            # Always seed past the high-water mark. For a new session
-            # this starts at 0; for a resumed session it starts past
-            # pre-crash files (and any quarantined-but-DB-present rows
-            # whose fragment_index would otherwise collide); for any
-            # Stop/Start cycle, it starts past whatever the previous
-            # cycle wrote, so segment files never collide. The walk is
-            # rooted at `<session>/recording/` (not the per-feed dir) so
-            # the recursive scan finds segments under every game subdir.
-            start_index = find_next_fragment_index(
-                session_paths.recording_dir,
-                db=db,
-                session_id=session_paths.session_id,
-                feed_id=runtime.feed.feed_id,
-            )
+            # Per-game folder layout means segment names can safely
+            # restart at 0 each game — there's no cross-game collision
+            # risk because each game has its own folder. Scope
+            # `find_next_fragment_index` to the per-feed game folder so
+            # a fresh game returns 0 (folder doesn't exist yet) and a
+            # resumed game (folder exists with pre-crash files)
+            # continues past whatever's already there.
+            feed_game_dir = game_dir / runtime.feed.feed_id
+            start_index = find_next_fragment_index(feed_game_dir)
             runtime.pipeline_manager.enable_file_recording(
                 session_paths,
                 feed_id=runtime.feed.feed_id,
                 start_fragment_index=start_index,
                 game_subdir=game_subdir,
+            )
+        # Phase 7.B-ext: scope replay queries to this game. Captured
+        # AFTER the splitmuxsink valves open so the timestamp is on or
+        # just before the first segment's `start_session_time_ns`,
+        # never after.
+        if self.session_clock is not None:
+            self.replay_store.set_current_game_start_session_time(
+                self.session_clock.now_session_time_ns()
             )
         recording_sm.transition_to(RecordingState.RECORDING)
         if session_sm is not None and session_sm.state == SessionState.CREATED:

@@ -651,6 +651,179 @@ class SecondsBehindLiveSmoothnessTests(unittest.TestCase):
         self.assertAlmostEqual(before, after, places=2)
 
 
+class LatestReplayableSurfaceTests(unittest.TestCase):
+    """Phase 7.B: UiState population for `latest_replayable_session_time_ns`,
+    `live_lag_behind_replayable_seconds`, `replay_available`.
+
+    Three cases per the spec: no segments yet → `replay_available=False`;
+    one finalized segment → range + lag; multiple finalized segments →
+    latest tracks the newest. Plus a hypothetical 8s segment-duration
+    config to confirm the fields scale with the configured cadence
+    (the lag hovers near segment_duration rather than near 4s).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._app = QCoreApplication.instance() or QCoreApplication([])
+
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        root_dir = Path(self._temp_dir.name) / "session_001"
+        for sub in ("recording", "rolling", "clips"):
+            (root_dir / sub).mkdir(parents=True, exist_ok=True)
+        self.session_paths = SessionPaths(
+            session_id="session_001",
+            root_dir=root_dir,
+            recording_dir=root_dir / "recording",
+            rolling_dir=root_dir / "rolling",
+            clips_dir=root_dir / "clips",
+        )
+        self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
+        self.recording_manager = RecordingManager()
+        self.segment_index = SegmentIndex()
+        self.replay_store = RecordingSegmentReplayStore(self.segment_index)
+
+        self.fake_clock_fn = _FakeNanosecondClock(start_ns=0)
+        # Construct SessionClock at t=10s so now_session_time_ns()
+        # starts at 0 and grows monotonically.
+        self.fake_clock_fn.advance_ns(10_000_000_000)
+        self.session_clock = SessionClock(clock_ns=self.fake_clock_fn)
+
+        runtime = FeedRuntime(
+            feed=self.feed,
+            source=_FakeSource(self.feed.feed_id),
+            pipeline_manager=_FakePipelineManager(self.feed.feed_id),
+        )
+        runtime.start(self.session_paths)
+
+        self.renderer = _FakeRenderer()
+        self.controller = PlaybackController(
+            feed_runtimes=[runtime],
+            output_renderer=self.renderer,
+            recording_manager=self.recording_manager,
+            replay_store=self.replay_store,
+            default_source_name="Fake Source",
+            session_role="operator",
+            live_only=False,
+            decoder_factory=lambda *_args: _StubSegmentDecoder(
+                self.feed.feed_id, self.feed.display_name
+            ),
+            session_clock=self.session_clock,
+        )
+        self.controller.initialize(self.session_paths.session_id)
+        self.recording_manager.recording_state.force(RecordingState.RECORDING)
+        self.controller.refresh_recording_state()
+
+    def tearDown(self) -> None:
+        self.controller.shutdown()
+        self._temp_dir.cleanup()
+
+    def _refresh(self) -> None:
+        with self.controller._lock:
+            self.controller._update_state_timestamps_locked()
+
+    def test_no_segments_replay_unavailable(self) -> None:
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertFalse(s.replay_available)
+        self.assertIsNone(s.latest_replayable_session_time_ns)
+        self.assertEqual(s.live_lag_behind_replayable_seconds, 0.0)
+        self.assertEqual(s.replay_buffer_span_seconds, 0.0)
+
+    def test_one_finalized_segment_populates_range_and_lag(self) -> None:
+        # Segment finalized at session_time 0..4. Clock now at 4s
+        # (segment just finalized) — lag should be ~0s.
+        self.segment_index.add(_make_segment(fragment_index=0, start_pts_ns=0))
+        self.fake_clock_fn.advance_ns(4_000_000_000)
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertTrue(s.replay_available)
+        self.assertEqual(s.latest_replayable_session_time_ns, 4_000_000_000)
+        self.assertAlmostEqual(s.live_lag_behind_replayable_seconds, 0.0, places=2)
+        self.assertAlmostEqual(s.replay_buffer_span_seconds, 4.0, places=2)
+
+    def test_lag_grows_between_segment_finalizations(self) -> None:
+        # One segment finalized at 0..4, then 3.5s of real time pass
+        # before the next segment finalizes — the in-progress segment
+        # is still being written, so lag should be ~3.5s.
+        self.segment_index.add(_make_segment(fragment_index=0, start_pts_ns=0))
+        self.fake_clock_fn.advance_ns(4_000_000_000)  # clock = 4s
+        self.fake_clock_fn.advance_ns(3_500_000_000)  # clock = 7.5s
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertAlmostEqual(s.live_lag_behind_replayable_seconds, 3.5, places=2)
+        # latest_replayable still pinned to first segment's end (4s).
+        self.assertEqual(s.latest_replayable_session_time_ns, 4_000_000_000)
+
+    def test_multiple_finalized_segments_latest_tracks_newest(self) -> None:
+        # Three back-to-back 4s segments → 0..12s coverage.
+        for i in range(3):
+            self.segment_index.add(
+                _make_segment(fragment_index=i, start_pts_ns=i * 4_000_000_000)
+            )
+        self.fake_clock_fn.advance_ns(12_000_000_000)
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertTrue(s.replay_available)
+        self.assertEqual(s.latest_replayable_session_time_ns, 12_000_000_000)
+        self.assertAlmostEqual(s.replay_buffer_span_seconds, 12.0, places=2)
+        self.assertAlmostEqual(s.live_lag_behind_replayable_seconds, 0.0, places=2)
+
+    def test_eight_second_segment_duration(self) -> None:
+        # Hypothetical [recording] segment_duration_seconds = 8.0.
+        # The replay surfaces don't depend on the configured value
+        # directly — they reflect actual segment metadata. Verify the
+        # lag tracks segment-edge cadence: one 8s segment finalized,
+        # clock advanced 6s → lag = 6s, span = 8s.
+        self.segment_index.add(
+            _make_segment(
+                fragment_index=0, start_pts_ns=0, duration_ns=8_000_000_000
+            )
+        )
+        self.fake_clock_fn.advance_ns(8_000_000_000)  # clock = 8s
+        self.fake_clock_fn.advance_ns(6_000_000_000)  # clock = 14s
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertEqual(s.latest_replayable_session_time_ns, 8_000_000_000)
+        self.assertAlmostEqual(s.replay_buffer_span_seconds, 8.0, places=2)
+        self.assertAlmostEqual(s.live_lag_behind_replayable_seconds, 6.0, places=2)
+
+    def test_replay_unavailable_when_recording_stopped(self) -> None:
+        # Segment present but recording is stopped — `replay_available`
+        # must be False per §10.4 (replay is unavailable outside the
+        # active recording state). Without this gate the status bar
+        # would advertise stale ranges between Stop and the next Start.
+        self.segment_index.add(_make_segment(fragment_index=0, start_pts_ns=0))
+        self.fake_clock_fn.advance_ns(4_000_000_000)
+        self.recording_manager.recording_state.force(RecordingState.NOT_RECORDING)
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertFalse(s.replay_available)
+
+    def test_per_game_filter_excludes_prior_game(self) -> None:
+        # Simulates a Stop / Start cycle: first game's segments live in
+        # the index from session_time 0..4. Then `set_current_game_start`
+        # moves the scope past them (analogous to the coordinator firing
+        # on a new Start press). New game's first segment finalizes at
+        # session_time 60..64. Replay surfaces should reflect ONLY the
+        # current game.
+        self.segment_index.add(
+            _make_segment(fragment_index=0, start_pts_ns=0)
+        )
+        # Operator stops, time passes, operator starts game 2 at 60s.
+        self.replay_store.set_current_game_start_session_time(60_000_000_000)
+        self.segment_index.add(
+            _make_segment(fragment_index=1, start_pts_ns=60_000_000_000)
+        )
+        self.fake_clock_fn.advance_ns(64_000_000_000)
+        self._refresh()
+        s = self.controller.get_state()
+        self.assertTrue(s.replay_available)
+        # Current game: 60..64 → span 4s, latest 64s.
+        self.assertEqual(s.latest_replayable_session_time_ns, 64_000_000_000)
+        self.assertAlmostEqual(s.replay_buffer_span_seconds, 4.0, places=2)
+
+
 class MultiFeedRenderTests(unittest.TestCase):
     """Slice 5.C: multi-feed render via `nearest_frame_location` per
     feed. Covers the §8.6.1 worked example: feed B joining at

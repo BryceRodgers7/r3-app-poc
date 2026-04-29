@@ -63,9 +63,42 @@ class RecordingSegmentReplayStore:
 
     def __init__(self, segment_index: SegmentIndex) -> None:
         self._index = segment_index
+        # Phase 7.B-ext: per-game scoping. When set, all session-time
+        # queries exclude segments whose `start_session_time_ns` is
+        # before this value. The coordinator sets this on each Start
+        # press of "Start game recording" so timing surfaces (rewind
+        # bounds, status-bar coverage range, "behind live" counter)
+        # reflect the current game only — not segments left over in
+        # the index from a prior Stop/Start cycle within the same
+        # session. None = include all segments (fresh-session path,
+        # tests, ad-hoc tooling).
+        self._current_game_start_session_time_ns: int | None = None
 
     def is_replay_available(self, *, recording_state: RecordingState) -> bool:
         return recording_state == RecordingState.RECORDING
+
+    def set_current_game_start_session_time(
+        self, session_time_ns: int | None
+    ) -> None:
+        """Scope subsequent session-time queries to segments at or after `session_time_ns`.
+
+        Pass `None` to clear the filter (after Stop, between games — the
+        recording-state gate keeps queries idle anyway, but clearing
+        avoids stale filter state if recording starts again without
+        going through `set_current_game_start_session_time` first).
+        """
+        self._current_game_start_session_time_ns = session_time_ns
+
+    def _segment_in_current_game(self, segment: Segment) -> bool:
+        """Per-game filter applied to every session-time query."""
+        if self._current_game_start_session_time_ns is None:
+            return True
+        if segment.start_session_time_ns is None:
+            return False
+        return (
+            segment.start_session_time_ns
+            >= self._current_game_start_session_time_ns
+        )
 
     def resolve(
         self,
@@ -152,6 +185,7 @@ class RecordingSegmentReplayStore:
                 feed_id, target_session_time_ns, target_session_time_ns
             )
             if s.state == SEGMENT_STATE_COMPLETE
+            and self._segment_in_current_game(s)
         ]
         if not candidates:
             return None
@@ -194,6 +228,7 @@ class RecordingSegmentReplayStore:
             if s.state == SEGMENT_STATE_COMPLETE
             and s.start_session_time_ns is not None
             and s.end_session_time_ns is not None
+            and self._segment_in_current_game(s)
         ]
         if not completed:
             return None
@@ -242,23 +277,84 @@ class RecordingSegmentReplayStore:
         )
 
     def earliest_session_time(self, feed_id: str) -> int | None:
-        """Return the earliest `start_session_time_ns` for `feed_id`, or None."""
-        return self._index.earliest_session_time(feed_id)
+        """Return the earliest `start_session_time_ns` for `feed_id`, or None.
+
+        Phase 7.B-ext: when a per-game filter is active, only segments
+        from the current game are considered.
+        """
+        if self._current_game_start_session_time_ns is None:
+            return self._index.earliest_session_time(feed_id)
+        for seg in self._index.all_for_feed(feed_id):
+            if not self._segment_in_current_game(seg):
+                continue
+            if seg.start_session_time_ns is not None:
+                return seg.start_session_time_ns
+        return None
 
     def latest_replayable_session_time(self, feed_id: str) -> int | None:
-        """Return the latest `end_session_time_ns` of any complete segment, or None."""
-        return self._index.latest_replayable_session_time(feed_id)
+        """Return the latest `end_session_time_ns` of any complete segment, or None.
+
+        Phase 7.B-ext: when a per-game filter is active, only segments
+        from the current game are considered.
+        """
+        if self._current_game_start_session_time_ns is None:
+            return self._index.latest_replayable_session_time(feed_id)
+        latest: int | None = None
+        for seg in self._index.all_for_feed(feed_id):
+            if seg.state != SEGMENT_STATE_COMPLETE:
+                continue
+            if seg.end_session_time_ns is None:
+                continue
+            if not self._segment_in_current_game(seg):
+                continue
+            if latest is None or seg.end_session_time_ns > latest:
+                latest = seg.end_session_time_ns
+        return latest
 
     def available_session_time_range(self) -> tuple[int | None, int | None]:
         """Return `(earliest_start, latest_replayable_end)` across all feeds.
 
         Operator-UI bounds for the replay timeline. Crosses feeds by
-        design — the timeline is shared per §8.1.
+        design — the timeline is shared per §8.1. Phase 7.B-ext: when
+        a per-game filter is active, only segments from the current
+        game are considered, so the operator can't rewind into a
+        prior game's recording within the same session.
         """
-        return self._index.cross_feed_session_time_range()
+        if self._current_game_start_session_time_ns is None:
+            return self._index.cross_feed_session_time_range()
+        earliest: int | None = None
+        latest: int | None = None
+        for feed_id in self._index.feed_ids():
+            for seg in self._index.all_for_feed(feed_id):
+                if seg.start_session_time_ns is None or seg.end_session_time_ns is None:
+                    continue
+                if not self._segment_in_current_game(seg):
+                    continue
+                if earliest is None or seg.start_session_time_ns < earliest:
+                    earliest = seg.start_session_time_ns
+                if seg.state == SEGMENT_STATE_COMPLETE:
+                    if latest is None or seg.end_session_time_ns > latest:
+                        latest = seg.end_session_time_ns
+        return earliest, latest
 
     def feeds_with_coverage_at(self, session_time_ns: int) -> list[str]:
         """Return feed_ids that have a completed segment covering this
         session time. Convenience pass-through for the multi-feed
-        render path in 5.C."""
-        return self._index.feeds_with_coverage_at(session_time_ns)
+        render path in 5.C. Phase 7.B-ext: filtered by the per-game
+        scope when active.
+        """
+        if self._current_game_start_session_time_ns is None:
+            return self._index.feeds_with_coverage_at(session_time_ns)
+        out: list[str] = []
+        for feed_id in self._index.feed_ids():
+            for seg in self._index.all_for_feed(feed_id):
+                if seg.state != SEGMENT_STATE_COMPLETE:
+                    continue
+                if seg.start_session_time_ns is None or seg.end_session_time_ns is None:
+                    continue
+                if not self._segment_in_current_game(seg):
+                    continue
+                if seg.start_session_time_ns <= session_time_ns <= seg.end_session_time_ns:
+                    out.append(feed_id)
+                    break
+        return out

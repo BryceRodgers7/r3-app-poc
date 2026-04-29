@@ -51,6 +51,7 @@ class DiagnosticsWidget(QFrame):
         self._disk_label = QLabel("-")
         self._disk_budget_label = QLabel("-")
         self._latency_label = QLabel("-")
+        self._replay_lag_label = QLabel("-")
         self._health_label = QLabel("-")
         for label in (
             self._app_state_label,
@@ -58,6 +59,7 @@ class DiagnosticsWidget(QFrame):
             self._disk_label,
             self._disk_budget_label,
             self._latency_label,
+            self._replay_lag_label,
             self._health_label,
         ):
             label.setWordWrap(True)
@@ -72,6 +74,7 @@ class DiagnosticsWidget(QFrame):
         layout.addWidget(self._disk_label)
         layout.addWidget(self._disk_budget_label)
         layout.addWidget(self._latency_label)
+        layout.addWidget(self._replay_lag_label)
         layout.addWidget(self._health_label)
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -159,6 +162,8 @@ class DiagnosticsWidget(QFrame):
                 )
             )
 
+        self._update_replay_lag_label()
+
         log = default_log()
         self._health_label.setText(
             f"invalid_transitions: {log.category_count('invalid_transition')}  "
@@ -166,6 +171,24 @@ class DiagnosticsWidget(QFrame):
             f"disk_low: {log.category_count('disk_low')}  "
             f"recording_branch_saturated: "
             f"{log.category_count('recording_branch_saturated')}"
+        )
+
+    def _update_replay_lag_label(self) -> None:
+        """Phase 7.B replay-lag readout. A wedged splitmuxsink shows up
+        as `replay lag` growing unboundedly instead of hovering near
+        `recording_segment_duration_seconds`."""
+        coord = self._coordinator
+        if coord is None:
+            self._replay_lag_label.setText("replay lag: (no coordinator)")
+            return
+        ui_state = coord.operator_controller.get_state()
+        if not ui_state.replay_available:
+            self._replay_lag_label.setText("replay lag: (no segments yet)")
+            return
+        lag = ui_state.live_lag_behind_replayable_seconds
+        self._replay_lag_label.setText(
+            f"replay lag: {lag:5.1f}s behind live "
+            f"(span {ui_state.replay_buffer_span_seconds:5.1f}s)"
         )
 
     def _update_disk_budget_label(self) -> None:
