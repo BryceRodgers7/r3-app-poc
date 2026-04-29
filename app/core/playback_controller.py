@@ -214,6 +214,8 @@ class PlaybackController:
                 PlaybackMode.LIVE if self._state.source_connected else PlaybackMode.SOURCE_LOST
             )
             self._state.error_message = None
+            # Phase 6: leaving replay clears all freeze badges.
+            self._state.feeds_in_freeze_frame = ()
             self._update_state_timestamps_locked()
         # Re-show the latest live frame for every bound feed. The
         # renderer remembers the most recent frame per feed_id so
@@ -444,6 +446,7 @@ class PlaybackController:
                 if self._state.source_connected
                 else PlaybackMode.SOURCE_LOST
             )
+            self._state.feeds_in_freeze_frame = ()
         elif current == ReplayState.LIVE_WHILE_RECORDING:
             self.replay_state.transition_to(ReplayState.REPLAY_UNAVAILABLE_NOT_RECORDING)
 
@@ -537,6 +540,7 @@ class PlaybackController:
         if not self._segment_decoders:
             return
         recording_state = self._recording_manager.recording_state.state
+        feeds_in_freeze: list[str] = []
         for runtime in self._feed_runtimes:
             decoder = self._segment_decoders.get(runtime.feed.feed_id)
             if decoder is None:
@@ -548,10 +552,15 @@ class PlaybackController:
             )
             if location is None:
                 continue
+            if location.is_freeze:
+                feeds_in_freeze.append(runtime.feed.feed_id)
             frame = decoder.decode(location)
             if frame is None:
                 continue
             self._output_renderer.show_frame(frame)
+        # Phase 6: surface per-tile freeze state for the operator UI.
+        with self._lock:
+            self._state.feeds_in_freeze_frame = tuple(feeds_in_freeze)
 
     def _update_state_timestamps_locked(self) -> None:
         self._state.last_frame_timestamp = self._latest_live_timestamp

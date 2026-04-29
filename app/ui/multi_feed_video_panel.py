@@ -119,6 +119,19 @@ class MultiFeedVideoPanel(QWidget):
         for tile in self._tiles.values():
             tile.set_placeholder_text(text)
 
+    def apply_freeze_indicators(self, feeds_in_freeze: tuple[str, ...] | list[str]) -> None:
+        """Phase 6: show the FROZEN badge on each tile whose feed_id is in the list.
+
+        Tiles not in the list have their badge hidden. `feeds_in_freeze`
+        comes from `UiState.feeds_in_freeze_frame`, populated by the
+        controller's multi-feed render loop when a tile's
+        `nearest_frame_location` returned a clamped (`is_freeze=True`)
+        location.
+        """
+        freeze_set = set(feeds_in_freeze)
+        for feed_id, tile in self._tiles.items():
+            tile.set_freeze_indicator(feed_id in freeze_set)
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self._layout_playback_overlay()

@@ -28,13 +28,22 @@ from app.storage.segment_index import SegmentIndex
 class SegmentReplayLocation:
     """A resolved replay target: the segment file + how far into it to seek.
 
-    `offset_in_segment_ns` is `target_pts_ns - segment.start_pts_ns`,
-    clamped to >= 0. The replay player should seek the segment file by
-    this offset once it has been opened.
+    `offset_in_segment_ns` is the seek offset within the resolved
+    segment file, clamped to >= 0.
+
+    `is_freeze` is `True` when this location is the result of the
+    §8.6.1 clamping rule (the requested time fell outside the feed's
+    coverage and the resolver returned the nearest available frame as
+    a freeze) and `False` for exact-coverage matches. Phase 6 uses
+    this to surface "FROZEN" badges on operator tiles whose feed is
+    currently in freeze-frame mode (§15.5 degraded-replay indicator).
+    The strict resolvers (`resolve`, `resolve_session_time`) only
+    return on exact coverage, so they always emit `is_freeze=False`.
     """
 
     segment: Segment
     offset_in_segment_ns: int
+    is_freeze: bool = False
 
 
 class RecordingSegmentReplayStore:
@@ -188,21 +197,25 @@ class RecordingSegmentReplayStore:
         ]
         if not completed:
             return None
-        # Case 3 — exact in-coverage match.
+        # Case 3 — exact in-coverage match. is_freeze=False.
         for seg in completed:
             assert seg.start_session_time_ns is not None
             assert seg.end_session_time_ns is not None
             if seg.start_session_time_ns <= session_time_ns <= seg.end_session_time_ns:
                 offset = session_time_ns - seg.start_session_time_ns
-                return SegmentReplayLocation(segment=seg, offset_in_segment_ns=offset)
-        # Case 4 — before the earliest segment.
+                return SegmentReplayLocation(
+                    segment=seg, offset_in_segment_ns=offset, is_freeze=False
+                )
+        # Case 4 — before the earliest segment. Freeze on first frame.
         earliest = completed[0]
         assert earliest.start_session_time_ns is not None
         if session_time_ns < earliest.start_session_time_ns:
-            return SegmentReplayLocation(segment=earliest, offset_in_segment_ns=0)
+            return SegmentReplayLocation(
+                segment=earliest, offset_in_segment_ns=0, is_freeze=True
+            )
         # Case 5 — after all coverage or in a gap. Pick the segment
         # whose end_session_time is the highest at-or-before
-        # `session_time_ns`.
+        # `session_time_ns`. Freeze on its last frame.
         nearest_before: Segment | None = None
         for seg in completed:
             assert seg.end_session_time_ns is not None
@@ -219,10 +232,13 @@ class RecordingSegmentReplayStore:
             # Defensive fallback — the case 4 guard above should have
             # caught it, but if for some reason we land here, freeze
             # on the earliest segment's first frame.
-            return SegmentReplayLocation(segment=earliest, offset_in_segment_ns=0)
+            return SegmentReplayLocation(
+                segment=earliest, offset_in_segment_ns=0, is_freeze=True
+            )
         return SegmentReplayLocation(
             segment=nearest_before,
             offset_in_segment_ns=max(0, nearest_before.duration_ns),
+            is_freeze=True,
         )
 
     def earliest_session_time(self, feed_id: str) -> int | None:

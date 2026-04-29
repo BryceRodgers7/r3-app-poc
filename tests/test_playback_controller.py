@@ -583,6 +583,41 @@ class MultiFeedRenderTests(unittest.TestCase):
         feeds_seen = {c[2] for c in self.stub_decoder.decode_calls}
         self.assertEqual(feeds_seen, {"ndi_a", "ndi_b"})
 
+    def test_freeze_indicator_set_for_late_joining_feed(self) -> None:
+        """Phase 6: when the operator rewinds before feed B's first
+        segment, feed B's tile renders a freeze frame and shows up in
+        `UiState.feeds_in_freeze_frame`. Feed A is in coverage and is
+        NOT in the freeze list."""
+        self._force_recording_state()
+        with self.controller._lock:
+            self.controller._state.current_playback_mode = PlaybackMode.REPLAY
+            self.controller._playback_session_time_ns = 12_000_000_000
+        self.controller.rewind_10_seconds()  # → 2s
+        state = self.controller.get_state()
+        self.assertEqual(state.feeds_in_freeze_frame, ("ndi_b",))
+
+    def test_freeze_indicator_empty_when_all_feeds_in_coverage(self) -> None:
+        """At a session_time covered by every feed, no tile is frozen."""
+        self._force_recording_state()
+        with self.controller._lock:
+            self.controller._state.current_playback_mode = PlaybackMode.REPLAY
+            self.controller._playback_session_time_ns = 15_000_000_000
+        self.controller.rewind_10_seconds()  # → 5s — both feeds in coverage
+        state = self.controller.get_state()
+        self.assertEqual(state.feeds_in_freeze_frame, ())
+
+    def test_freeze_indicator_cleared_on_jump_to_live(self) -> None:
+        """Returning to live drops the freeze list — operator-visible
+        badges should disappear immediately."""
+        self._force_recording_state()
+        with self.controller._lock:
+            self.controller._state.current_playback_mode = PlaybackMode.REPLAY
+            self.controller._playback_session_time_ns = 12_000_000_000
+        self.controller.rewind_10_seconds()  # → 2s, feed B should freeze
+        self.assertEqual(self.controller.get_state().feeds_in_freeze_frame, ("ndi_b",))
+        self.controller.jump_to_live()
+        self.assertEqual(self.controller.get_state().feeds_in_freeze_frame, ())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,10 @@
       "Bash(python -m pytest tests/test_native_preview.py -v --tb=short)",
       "Bash(taskkill //F //IM python.exe)",
       "Bash(python -m pytest tests/test_session_clock.py -v --tb=short)",
-      "Bash(python -m pytest tests/test_session_time_queries.py -v --tb=short)"
+      "Bash(python -m pytest tests/test_session_time_queries.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_session_time_queries.py tests/test_playback_controller.py tests/test_native_preview.py --tb=short)",
+      "Bash(python -m pytest tests/test_session_time_queries.py tests/test_playback_controller.py tests/test_native_preview.py --tb=short -v)",
+      "Bash(python -m pytest tests/test_native_preview.py::VideoWidgetRenderModeFlipTests::test_freeze_badge_toggles_via_set_freeze_indicator -v --tb=long)"
     ]
   }
 }

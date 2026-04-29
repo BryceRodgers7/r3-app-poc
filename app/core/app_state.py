@@ -29,5 +29,10 @@ class UiState:
     ingest_telemetry: IngestTelemetry | None = None
     frame_overlay: FrameOverlayInfo = field(default_factory=FrameOverlayInfo)
     playback_overlay: PlaybackOverlayInfo = field(default_factory=PlaybackOverlayInfo)
+    # Phase 6: feed_ids whose tile is currently rendering a clamped
+    # freeze frame (per §8.6.1) instead of an exact-coverage frame.
+    # Empty in LIVE mode and during normal in-coverage replay. Drives
+    # the per-tile "FROZEN" badge surfacing in the operator UI.
+    feeds_in_freeze_frame: tuple[str, ...] = ()
 
 

@@ -71,6 +71,22 @@ class VideoWidget(QWidget):
         self._display_resolution_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._display_resolution_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
+        # Phase 6: degraded-replay indicator. Shown when this tile is
+        # currently rendering a clamped freeze frame instead of an
+        # exact-coverage frame (per §15.5 / §8.6.1) — typically because
+        # this feed joined later than the playback target, was
+        # disconnected at that point, or has reached the end of its
+        # coverage.
+        self._freeze_badge_label = QLabel("FROZEN", self._surface_stack_host)
+        self._freeze_badge_label.setObjectName("freezeBadgeLabel")
+        self._freeze_badge_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._freeze_badge_label.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        )
+        self._freeze_badge_label.hide()
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(10)
@@ -113,8 +129,36 @@ class VideoWidget(QWidget):
                 font-weight: 500;
                 padding: 8px 10px;
             }
+            QLabel#freezeBadgeLabel {
+                background-color: rgba(180, 90, 0, 220);
+                border: 1px solid #ffb060;
+                border-radius: 8px;
+                color: #fff8e0;
+                font-size: 13px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                padding: 6px 10px;
+            }
             """
         )
+
+    def set_freeze_indicator(self, visible: bool) -> None:
+        """Show/hide the degraded-replay freeze badge (Phase 6).
+
+        The badge is a small "FROZEN" pill rendered in the top-right
+        corner of the tile, alongside the playback overlay. It tells
+        the operator that this tile is currently displaying a clamped
+        freeze frame rather than an exact-coverage match — useful when
+        a feed joined later than the rewind target or was disconnected
+        at that session time.
+        """
+        if visible:
+            self._freeze_badge_label.adjustSize()
+            self._layout_freeze_badge()
+            self._freeze_badge_label.show()
+            self._freeze_badge_label.raise_()
+        else:
+            self._freeze_badge_label.hide()
 
     def set_placeholder_text(self, text: str) -> None:
         """Update the placeholder message shown when no embedded video is active."""
@@ -214,6 +258,7 @@ class VideoWidget(QWidget):
         super().resizeEvent(event)
         self._refresh_pixmap()
         self._layout_playback_overlay()
+        self._layout_freeze_badge()
         self._stack_overlay_z_order()
         if self._showing_video_surface:
             self.video_surface_resized.emit()
@@ -270,6 +315,8 @@ class VideoWidget(QWidget):
         self._display_resolution_label.raise_()
         if self._playback_overlay_label.isVisible():
             self._playback_overlay_label.raise_()
+        if self._freeze_badge_label.isVisible():
+            self._freeze_badge_label.raise_()
 
     def _layout_playback_overlay(self) -> None:
         if self._playback_overlay_label.text() == "":
@@ -285,3 +332,15 @@ class VideoWidget(QWidget):
         x_position = max(side_margin, self._surface_stack_host.width() - overlay_width - side_margin)
         self._playback_overlay_label.move(x_position, top_margin)
         self._playback_overlay_label.resize(overlay_width, overlay_height)
+
+    def _layout_freeze_badge(self) -> None:
+        """Pin the FROZEN badge to the top-right corner of the tile."""
+        margin = 14
+        self._freeze_badge_label.adjustSize()
+        x_position = max(
+            margin,
+            self._surface_stack_host.width()
+            - self._freeze_badge_label.width()
+            - margin,
+        )
+        self._freeze_badge_label.move(x_position, margin)

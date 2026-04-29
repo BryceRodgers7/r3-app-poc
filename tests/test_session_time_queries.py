@@ -216,6 +216,8 @@ class ResolveSessionTimeTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.segment.fragment_index, 1)
         self.assertEqual(result.offset_in_segment_ns, 1_500_000_000)
+        # Phase 6: strict resolvers always emit is_freeze=False.
+        self.assertFalse(result.is_freeze)
 
     def test_returns_none_before_earliest(self) -> None:
         result = self.store.resolve_session_time(
@@ -284,6 +286,8 @@ class NearestFrameLocationTests(unittest.TestCase):
         # 10s falls in fragment 2 (8..12), offset = 2s.
         self.assertEqual(loc.segment.fragment_index, 2)
         self.assertEqual(loc.offset_in_segment_ns, 2_000_000_000)
+        # Phase 6: exact coverage means is_freeze=False.
+        self.assertFalse(loc.is_freeze)
 
     def test_before_earliest_freezes_on_first_frame(self) -> None:
         """The §8.6.1 worked example: feed B joined at session_time=5,
@@ -298,6 +302,8 @@ class NearestFrameLocationTests(unittest.TestCase):
         assert loc is not None
         self.assertEqual(loc.segment.fragment_index, 0)
         self.assertEqual(loc.offset_in_segment_ns, 0)
+        # Phase 6: clamped → is_freeze=True (drives the FROZEN badge).
+        self.assertTrue(loc.is_freeze)
 
     def test_advancing_clock_into_coverage_starts_playback(self) -> None:
         """The other half of the worked example: as the playback clock
@@ -329,6 +335,7 @@ class NearestFrameLocationTests(unittest.TestCase):
         self.assertEqual(loc.segment.fragment_index, 2)
         # Offset = segment.duration_ns (= 4s).
         self.assertEqual(loc.offset_in_segment_ns, 4_000_000_000)
+        self.assertTrue(loc.is_freeze)
 
     def test_in_gap_freezes_on_last_segment_before_gap(self) -> None:
         # Build a feed with a gap: segments at session-time 0..4 and 10..14.
@@ -363,6 +370,7 @@ class NearestFrameLocationTests(unittest.TestCase):
         # Should freeze on segment 0's last frame.
         self.assertEqual(loc.segment.fragment_index, 0)
         self.assertEqual(loc.offset_in_segment_ns, 4_000_000_000)
+        self.assertTrue(loc.is_freeze)
 
     def test_returns_none_when_feed_has_no_segments(self) -> None:
         self._populate_two_feeds()

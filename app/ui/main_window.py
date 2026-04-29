@@ -153,6 +153,7 @@ class MainWindow(QMainWindow):
             state.current_playback_mode,
             program_live_only=self._program_live_only,
         )
+        self.video_panel.apply_freeze_indicators(state.feeds_in_freeze_frame)
         if not show_embedded_video:
             placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
             self.video_panel.set_global_placeholder(placeholder_text)

@@ -2205,24 +2205,34 @@ Phase 5 lands in three slices:
 
 ## Phase 6 – Multi-Feed Replay Controller
 
+**Status: 🟢 Complete.** Most of Phase 6 was delivered as a side-effect of Phase 5 (the multi-feed render loop in 5.C, the `nearest_frame_location` clamping in 5.B, the per-feed `pts_to_session_offset_ns` in 5.A). The remaining concrete item — degraded replay indicators (§15.5) — landed as a single follow-up slice on top of Phase 5.
+
 Goal:
 
 - Make replay multi-feed and synchronized.
 
 Tasks:
 
-- Update PlaybackController to control multiple feeds.
-- Support pause, resume, slow motion, jump to live.
-- Keep program output live-only.
-- Keep recording active during replay.
-- Add degraded replay indicators.
+- ~~Update PlaybackController to control multiple feeds.~~ ✅ Slice 5.C — `_render_at_session_time_ns` iterates every enabled feed via `nearest_frame_location`.
+- ~~Support pause, resume, slow motion, jump to live.~~ ✅ All four work multi-feed naturally because the replay clock advances in shared session-time and the render loop reads it on every tick.
+- ~~Keep program output live-only.~~ ✅ The `live_only` flag (set on the program controller since Phase 2) skips replay machinery entirely.
+- ~~Keep recording active during replay.~~ ✅ Recording branch is independent of preview/replay (since Phase 4.A); never paused during transport.
+- ~~Add degraded replay indicators.~~ ✅ This slice — see below.
+
+### Phase 6 slice — degraded replay indicators
+
+- `SegmentReplayLocation` gained `is_freeze: bool = False`. `RecordingSegmentReplayStore.nearest_frame_location` sets `True` for the three §8.6.1 clamping branches (before-earliest / after-latest / in-gap) and `False` for exact coverage. The strict resolvers (`resolve`, `resolve_session_time`) always emit `False` since they only return on exact match.
+- `UiState.feeds_in_freeze_frame: tuple[str, ...]` — the controller's `_render_at_session_time_ns` collects the list of feeds whose `nearest_frame_location` returned `is_freeze=True` and writes it into the state every tick. Cleared on `jump_to_live` and on the recording-stop snap-back.
+- `VideoWidget.set_freeze_indicator(visible)` — small "FROZEN" badge in the top-right corner, amber background. Hidden by default.
+- `MultiFeedVideoPanel.apply_freeze_indicators(feeds)` — sets each tile's badge by feed_id. Wired into `MainWindow._render_state` so Qt re-renders when the controller emits a state change.
+- 5 new tests cover the four `is_freeze` branches in the replay store + controller-side state population (late-join scenario sets `("ndi_b",)`; in-coverage range sets `()`; jump-to-live clears the list) + widget badge toggle.
 
 Exit criteria:
 
-- Operator can replay multiple feeds for same time range.
-- Program output remains live.
-- Recording continues during replay.
-- Missing feed does not break replay.
+- ✅ Operator can replay multiple feeds for same time range.
+- ✅ Program output remains live.
+- ✅ Recording continues during replay.
+- ✅ Missing feed does not break replay (clamps via §8.6.1, surfaces as a per-tile FROZEN badge).
 
 ---
 

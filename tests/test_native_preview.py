@@ -136,6 +136,23 @@ class VideoWidgetRenderModeFlipTests(unittest.TestCase):
             widget._surface_stack.currentWidget(), widget._frame_label
         )
 
+    def test_freeze_badge_hidden_by_default(self) -> None:
+        """Phase 6: freeze badge starts hidden."""
+        widget = VideoWidget()
+        self.assertFalse(widget._freeze_badge_label.isVisibleTo(widget))
+
+    def test_freeze_badge_toggles_via_set_freeze_indicator(self) -> None:
+        """Phase 6: set_freeze_indicator(True/False) shows/hides the badge."""
+        widget = VideoWidget()
+        widget.set_freeze_indicator(True)
+        self.assertTrue(
+            widget._freeze_badge_label.isVisibleTo(widget._surface_stack_host)
+        )
+        widget.set_freeze_indicator(False)
+        self.assertFalse(
+            widget._freeze_badge_label.isVisibleTo(widget._surface_stack_host)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
