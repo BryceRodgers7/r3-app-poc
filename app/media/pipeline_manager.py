@@ -9,6 +9,7 @@ from fractions import Fraction
 import importlib
 import logging
 from pathlib import Path
+import tempfile
 import threading
 import time
 from typing import Any
@@ -39,6 +40,31 @@ from app.storage.metadata_db import MetadataDb
 from app.storage.segment_index import SegmentIndex
 
 LOGGER = logging.getLogger(__name__)
+
+
+def unrouted_segments_dir() -> Path:
+    """Folder used when splitmuxsink asks for a filename outside an active session.
+
+    Splitmuxsink's `format-location` callback can fire during pipeline
+    startup, caps propagation, muxer reset, or state-cycling — before
+    `enable_file_recording` has set the session pointers. The callback
+    must return a path, so we route those throwaway files into a known
+    folder we own and purge on startup, rather than dropping them in cwd.
+    """
+    return Path(tempfile.gettempdir()) / "r3-app-unrouted-segments"
+
+
+def purge_unrouted_segments() -> None:
+    """Remove leftover unrouted-segment files from prior runs."""
+    folder = unrouted_segments_dir()
+    if not folder.exists():
+        return
+    for entry in folder.iterdir():
+        try:
+            if entry.is_file():
+                entry.unlink()
+        except OSError:
+            LOGGER.exception("could not remove unrouted segment %s", entry)
 
 
 @dataclass(slots=True)
@@ -1225,7 +1251,9 @@ class PipelineManager:
         self._finalize_pending_segment_locked()
 
         if self._recording_session_paths is None or self._recording_feed_id is None:
-            tmp = Path(f"./_unrouted_segment_{fragment_id:05d}.mkv").resolve()
+            fallback_dir = unrouted_segments_dir()
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            tmp = (fallback_dir / f"_unrouted_segment_{fragment_id:05d}.mkv").resolve()
             LOGGER.warning(
                 "splitmuxsink requested format-location without an active "
                 "recording session; writing to %s",

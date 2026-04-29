@@ -13,6 +13,7 @@ from app.core.application_coordinator import (
     build_default_application_coordinator,
 )
 from app.media.output_renderer import MultiFeedOutputRenderer
+from app.media.pipeline_manager import purge_unrouted_segments
 from app.storage.file_manager import FileManager
 from app.storage.metadata_db import MetadataDb
 from app.storage.session_manager import SessionManager
@@ -41,6 +42,8 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
     file_manager = FileManager(settings)
     metadata_db = MetadataDb(settings.metadata_db_path)
     session_manager = SessionManager(file_manager, metadata_db)
+
+    purge_unrouted_segments()
 
     # Slice 4.E + §11.4: scan for unfinished prior sessions and let the
     # operator resolve each one before any new session is created. Runs
