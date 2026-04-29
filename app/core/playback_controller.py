@@ -14,6 +14,7 @@ from app.core.app_state import UiState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
 from app.core.recording_state import RecordingState
 from app.core.replay_state import ACTIVE_REPLAY_STATES, ReplayState, make_replay_state_machine
+from app.core.session_clock import SessionClock
 from app.core.signals import AppSignals
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import MultiFeedOutputRenderer, OutputRenderer
@@ -62,6 +63,7 @@ class PlaybackController:
         session_role: str,
         live_only: bool = False,
         decoder_factory: Callable[[str, str], SegmentDecoder] | None = None,
+        session_clock: SessionClock | None = None,
     ) -> None:
         if not feed_runtimes:
             raise ValueError("PlaybackController requires at least one FeedRuntime.")
@@ -71,6 +73,14 @@ class PlaybackController:
         self._output_renderer = output_renderer
         self._recording_manager = recording_manager
         self._replay_store = replay_store
+        # Slice 5.A clock is reused here for the smooth "behind live"
+        # counter — `seconds_behind_live` reads from
+        # `clock.now_session_time_ns()` rather than from the latest
+        # finalized segment so the indicator grows steadily during
+        # pause / slow-motion instead of jumping in segment-duration
+        # quanta. Falls back to the segment-derived metric when no
+        # clock is attached (test fixtures, headless tooling).
+        self._session_clock = session_clock
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
@@ -233,6 +243,14 @@ class PlaybackController:
         requested fraction; the decoder is rate-agnostic. A rate of 0.0
         is treated as a pause (replay clock stops, no further decode
         ticks).
+
+        From LIVE/SOURCE_LOST, the slow buttons snap into REPLAY at the
+        latest replayable session-time **without** any rewind. The
+        operator can then watch from the leading edge at the requested
+        slow speed and start to fall behind live as playback progresses.
+        Anchoring at `latest_replayable` rather than at "now" avoids
+        landing in the in-progress segment (which has no replay
+        coverage).
         """
         if self._live_only:
             self._emit_state("This output is locked to live.")
@@ -240,10 +258,23 @@ class PlaybackController:
         if not self._replay_actions_allowed():
             self._emit_state("Replay unavailable: start game recording first.")
             return
-        if self.get_state().current_playback_mode == PlaybackMode.LIVE:
-            self.rewind_10_seconds()
         with self._lock:
             assert self.replay_state is not None
+            # If we're entering replay from LIVE/SOURCE_LOST, snap the
+            # playback position to the latest replayable session-time
+            # so the operator starts at "now" (minus segment-finalize
+            # lag) rather than at -10s.
+            if (
+                self._state.current_playback_mode
+                in {PlaybackMode.LIVE, PlaybackMode.SOURCE_LOST}
+                or self._playback_session_time_ns is None
+            ):
+                _, latest = self._replay_store.available_session_time_range()
+                if latest is None:
+                    self._state.error_message = "Replay frame is not available yet."
+                    self._emit_state()
+                    return
+                self._playback_session_time_ns = latest
             self._playback_rate = max(0.0, playback_rate)
             if self._playback_rate == 0.0:
                 self.replay_state.transition_to(ReplayState.PAUSED)
@@ -257,9 +288,15 @@ class PlaybackController:
                 )
                 self.replay_state.transition_to(target)
                 self._state.current_playback_mode = PlaybackMode.REPLAY
-                if self._playback_session_time_ns is not None:
-                    self._start_replay_clock_locked(self._playback_session_time_ns)
+                self._start_replay_clock_locked(self._playback_session_time_ns)
+            self._state.error_message = None
             self._update_state_timestamps_locked()
+            target_session_time = self._playback_session_time_ns
+        # Render a frame at the snapped position outside the lock so
+        # `_render_at_session_time_ns` can re-acquire it for state
+        # updates without deadlocking.
+        if target_session_time is not None:
+            self._render_at_session_time_ns(target_session_time)
         self._emit_state(f"Replay speed {self._playback_rate:.2f}x")
 
     def set_source_lost(self, message: str = "Source signal lost.") -> None:
@@ -585,15 +622,32 @@ class PlaybackController:
         if (
             self._state.current_playback_mode == PlaybackMode.LIVE
             or self._playback_session_time_ns is None
-            or latest_session_time_ns is None
         ):
             self._state.seconds_behind_live = 0.0
-        else:
+        elif self._session_clock is not None:
+            # Smooth path: `now − playback` grows continuously with
+            # real time. During pause it grows at 1s/s; during slow
+            # motion at (1 − rate)/s; during REPLAY at 1.0x it stays
+            # constant. Independent of segment finalization cadence.
+            self._state.seconds_behind_live = max(
+                0.0,
+                (
+                    self._session_clock.now_session_time_ns()
+                    - self._playback_session_time_ns
+                )
+                / 1_000_000_000.0,
+            )
+        elif latest_session_time_ns is not None:
+            # Fallback for fixtures / tooling without a SessionClock —
+            # uses the latest finalized segment, which jumps in
+            # segment-duration quanta but is better than 0.
             self._state.seconds_behind_live = max(
                 0.0,
                 (latest_session_time_ns - self._playback_session_time_ns)
                 / 1_000_000_000.0,
             )
+        else:
+            self._state.seconds_behind_live = 0.0
         if self._state.current_playback_mode == PlaybackMode.LIVE:
             self._state.frame_overlay = self._latest_live_overlay
         else:

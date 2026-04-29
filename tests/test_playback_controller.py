@@ -21,6 +21,7 @@ from app.core.models import (
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
 from app.core.replay_state import ReplayState
+from app.core.session_clock import SessionClock
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import OutputRenderer
 from app.media.recording_manager import RecordingManager
@@ -350,6 +351,31 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
         self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
 
+    def test_set_playback_rate_from_live_does_not_rewind(self) -> None:
+        """Bug fix: Slow 1/2 from LIVE used to call `rewind_10_seconds`
+        as a side effect, dropping playback to `latest − 10s`. The new
+        behavior snaps to `latest_replayable_session_time` (the leading
+        edge of replay coverage) without any rewind, so the operator
+        starts watching at the freshest available frame and falls
+        behind live as playback progresses.
+        """
+        self._force_recording_state()
+        # Pre-condition: not yet in REPLAY.
+        self.assertNotEqual(
+            self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY
+        )
+        self.assertIsNone(self.controller._playback_session_time_ns)
+        self.controller.set_playback_rate(0.5)
+        # Latest replayable session_time is the end of the last
+        # finalized segment = 20s in this fixture. The slow button
+        # should land us at 20s, NOT at 10s.
+        self.assertEqual(
+            self.controller._playback_session_time_ns, 20_000_000_000
+        )
+        self.assertEqual(
+            self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY
+        )
+
     def test_jump_to_live_clears_playback_session_time_and_returns_to_live(self) -> None:
         self._force_recording_state()
         self.controller.rewind_10_seconds()
@@ -425,6 +451,130 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertAlmostEqual(
             self.controller.get_state().replay_buffer_span_seconds, 20.0, places=3
         )
+
+
+class _FakeNanosecondClock:
+    """Manually advanced monotonic-ns clock for SessionClock tests."""
+
+    def __init__(self, start_ns: int = 0) -> None:
+        self.now_ns = start_ns
+
+    def __call__(self) -> int:
+        return self.now_ns
+
+    def advance_ns(self, delta_ns: int) -> None:
+        self.now_ns += delta_ns
+
+
+class SecondsBehindLiveSmoothnessTests(unittest.TestCase):
+    """Bug fix: `seconds_behind_live` should grow continuously with
+    real time during pause / slow motion, not jump in segment-finalize
+    quanta. Verified by passing in a fake `SessionClock` whose monotonic
+    source the test advances directly."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._app = QCoreApplication.instance() or QCoreApplication([])
+
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        root_dir = Path(self._temp_dir.name) / "session_001"
+        for sub in ("recording", "rolling", "clips"):
+            (root_dir / sub).mkdir(parents=True, exist_ok=True)
+        self.session_paths = SessionPaths(
+            session_id="session_001",
+            root_dir=root_dir,
+            recording_dir=root_dir / "recording",
+            rolling_dir=root_dir / "rolling",
+            clips_dir=root_dir / "clips",
+        )
+        self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
+        self.recording_manager = RecordingManager()
+        self.segment_index = SegmentIndex()
+        # Single 4-second segment at session_time 0..4. Fixture
+        # deliberately keeps `latest_replayable` constant at 4s so the
+        # smoothness check isolates the clock-vs-segment-edge difference.
+        self.segment_index.add(
+            _make_segment(fragment_index=0, start_pts_ns=0)
+        )
+        self.replay_store = RecordingSegmentReplayStore(self.segment_index)
+        self.stub_decoder = _StubSegmentDecoder(self.feed.feed_id, self.feed.display_name)
+
+        self.fake_clock_fn = _FakeNanosecondClock(start_ns=0)
+        # Advance to t=10s so when SessionClock is constructed below,
+        # `now_session_time_ns()` starts at 0 and grows from there.
+        self.fake_clock_fn.advance_ns(10_000_000_000)
+        self.session_clock = SessionClock(clock_ns=self.fake_clock_fn)
+
+        runtime = FeedRuntime(
+            feed=self.feed,
+            source=_FakeSource(self.feed.feed_id),
+            pipeline_manager=_FakePipelineManager(self.feed.feed_id),
+        )
+        runtime.start(self.session_paths)
+
+        self.renderer = _FakeRenderer()
+        self.controller = PlaybackController(
+            feed_runtimes=[runtime],
+            output_renderer=self.renderer,
+            recording_manager=self.recording_manager,
+            replay_store=self.replay_store,
+            default_source_name="Fake Source",
+            session_role="operator",
+            live_only=False,
+            decoder_factory=lambda *_args: self.stub_decoder,
+            session_clock=self.session_clock,
+        )
+        self.controller.initialize(self.session_paths.session_id)
+        self.recording_manager.recording_state.force(RecordingState.RECORDING)
+        self.controller.refresh_recording_state()
+
+    def tearDown(self) -> None:
+        self.controller.shutdown()
+        self._temp_dir.cleanup()
+
+    def test_seconds_behind_live_grows_smoothly_during_pause(self) -> None:
+        """While paused, `latest_replayable` stays at 4s but the clock
+        keeps advancing. The displayed `seconds_behind_live` should
+        track the clock, not the segment edge."""
+        self.controller.pause_playback()
+        # Pause anchored at latest_replayable = 4s; clock now at 0s
+        # session-time → behind = 0 - 4 clamped to 0. Advance clock 5s
+        # of real time without finalizing any new segments.
+        self.fake_clock_fn.advance_ns(5_000_000_000)
+        with self.controller._lock:
+            self.controller._update_state_timestamps_locked()
+        # session_clock.now = 5s; playback_session_time = 4s; behind = 1s.
+        self.assertAlmostEqual(
+            self.controller.get_state().seconds_behind_live, 1.0, places=2
+        )
+        # Advance another 4 real-time seconds (still no new segment).
+        self.fake_clock_fn.advance_ns(4_000_000_000)
+        with self.controller._lock:
+            self.controller._update_state_timestamps_locked()
+        # session_clock.now = 9s; playback_session_time = 4s; behind = 5s.
+        self.assertAlmostEqual(
+            self.controller.get_state().seconds_behind_live, 5.0, places=2
+        )
+
+    def test_seconds_behind_live_unaffected_by_segment_finalization(self) -> None:
+        """The smooth metric should NOT jump when a new segment finalizes
+        — the clock-based formula is independent of segment edges."""
+        self.controller.pause_playback()
+        self.fake_clock_fn.advance_ns(5_000_000_000)
+        with self.controller._lock:
+            self.controller._update_state_timestamps_locked()
+        before = self.controller.get_state().seconds_behind_live
+        # Simulate a new segment finalizing — this would have caused a
+        # 4s jump in the old segment-edge metric.
+        self.segment_index.add(
+            _make_segment(fragment_index=1, start_pts_ns=4_000_000_000)
+        )
+        with self.controller._lock:
+            self.controller._update_state_timestamps_locked()
+        after = self.controller.get_state().seconds_behind_live
+        # Same clock reading → same behind-live (no jump).
+        self.assertAlmostEqual(before, after, places=2)
 
 
 class MultiFeedRenderTests(unittest.TestCase):

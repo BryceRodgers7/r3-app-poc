@@ -2258,6 +2258,54 @@ Exit criteria:
 - Replay availability is calculated from completed recording segments only, from recording start through the latest replayable finalized segment.
 - The UI can show when replay is unavailable or lagging behind live because the latest segment is still being written.
 
+### Slices
+
+Phase 7 lands in three slices. 7.A and 7.B are independent (different surfaces) and could land in either order; 7.C is mostly a confirming pass against the prior slices and is most useful last.
+
+**7.A — Disk budget estimation + startup validation**
+
+- New setting `disk_budget_mb_s: float = 200.0` (default conservative SATA-SSD threshold; configurable per-deployment in `app_settings.toml` under `[recording]`).
+- New `app/core/disk_budget.py` module:
+  - `estimate_per_feed_mb_s(target_frame_width, target_frame_height, target_fps, codec)` — bitrate estimate from frame size × fps × codec coefficient. MJPEG default coefficient `0.10` (≈ jpegenc default quality 85 at typical broadcast content). Other codecs raise `NotImplementedError` for now (Phase-4 only ships MJPEG).
+  - `estimate_total_mb_s(enabled_feeds, settings)` — sum across feeds.
+  - `validate_budget(estimated_mb_s, budget_mb_s)` returns one of `BudgetVerdict.OK` / `BudgetVerdict.WARN` (≥ 80% of budget) / `BudgetVerdict.OVER_BUDGET` (≥ 100%).
+- `ApplicationCoordinator.initialize` (or earlier in `build_default_application_coordinator`) calls the validator at startup. `OK` → `INFO` log. `WARN` → `WARNING` log + a `disk_budget_warn` health event. `OVER_BUDGET` → `ERROR` log + a `disk_budget_over` health event. Recording is still allowed (operator-overridable); the warning is surfaced through the diagnostics banner.
+- `DiagnosticsWidget` adds a one-line readout: `disk: 75/200 MB/s est ✓` / `disk: 165/200 MB/s est ⚠` / `disk: 240/200 MB/s est ✗`.
+- Tests: per-feed estimation against known frame size / fps fixtures; total-aggregate; threshold matrix (OK / WARN / OVER); health-event emission; TOML parsing of `disk_budget_mb_s` (default + override).
+
+**Out of scope for 7.A:** dynamic re-validation when `target_frame_*` changes mid-session (settings are immutable per app run); auto-detection of disk type or measured throughput (a separate observability slice).
+
+**7.B — Latest-replayable surface in diagnostics + status bar**
+
+- `UiState` gains:
+  - `latest_replayable_session_time_ns: int | None` — the cross-feed latest replayable session time (already computed for the overlay; expose explicitly).
+  - `live_lag_behind_replayable_seconds: float` — distance between "now" (latest live overlay's `capture_timestamp` mapped to session time, or the controller's monotonic now) and the latest replayable session time. Typically equals `~segment_duration_seconds` while the in-progress segment is being written.
+  - `replay_available: bool` — `False` until the first segment finalizes (covers the "operator just started recording, no replay yet" UX gap).
+- `PlaybackController._update_state_timestamps_locked` populates the new fields from `replay_store.available_session_time_range()` and the per-feed running session-time at the latest live tick.
+- `StatusBarWidget` adds an indicator: `Replay covers 0:00 – 0:42 (latest finalized -4s)` when `replay_available`; `Replay not yet available — first segment finalizing` when `replay_available is False`.
+- `DiagnosticsWidget` shows the `live_lag_behind_replayable_seconds` value alongside the existing latency block — useful for diagnosing a wedged splitmuxsink (lag would grow unboundedly instead of hovering near `segment_duration`).
+- Tests: state population for the three cases (no segments yet → `replay_available=False`; one finalized segment → range + lag); status-bar text formatting; behavior across `recording_segment_duration_seconds=4.0` and a hypothetical 8s configuration.
+
+**Out of scope for 7.B:** the operator-facing "rewind back to" picker UI (a slice in the future scope-of-marker work). 7.B only adds the read-only surface so the operator knows what's available.
+
+**7.C — Replay safety invariants + clip-shortcut audit**
+
+- Defensive tests asserting:
+  - `RecordingSegmentReplayStore.resolve` / `resolve_session_time` / `nearest_frame_location` all return `None` (or skip) for `state="writing"` rows even when their PTS / session-time range would otherwise overlap the target. (Some coverage exists from 4.C; 7.C consolidates.)
+  - `SegmentIndex.latest_replayable_pts` and `latest_replayable_session_time` exclude writing segments. (Already true; lock in.)
+  - `PlaybackController.rewind_10_seconds` / `pause_playback` / `set_playback_rate` / `jump_to_live` exercised against an index that contains a writing tail segment never resolve into it.
+- Code-path audit asserting transport methods take no file-system mutation actions:
+  - `_render_at_session_time_ns`, `_resolve_pause_anchor_locked`, `_resolve_rewind_target_locked`, `_on_replay_timer_tick` should never call `Path.unlink`, `Path.replace`, `Path.rename`, `os.remove`, or any `MetadataDb` write. Add a test that uses an instrumented `MetadataDb` / fake `Path` to detect any write call originating from those methods.
+- Documentation pass: §15.2 / §15.7 already say replay reads from completed segments only; 7.C adds an inline note pointing at the test file that locks this in.
+
+**Out of scope for 7.C:** retention / cleanup policy enforcement (§6.8 — separate phase). 7.C only confirms the read path is harmless; cleanup happens elsewhere via the recovery scan + future retention sweeper.
+
+### Phase 7 sequencing notes
+
+- **7.A and 7.B are independent.** Either can land first; both are needed before Phase 7 is ✅. Recommend 7.A first because the disk-budget signal is what catches a misconfigured production deployment before the operator hits a wedged-recording bug — higher operational value than the latest-replayable surface, which is mostly diagnostic.
+- **7.C should land last.** It's a confirming/locking-in pass; the tests it adds are most valuable after the surfaces it covers exist.
+- **No hardware-specific risk** in any of the three slices. All testable against synthesized fixtures.
+
 ---
 
 ## Phase 8 – Post-Session MP4 Processor

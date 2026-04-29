@@ -46,6 +46,7 @@ class ApplicationCoordinator:
         operator_renderer: MultiFeedOutputRenderer,
         program_renderer: MultiFeedOutputRenderer,
         segment_index: SegmentIndex | None = None,
+        session_clock: SessionClock | None = None,
     ) -> None:
         self._settings = settings
         self._session_manager = session_manager
@@ -63,6 +64,13 @@ class ApplicationCoordinator:
         # use this rather than touching the index directly so eligibility
         # checks (§10.4 / §6.6) stay in one place.
         self.replay_store = RecordingSegmentReplayStore(self.segment_index)
+        # Shared session clock — defaults to a fresh instance if the
+        # caller didn't supply one (covers older test callers). The
+        # builder below threads in the same instance the
+        # PipelineManagers got, so the controller's `seconds_behind_live`
+        # math is anchored to the same monotonic origin as the segment
+        # rows it queries.
+        self.session_clock = session_clock if session_clock is not None else SessionClock()
 
         primary_feed = feed_registry.get_primary_feed()
         enabled_feeds = feed_registry.get_enabled_feeds()
@@ -75,6 +83,7 @@ class ApplicationCoordinator:
             default_source_name=primary_feed.display_name,
             session_role="operator",
             live_only=False,
+            session_clock=self.session_clock,
         )
         self.program_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,
@@ -84,6 +93,7 @@ class ApplicationCoordinator:
             default_source_name=primary_feed.display_name,
             session_role="program",
             live_only=True,
+            session_clock=self.session_clock,
         )
         self._session_started = False
         self._shutting_down = False
@@ -370,6 +380,7 @@ def build_default_application_coordinator(
         operator_renderer=operator_renderer,
         program_renderer=program_renderer,
         segment_index=segment_index,
+        session_clock=session_clock,
     )
 
 
