@@ -194,6 +194,15 @@ class PipelineManager:
         # `_add_record_branch_via_splitmuxsink`.
         self._record_branch_jpegenc: Any | None = None
         self._record_branch_name: str | None = None
+        # Phase 7.G bug-fix: the audio_record opusenc, captured during
+        # `_add_audio_record_branch_to_splitmuxsink`. The rebuild path
+        # (`_rebuild_splitmuxsink_locked`) needs it to re-link audio
+        # into the freshly built splitmuxsink — without this,
+        # game_002+ silently lost their audio stream because the new
+        # splitmuxsink had no `audio_%u` pad requested. None when the
+        # audio chain was never wired (recording_audio_enabled=False
+        # or source has no audio).
+        self._audio_record_encoder: Any | None = None
         # Each press of "Start game recording" gets its own subfolder
         # under `<session>/recording/`. Captured here at enable time;
         # `_on_splitmuxsink_format_location` builds the per-segment
@@ -1230,6 +1239,11 @@ class PipelineManager:
             LOGGER.exception("rebuild_splitmuxsink: pipeline.remove(old) failed")
         new_sink = self._build_splitmuxsink_element(branch_name)
         self._pipeline.add(new_sink)
+        # Phase 7.G: re-attach the audio_record chain BEFORE the
+        # element is brought up. Order matters for matroskamux caps
+        # negotiation (see comment in `_add_audio_record_branch_to_splitmuxsink`).
+        # No-op when `_audio_record_encoder` is None.
+        self._link_audio_encoder_to_splitmuxsink_locked(new_sink)
         if not jpegenc.link(new_sink):
             raise RuntimeError(
                 "rebuild_splitmuxsink: failed to link jpegenc → new splitmuxsink"
@@ -1676,31 +1690,27 @@ class PipelineManager:
         ):
             raise RuntimeError("Failed to link the audio_record branch head.")
 
-        # Request the audio_%u pad BEFORE linking the encoder's src.
-        audio_sink_pad = self._splitmuxsink.request_pad_simple("audio_%u")
-        if audio_sink_pad is None:
-            audio_sink_pad = self._splitmuxsink.get_request_pad("audio_%u")
-        if audio_sink_pad is None:
-            raise RuntimeError(
-                "splitmuxsink does not expose an audio_%u request pad — "
-                "muxer-factory likely doesn't support audio."
-            )
         encoder_src_pad = encoder.get_static_pad("src")
         if encoder_src_pad is None:
             raise RuntimeError("opusenc src pad missing")
-        if encoder_src_pad.link(audio_sink_pad) != Gst.PadLinkReturn.OK:
-            raise RuntimeError(
-                "Failed to link opusenc.src to splitmuxsink.audio_%u"
-            )
         # Phase 7.E: detect "audio chain is wired but source produced
         # no audio" by capturing the timestamp of the first buffer
         # leaving opusenc. The grace check in
-        # `_on_record_branch_buffer_probe` reads this field.
+        # `_on_record_branch_buffer_probe` reads this field. Probe is
+        # installed once, here, on the encoder's permanent src pad
+        # (NOT on the splitmuxsink request pad which gets reassigned
+        # when splitmuxsink is rebuilt for a new game).
         encoder_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
             self._on_audio_record_buffer_probe,
             None,
         )
+        # Phase 7.G: store encoder reference + perform the
+        # encoder→splitmuxsink link via the shared helper. The helper
+        # is also called from `_rebuild_splitmuxsink_locked` so the
+        # audio chain gets re-attached to each fresh splitmuxsink.
+        self._audio_record_encoder = encoder
+        self._link_audio_encoder_to_splitmuxsink_locked(self._splitmuxsink)
 
         tee_src_pad = self._request_audio_tee_pad()
         queue_sink_pad = queue.get_static_pad("sink")
@@ -1716,6 +1726,51 @@ class PipelineManager:
             "Audio record branch wired into splitmuxsink at %d bps (opus).",
             self._audio_bitrate,
         )
+
+    def _link_audio_encoder_to_splitmuxsink_locked(
+        self, splitmuxsink: Any
+    ) -> None:
+        """Phase 7.G: request `audio_%u` on `splitmuxsink` and link the
+        existing audio_record opusenc to it.
+
+        Called twice in a recording's lifetime: once during initial
+        audio-chain construction (`_add_audio_record_branch_to_splitmuxsink`),
+        and again on every Stop/Start cycle from `_rebuild_splitmuxsink_locked`.
+        Without the second call, games after the first record video-only
+        because the rebuilt splitmuxsink has no `audio_%u` pad and the
+        encoder's src pad is dangling.
+
+        No-op when `_audio_record_encoder` is None — that's the
+        `recording_audio_enabled=False` / video-only-source path.
+        """
+        encoder = self._audio_record_encoder
+        if encoder is None or self._Gst is None:
+            return
+        Gst = self._Gst
+        # Pad request order matches the initial wiring: `audio_%u`
+        # FIRST, link encoder.src AFTER. Reversing order is what
+        # caused the 4.A.bis freeze referenced in the original
+        # comments above.
+        audio_sink_pad = splitmuxsink.request_pad_simple("audio_%u")
+        if audio_sink_pad is None:
+            audio_sink_pad = splitmuxsink.get_request_pad("audio_%u")
+        if audio_sink_pad is None:
+            raise RuntimeError(
+                "splitmuxsink does not expose an audio_%u request pad on rebuild."
+            )
+        encoder_src_pad = encoder.get_static_pad("src")
+        if encoder_src_pad is None:
+            raise RuntimeError("opusenc src pad missing on audio re-link")
+        # Defensive: if encoder.src is already peer-linked (to the old
+        # splitmuxsink that's about to be removed), unlink first.
+        # GStreamer would otherwise raise on the new link attempt.
+        peer = encoder_src_pad.get_peer()
+        if peer is not None:
+            encoder_src_pad.unlink(peer)
+        if encoder_src_pad.link(audio_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(
+                "Failed to link opusenc.src to splitmuxsink.audio_%u"
+            )
 
     def _add_audio_appsink_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
         assert self._pipeline is not None

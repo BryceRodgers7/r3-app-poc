@@ -346,9 +346,17 @@ class MainEndToEndTests(unittest.TestCase):
             db.close()
 
     def test_main_returns_zero_on_finalized_session(self) -> None:
+        # `--dry-run` skips encoding so this test stays a pure
+        # validation+plan check; the encoding path lives in
+        # `tests/test_long_form_export.py::MainCliEncodingTests`.
         _write_manifest(self.session_dir, state="finalized")
         self._populate_db()
-        rc = main([str(self.session_dir), "--metadata-db", str(self.db_path)])
+        rc = main([
+            str(self.session_dir),
+            "--metadata-db",
+            str(self.db_path),
+            "--dry-run",
+        ])
         self.assertEqual(rc, 0)
 
     def test_main_returns_two_on_dirty_session(self) -> None:

@@ -21,6 +21,57 @@ Target vs current design (multi-feed, two windows, future playback model) is des
 
 **Optional** `app_settings.toml` in the working directory sets ingest and paths (see [app/config/settings.py](app/config/settings.py)). If the file defines `[[feeds]]`, at least one feed must have `enabled = true` and the legacy `[source]` section is ignored. With no `[[feeds]]` table, the app uses a single feed from `[source]`.
 
+## Post-session MP4 export (Phase 8)
+
+After the recording app has been **shut down** and the session is **finalized**, run the post-session processor to produce one long-form MP4 per game per feed. Source MKV segments stay on disk untouched.
+
+Dependencies:
+
+- **ffmpeg** must be installed and either on PATH or passed via `--ffmpeg-path`. On MSYS2 UCRT64:
+  `pacman -S mingw-w64-ucrt-x86_64-ffmpeg`
+  Default install location is `C:\msys64\ucrt64\bin\ffmpeg.exe`.
+
+Usage:
+
+```
+python -m app.tools.post_session_processor <session_path> [options]
+```
+
+Examples (Windows / Git Bash):
+
+```
+# Default — print plan, encode each (game, feed) to <session>/processed/<game>/<feed>.mp4
+python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118 \
+    --ffmpeg-path C:/msys64/ucrt64/bin/ffmpeg.exe
+
+# Plan only, no encoding
+python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118 --dry-run
+```
+
+Or, to skip `--ffmpeg-path` on every run, add the bin dir to PATH for your shell:
+
+```
+export PATH="/c/msys64/ucrt64/bin:$PATH"
+python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118
+```
+
+Behavior:
+
+- **Refuses to run** on sessions in any state other than `finalized`. Use the recording app's recovery dialog to finalize a `dirty` / `stopped` session first.
+- **File-locks** the session directory via `<session>/.processing.lock` so concurrent processors fail-fast. If the previous run crashed, delete the lock file manually and retry.
+- **Encodes** to H.264 (libx264, `-preset medium -crf 23`) + AAC (128 kbps), MP4 container.
+- **Output**: `<session_path>/processed/<game_NNN>/<feed_id>.mp4` per (game, feed). Existing outputs are overwritten (`-y`).
+- **Exit codes:** `0` — all artifacts encoded (or `--dry-run`); `1` — partial failure (one or more artifacts failed); `2` — pre-flight failure (validation, missing DB, missing ffmpeg, lock held).
+
+Options:
+
+- `--dry-run` — print the export plan and exit without encoding.
+- `--ffmpeg-path PATH` — override ffmpeg binary location (otherwise `shutil.which("ffmpeg")`).
+- `--metadata-db PATH` — override DB location (default `<session_path>/../../metadata.db`, i.e. `<base_data_dir>/metadata.db`).
+- `-v` / `--verbose` — DEBUG-level logging.
+
+`8.B` ships long-form export only. Short-play MP4s (per-clip extracts using operator clip markers) are deferred until the §6.7 clip-marker system lands. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 8 sequencing notes for details.
+
 - **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed. Production deployments use this exclusively.
 - **`kind = "synthetic"`**: deterministic synthetic test pattern from [app/media/test_source.py](app/media/test_source.py). Dev-only fallback for machines without NDI hardware.
 

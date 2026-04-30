@@ -61,6 +61,11 @@ class LongFormPlanItem:
     segment_count: int
     total_duration_ns: int
     output_path: Path
+    # Phase 8.B: ordered absolute paths of the segments that will be
+    # concatenated into `output_path`. Populated by `build_plan` from
+    # the SegmentIndex; the encoder uses this rather than re-querying
+    # the DB during export. Tuple for hashability + dataclass frozen.
+    segment_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +82,13 @@ class ProcessingPlan:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point. Returns the process exit code."""
+    """CLI entry point. Returns the process exit code.
+
+    Exit codes:
+      0 — success (all artifacts encoded, or `--dry-run`).
+      1 — partial success (one or more artifacts failed to encode).
+      2 — pre-flight failure (validation, missing DB, missing ffmpeg, lock held).
+    """
     args = _parse_args(argv)
     _configure_logging(args.verbose)
 
@@ -95,6 +106,22 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("metadata database not found at %s", db_path)
         return 2
 
+    # Resolve ffmpeg up front (unless `--dry-run`) so a missing binary
+    # fails before we acquire the lock or open the DB. Phase 8.C will
+    # bring its own `dry_run` plumbing into the artifact persistence
+    # layer; for 8.B it just short-circuits encoding.
+    exporter: "LongFormExporter | None" = None
+    if not args.dry_run:
+        from app.tools.long_form_export import (
+            FfmpegNotFoundError,
+            LongFormExporter,
+        )
+        try:
+            exporter = LongFormExporter(ffmpeg_path=args.ffmpeg_path)
+        except FfmpegNotFoundError as exc:
+            LOGGER.error("%s", exc)
+            return 2
+
     try:
         with acquire_lock(session_path):
             db = MetadataDb(db_path)
@@ -103,10 +130,30 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 db.close()
             print_plan(plan)
+            if args.dry_run or not plan.long_form:
+                return 0
+            assert exporter is not None
+            from app.tools.long_form_export import export_all
+            results = export_all(
+                exporter,
+                plan.long_form,
+                segment_paths_for=lambda item: list(item.segment_paths),
+            )
     except ValidationError as exc:
         LOGGER.error("%s", exc)
         return 2
-    return 0
+
+    failed = [r for r in results if r.status != "success"]
+    succeeded = [r for r in results if r.status == "success"]
+    print(
+        f"\nExport complete: {len(succeeded)} succeeded, {len(failed)} failed."
+    )
+    for r in failed:
+        print(
+            f"  FAILED  {r.plan_item.game_subdir}/{r.plan_item.feed_id}: "
+            f"{(r.error_message or 'unknown error').splitlines()[0]}"
+        )
+    return 0 if not failed else 1
 
 
 def validate_session_state(session_path: Path) -> dict:
@@ -231,6 +278,9 @@ def build_plan(db: MetadataDb, session_path: Path) -> ProcessingPlan:
     items: list[LongFormPlanItem] = []
     processed_dir = session_path / PROCESSED_DIRNAME
     for (game_subdir, feed_id), segs in sorted(grouped.items()):
+        # Sort segments by fragment_index so the concat order matches
+        # the recording timeline rather than DB insert order.
+        segs.sort(key=lambda s: s.fragment_index)
         total_duration_ns = sum(s.duration_ns for s in segs)
         output_path = processed_dir / game_subdir / f"{feed_id}.mp4"
         items.append(
@@ -240,6 +290,7 @@ def build_plan(db: MetadataDb, session_path: Path) -> ProcessingPlan:
                 segment_count=len(segs),
                 total_duration_ns=total_duration_ns,
                 output_path=output_path,
+                segment_paths=tuple(Path(s.file_path) for s in segs),
             )
         )
     return ProcessingPlan(session_id=session_id, long_form=items)
@@ -271,8 +322,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="post_session_processor",
         description=(
             "Generate MP4 deliverables from a finalized session's recording "
-            "segments. Phase 8.A only validates and prints the plan; "
-            "encoding is added in 8.B."
+            "segments. Default behavior: validate, print the plan, encode "
+            "each artifact via ffmpeg. Use `--dry-run` to skip encoding."
         ),
     )
     parser.add_argument(
@@ -286,6 +337,21 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "Override the metadata DB path (default: <session_path>/../../metadata.db)."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the export plan and exit without encoding.",
+    )
+    parser.add_argument(
+        "--ffmpeg-path",
+        type=Path,
+        default=None,
+        help=(
+            "Override the ffmpeg binary location. Default: PATH lookup via "
+            "shutil.which. Useful on MSYS2 UCRT64 where ffmpeg may live at "
+            "/ucrt64/bin/ffmpeg.exe but isn't on the Git Bash PATH."
         ),
     )
     parser.add_argument(
