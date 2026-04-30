@@ -97,6 +97,14 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         # peer. Stays None in tests so the EOS-dispatch branch becomes a
         # no-op (avoids fabricating a fake pad chain).
         pm._record_branch_jpegenc = None
+        # Phase 9.C fields read by `_ensure_audio_record_branch_built_locked`
+        # which `enable_file_recording` calls on the first-Start branch.
+        # Defaulting them all to "no audio chain" keeps the stub simple
+        # and matches a video-only test pipeline.
+        pm._recording_audio_enabled = False
+        pm._audio_format = None
+        pm._audio_record_encoder = None
+        pm._audio_present_observed = False
         return pm
 
     def _session_paths(self, root: Path) -> SessionPaths:

@@ -219,16 +219,23 @@ class PipelineManager:
                 f"Got codec={self._recording_codec!r} container={self._recording_container!r}. "
                 f"ProRes/DNxHR support is deferred."
             )
-        # Phase 7.E: audio-missing detection. When `recording_audio_enabled`
-        # is True but the source produces no audio buffers, splitmuxsink
-        # waits indefinitely for audio data and the recording queue
-        # back-pressures the tee, freezing the live preview. This is
-        # documented in CLAUDE.md as the "set audio_enabled = false for
-        # no-audio sources" caveat. The probe + grace-timer below logs a
-        # `category=audio_missing` health event after 5s if the audio
-        # chain is wired but no buffer has flowed, so the operator gets
-        # a visible paper trail instead of a silent freeze.
+        # Phase 7.E + 9.C: audio-presence detection.
+        #
+        # `_audio_present_observed` is set by a buffer probe on the
+        # audio tee's sink pad as soon as the first audio buffer
+        # flows from the source. This is the signal Phase 9.C uses
+        # to decide whether to build the audio_record branch into
+        # splitmuxsink; without an observed buffer the branch is
+        # never built and recordings are silently video-only.
+        #
+        # `_audio_record_first_buffer_at_ns` (Phase 7.E) is set by a
+        # later probe on opusenc.src, which only exists once the
+        # audio_record branch HAS been built. Together with
+        # `_pipeline_started_monotonic_ns` it drives the
+        # `audio_missing` health-event grace check — informational
+        # since 9.C, no longer a freeze warning.
         self._pipeline_started_monotonic_ns: int | None = None
+        self._audio_present_observed: bool = False
         self._audio_record_first_buffer_at_ns: int | None = None
         self._audio_missing_warned: bool = False
 
@@ -310,6 +317,13 @@ class PipelineManager:
                     "splitmuxsink rebuild failed on re-enable for feed_id=%s",
                     self._recording_feed_id,
                 )
+        else:
+            # Phase 9.C: first Start (no prior rebuild). If audio has
+            # been observed since pipeline construction, late-build the
+            # audio_record branch BEFORE we open the recording valve so
+            # the first segment's matroskamux sees the audio pad during
+            # caps negotiation.
+            self._ensure_audio_record_branch_built_locked()
         self._set_branch_enabled("record", True)
         self._recording_running = True
         self._recording_was_disabled = False
@@ -1239,17 +1253,28 @@ class PipelineManager:
             LOGGER.exception("rebuild_splitmuxsink: pipeline.remove(old) failed")
         new_sink = self._build_splitmuxsink_element(branch_name)
         self._pipeline.add(new_sink)
-        # Phase 7.G: re-attach the audio_record chain BEFORE the
-        # element is brought up. Order matters for matroskamux caps
-        # negotiation (see comment in `_add_audio_record_branch_to_splitmuxsink`).
-        # No-op when `_audio_record_encoder` is None.
+        # Update the splitmuxsink reference now so downstream helpers
+        # (`_ensure_audio_record_branch_built_locked` ⇒
+        # `_add_audio_record_branch_to_splitmuxsink`) operate on the
+        # NEW sink, not the freshly-removed old one.
+        self._splitmuxsink = new_sink
+        # Phase 9.C: if audio was observed for the first time between
+        # the previous game and this one, build the audio_record
+        # branch now so this game's segments get audio. No-op when
+        # the branch is already built (the second helper below
+        # re-links it) or when audio still hasn't been seen.
+        self._ensure_audio_record_branch_built_locked()
+        # Phase 7.G: re-attach the existing audio_record chain BEFORE
+        # the element is brought up. Order matters for matroskamux
+        # caps negotiation (see comment in
+        # `_add_audio_record_branch_to_splitmuxsink`). No-op when
+        # `_audio_record_encoder` is None (audio never observed).
         self._link_audio_encoder_to_splitmuxsink_locked(new_sink)
         if not jpegenc.link(new_sink):
             raise RuntimeError(
                 "rebuild_splitmuxsink: failed to link jpegenc → new splitmuxsink"
             )
         new_sink.sync_state_with_parent()
-        self._splitmuxsink = new_sink
         LOGGER.info(
             "splitmuxsink rebuilt for feed_id=%s (fresh format-location callback ready)",
             self._recording_feed_id,
@@ -1487,17 +1512,15 @@ class PipelineManager:
     AUDIO_MISSING_GRACE_SECONDS = 5.0
 
     def _maybe_warn_audio_missing(self) -> None:
-        """Emit a `category=audio_missing` health event once when the
-        recording audio chain is wired but the source produced no audio
+        """Emit a `category=audio_missing` health event once when
+        recording audio is configured but the source produced no audio
         within the grace window.
 
-        Symptom this catches: with `recording_audio_enabled = true`
-        AND a source that doesn't emit audio (NDI Tools Screen Capture
-        or a sender whose audio stream is muted), splitmuxsink waits
-        for audio buffers indefinitely, the recording queue
-        backpressures the tee, and the live preview freezes. The
-        config-side workaround is `[recording] audio_enabled = false`;
-        Phase 9 will replace this warning with dynamic adaptation.
+        Phase 9.C: this warning is informational — recording proceeds
+        in video-only mode without any preview stall. Before 9.C, the
+        same condition caused a recording-queue back-pressure freeze.
+        The health event still fires so the operator can verify their
+        feed is producing the audio they expected.
 
         Called from the video record-branch buffer probe so the check
         runs at video-buffer cadence — no separate timer thread.
@@ -1506,7 +1529,7 @@ class PipelineManager:
             return
         if not self._recording_audio_enabled:
             return
-        if self._audio_record_first_buffer_at_ns is not None:
+        if self._audio_present_observed:
             return
         if self._pipeline_started_monotonic_ns is None:
             return
@@ -1519,11 +1542,10 @@ class PipelineManager:
             severity=HealthSeverity.WARNING,
             category="audio_missing",
             message=(
-                f"recording_audio_enabled is true but no audio buffer arrived "
-                f"within {self.AUDIO_MISSING_GRACE_SECONDS:.0f}s. The recording "
-                f"queue will back-pressure the tee and the live preview may "
-                f"freeze. Set `[recording] audio_enabled = false` in "
-                f"app_settings.toml if the source has no audio."
+                f"no audio buffer arrived from feed within "
+                f"{self.AUDIO_MISSING_GRACE_SECONDS:.0f}s; recording in "
+                f"video-only mode (Phase 9.C). If you expected audio, "
+                f"check the NDI sender's audio configuration."
             ),
             feed_id=feed_id,
             metadata={
@@ -1587,22 +1609,19 @@ class PipelineManager:
             self._audio_appsrc = appsrc
 
         self._add_live_audio_branch()
-        # Slice 4.F: when audio recording is enabled, route the audio
-        # tee into the same splitmuxsink the video record branch is
-        # using so segments are muxed video+audio. Otherwise drain
-        # via a no-op appsink so the audio tee doesn't back-pressure.
-        if self._recording_audio_enabled and self._splitmuxsink is not None:
-            try:
-                self._add_audio_record_branch_to_splitmuxsink()
-            except Exception:
-                LOGGER.exception(
-                    "Failed to wire audio into splitmuxsink; falling back to "
-                    "video-only segments. Set [recording] audio_enabled=false "
-                    "in app_settings.toml to silence this warning."
-                )
-                self._add_audio_appsink_branch("record", self._on_record_audio_sample)
-        else:
-            self._add_audio_appsink_branch("record", self._on_record_audio_sample)
+        # Phase 9.C: always drain the record-side of the tee via a
+        # no-op appsink so the tee never back-pressures, regardless
+        # of whether the audio_record branch into splitmuxsink ends
+        # up being built. The audio_record branch is built lazily
+        # (`_ensure_audio_record_branch_built_locked`) only when an
+        # audio buffer is actually observed flowing through the tee.
+        # If the source has no audio, the branch is never built and
+        # splitmuxsink stays video-only — no stall, no freeze.
+        self._add_audio_appsink_branch("record", self._on_record_audio_sample)
+        # Phase 9.C: presence detector. Probe the tee's sink pad
+        # (the input from the source) so we see audio buffers as
+        # soon as the source emits any.
+        self._install_audio_presence_probe_locked(tee)
 
     def _add_live_audio_branch(self) -> None:
         assert self._pipeline is not None
@@ -1726,6 +1745,79 @@ class PipelineManager:
             "Audio record branch wired into splitmuxsink at %d bps (opus).",
             self._audio_bitrate,
         )
+
+    def _install_audio_presence_probe_locked(self, tee: Any) -> None:
+        """Phase 9.C: detect the first audio buffer that flows through
+        the tee from the source.
+
+        `_audio_present_observed` becomes the source of truth for the
+        Phase 9.C "should we build the audio_record branch?" decision.
+        Probe is on the tee's sink pad so we see audio independent of
+        whether the audio_record branch has been built yet.
+        """
+        Gst = self._Gst
+        if Gst is None:
+            return
+        sink_pad = tee.get_static_pad("sink")
+        if sink_pad is None:
+            LOGGER.warning(
+                "audio tee has no sink pad — audio-presence detection disabled"
+            )
+            return
+        sink_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._on_audio_presence_probe,
+            None,
+        )
+
+    def _on_audio_presence_probe(
+        self, _pad: Any, _info: Any, _user: Any
+    ) -> Any:
+        """Set the sticky `_audio_present_observed` flag on first buffer."""
+        Gst = self._Gst
+        if Gst is None:
+            return 0
+        if not self._audio_present_observed:
+            self._audio_present_observed = True
+            LOGGER.info(
+                "audio detected on tee for feed_id=%s; audio_record branch "
+                "will be wired into splitmuxsink at next Start / rebuild",
+                self._source.get_feed_id() if self._source is not None else "?",
+            )
+        return Gst.PadProbeReturn.OK
+
+    def _ensure_audio_record_branch_built_locked(self) -> None:
+        """Phase 9.C: build the audio_record branch on demand.
+
+        No-op if any of:
+        - `[recording] audio_enabled = false` in TOML (manual override
+          for operators who want video-only by policy).
+        - The audio infrastructure wasn't built (source has no audio
+          capability — `_audio_format` is None).
+        - The audio_record branch is already built (encoder exists).
+        - No audio buffer has been observed on the tee yet.
+
+        Called at "Start game recording" (initial wiring) and at
+        `_rebuild_splitmuxsink_locked` (Stop/Start cycle) so a source
+        that gains audio between games picks it up on the next game.
+        """
+        if not self._recording_audio_enabled:
+            return
+        if self._audio_format is None:
+            return
+        if self._audio_record_encoder is not None:
+            return
+        if not self._audio_present_observed:
+            return
+        if self._splitmuxsink is None:
+            return
+        try:
+            self._add_audio_record_branch_to_splitmuxsink()
+        except Exception:
+            LOGGER.exception(
+                "Phase 9.C: late-build of audio_record branch failed; "
+                "this game will record video-only"
+            )
 
     def _link_audio_encoder_to_splitmuxsink_locked(
         self, splitmuxsink: Any

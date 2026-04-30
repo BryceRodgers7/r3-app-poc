@@ -37,14 +37,18 @@ def _build_pm_stub(
     *,
     recording_audio_enabled: bool = True,
     pipeline_started_ns: int | None = 0,
-    audio_first_buffer_at_ns: int | None = None,
+    audio_present_observed: bool = False,
     audio_missing_warned: bool = False,
 ) -> PipelineManager:
     """Build a PipelineManager with just the fields `_maybe_warn_audio_missing` reads."""
     pm = PipelineManager.__new__(PipelineManager)
     pm._recording_audio_enabled = recording_audio_enabled
     pm._pipeline_started_monotonic_ns = pipeline_started_ns
-    pm._audio_record_first_buffer_at_ns = audio_first_buffer_at_ns
+    pm._audio_present_observed = audio_present_observed
+    # Phase 7.E field still exists for the encoder probe but is no
+    # longer the gating signal — Phase 9.C moved presence detection
+    # to the audio tee's sink pad (`_audio_present_observed`).
+    pm._audio_record_first_buffer_at_ns = None
     pm._audio_missing_warned = audio_missing_warned
     pm._source = _FakeSource()
     return pm
@@ -88,10 +92,12 @@ class AudioMissingDetectionTests(unittest.TestCase):
         self.assertFalse(pm._audio_missing_warned)
 
     def test_does_not_fire_when_audio_buffer_received(self) -> None:
+        # Phase 9.C: presence is now signaled by `_audio_present_observed`
+        # (set by the audio-tee buffer probe).
         pipeline_started = time.monotonic_ns() - 6_000_000_000
         pm = _build_pm_stub(
             pipeline_started_ns=pipeline_started,
-            audio_first_buffer_at_ns=time.monotonic_ns() - 5_000_000_000,
+            audio_present_observed=True,
         )
         pm._maybe_warn_audio_missing()
         self.assertEqual(self._log.category_count("audio_missing"), 0)

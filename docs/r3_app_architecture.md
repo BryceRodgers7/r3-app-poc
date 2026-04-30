@@ -2172,7 +2172,7 @@ The coordinator's `initialize` gained a `resume_session_id` keyword. When set, i
 
 ### Out of scope for Phase 4 (deferred)
 
-- ~~**Audio in segments (slice 4.F).**~~ ✅ Committed. The audio tee feeds `queue → valve → audioconvert → audioresample → opusenc → splitmuxsink.audio_%u` when `[recording] audio_enabled = true` (default) and the source has audio capability. The previous 4.A.bis attempt was reverted because the test source (NDI Tools Screen Capture) had no audio — splitmuxsink stalled waiting for audio buffers. The new wiring requests the `audio_%u` request pad on splitmuxsink **before** linking the encoder so the matroskamux child sees audio during caps negotiation, and a try/except around the construction falls back to the video-only no-op appsink path with a clear warning if anything fails. The valve opens/closes in lockstep with the video valve via the existing `_set_branch_enabled("record", ...)` so segment boundaries stay aligned. Sources without audio (synthetic, Screen Capture) MUST set `[recording] audio_enabled = false` in `app_settings.toml` — otherwise the pipeline still stalls waiting for audio buffers that never arrive.
+- ~~**Audio in segments (slice 4.F).**~~ ✅ Committed. The audio tee feeds `queue → valve → audioconvert → audioresample → opusenc → splitmuxsink.audio_%u` when audio is observed on the source. Phase 9.C makes this wiring dynamic — the audio_record branch is built only after a buffer probe confirms audio buffers are flowing on the source's audio tee. Sources without audio produce video-only segments without operator intervention. The legacy `[recording] audio_enabled = false` config flag is preserved as a manual override for operators who want to force video-only regardless of source capability.
 - **ProRes / DNxHR codec selection.** §5.2's first-choice codecs require `gst-plugins-bad` elements that aren't always available on UCRT64. Add a config-driven codec selector once MJPEG path is solid; this becomes a small Phase-4-bis or a Phase 11 task (hardware acceleration ties into encoder choice).
 - ~~**§11.4 recovery-prompt Resume action.**~~ ✅ Committed. `SessionManager.adopt_session` adopts the existing session_id; `find_next_fragment_index` consults disk + DB to seed the next safe segment index; the bootstrap threads the chosen session_id into `coordinator.initialize(resume_session_id=...)`.
 - ~~**Phase 3.B and 3.C resumption.**~~ ✅ Committed after Phase 4 (queue policies, queue-depth metrics, saturation-driven health rules, transitional pipeline banner, `app_mode` setting).
@@ -2417,7 +2417,7 @@ Phase 8 lands in three slices.
 - For each `(game_subdir, feed_id)` in the 8.A plan:
   - Resolve the ordered list of `state="complete"` segments belonging to that game folder + feed.
   - Build a GStreamer pipeline: `concat → decodebin → x264enc → mp4mux → filesink` (or equivalent ffmpeg subprocess if `gst-plugins-bad` x264enc isn't available on the deployment). MJPEG decode → H.264 encode → MP4 mux. Output goes to `<session_path>/processed/<game_subdir>/<feed_id>.mp4`.
-  - Audio handling: when segments contain audio (post-Phase-9.B will be the common case), pass it through to MP4 via `aacenc` or `avenc_aac`. When audio is absent, mux video-only.
+  - Audio handling: when segments contain audio, pass it through to MP4 via `aacenc` or `avenc_aac`. When audio is absent (Phase 9.C video-only segments, or `audio_enabled = false`), mux video-only.
 - Source MKVs stay untouched on disk.
 - Per-artifact progress is logged so a long export shows incremental status.
 - Tests: synthesized MKV fixtures (single 1-frame segments) → verify MP4 output exists, has expected duration via `gst-discoverer-1.0` or ffprobe; verify source files are unmodified.
@@ -2488,38 +2488,49 @@ Phase 8 lands in three slices.
 
 Goal:
 
-- Add or harden audio according to the master-audio strategy.
+- Make audio recording self-healing — no operator config flag, no preview freeze when the NDI source has no audio stream.
+
+Phase 9 was originally framed around master-audio strategy (mixed-source, commentator overlay, replay audio). The actual deployment use case is simpler: each NDI feed has its own embedded audio, that audio is muxed into the feed's own segment MKV / long-form MP4, nobody listens during live operation, and there is no commentator. The per-feed model is already implemented (slice 4.F + Phase 7.G). What's missing is robustness when a source doesn't actually produce audio.
 
 Tasks:
 
-- Configure master audio source.
-- Map audio timestamps to session time.
-- Include audio in recording.
-- Include audio in replay if enabled.
-- Include audio in export.
-- Handle missing audio gracefully (replace the Phase 7.E config-flag workaround with dynamic adaptation).
+- Detect at runtime whether each feed's NDI source is producing an audio stream.
+- Wire the audio_record branch into `splitmuxsink` only when audio is observed.
+- When audio is absent, record video-only segments without operator intervention.
+- Surface the runtime decision so the operator can verify recording mode at a glance.
 
 Exit criteria:
 
-- Master audio records correctly.
-- Audio remains aligned during replay.
-- Missing audio does not break video replay.
 - Operator does not have to know whether the source produces audio in advance — pipeline adapts at runtime.
+- A no-audio NDI source produces video-only segments with no live-preview stall.
+- An audio-producing NDI source produces video+audio segments as today.
+- A source that gains audio mid-session picks it up on the next Stop/Start cycle (mid-game re-attach is out of scope — `splitmuxsink` can't add a sink pad mid-stream).
 
 ### Slices
 
-**9.A — Master audio source selection** (TBD when phase begins). Pick the canonical audio source (per-feed embedded audio vs. a separate dedicated capture device). Establish PTS-to-session-time mapping for it.
+**9.C — Dynamic no-audio handling** (replaces the Phase 7.E config-flag workaround). Phase 9 collapses to this single slice: the original 9.A "master audio source selection" is N/A (per-feed audio is the model and is already implemented), and 9.B "audio in replay + export" is N/A (the operator never plays back audio during operation, and `ffmpeg` already passes audio through to the long-form MP4 in Phase 8.B when segments contain it).
 
-**9.B — Audio in replay + export** (TBD). Currently `splitmuxsink` muxes audio into segment files via the `audio_%u` pad, so segments contain audio whenever the source produced it. 9.B wires that audio through the replay decode path and through Phase 8 export (long-form MP4 with audio).
+Today the audio chain is wired into `splitmuxsink` unconditionally based on `[recording] audio_enabled`. If the source has no audio, splitmuxsink waits indefinitely for audio buffers, the record queue back-pressures the tee, and the live preview freezes. Phase 7.E logs a `category=audio_missing` health event after a 5s grace period — the paper trail exists, but the workaround (`audio_enabled = false`) is operator-driven. Phase 9.C makes the pipeline self-healing:
 
-**9.C — Dynamic no-audio handling** (replaces the Phase 7.E workaround). Today, the audio chain is wired into `splitmuxsink` unconditionally based on `[recording] audio_enabled`. If the source has no audio, splitmuxsink waits indefinitely for audio buffers, the record queue back-pressures the tee, and the live preview freezes. Phase 7.E logs a `category=audio_missing` health event after a 5s grace period so operators get a paper trail in `health_events.jsonl` plus a counter in the diagnostics widget. Phase 9.C makes the pipeline self-healing instead of just warning:
+- At pipeline build time: build the audio infrastructure (tee, source, live audio branch, no-op record-side appsink to drain the tee). Do **not** wire the audio_record branch into `splitmuxsink` yet.
+- Install a buffer probe on the audio tee's input. On the first audio buffer ever observed, set a sticky `_audio_present_observed` flag.
+- On each "Start game recording" press (initial wiring) AND on each `_rebuild_splitmuxsink_locked` (Stop/Start cycle): check the flag.
+  - If True and the audio_record branch isn't already built: build it now (audioconvert → audioresample → opusenc), request `audio_%u` on splitmuxsink, link encoder.src → audio pad. Future segments are video+audio.
+  - If False: leave splitmuxsink without an `audio_%u` pad. Segments are video-only.
+- The `audio_missing` health event from Phase 7.E becomes redundant for the freeze-prevention purpose (since there's no longer a freeze) but stays as informational telemetry — the operator's diagnostics widget still shows the count of "audio expected but not produced" events.
 
-- Defer wiring the audio chain into splitmuxsink until the NDI receiver has emitted a `pad-added: pad='audio'` event (or until a configurable grace period expires).
-- If audio appears: wire the audio chain into splitmuxsink as today; segments are video+audio.
-- If the grace period expires with no audio pad: skip wiring; segments are video-only; emit `audio_missing` (existing 7.E health event) plus an `INFO`-level "recording in video-only mode" log so the operator sees the runtime decision.
-- Dynamic recovery: if audio appears later in the session, the next `_rebuild_splitmuxsink_locked` cycle (next Stop/Start) can pick it up without operator intervention. Mid-game audio re-attach is out of scope — splitmuxsink can't add a sink pad mid-stream.
+Edge cases:
 
-This eliminates the `audio_enabled = false` config-flag foot-gun: an operator deploying a no-audio NDI sender (Screen Capture, muted mic) doesn't have to know in advance — the pipeline adapts.
+- **Operator presses Start before audio's first buffer arrives.** Decision is made on whatever's been observed so far. Game 1 may be video-only even though audio would have come a second later. Game 2 (after Stop/Start) re-evaluates and picks audio up.
+- **Source produces audio mid-game.** Game 1 stays without audio (can't add a pad to splitmuxsink mid-stream); game 2 has it after the Stop/Start rebuild.
+- **Source loses audio mid-game.** Game 1 stays with audio. The audio chain is in place but no buffers flow — same behavior as the rest of the pipeline. Operator will see the audio_missing health event fire and can decide to Stop/Start to drop into video-only mode for game 2.
+
+Out of scope for 9.C:
+
+- Mid-stream audio attach/detach within a single game. Splitmuxsink doesn't support adding sink pads to a running mux, and the per-game-folder model means a Stop/Start is the natural seam.
+- Removing the `[recording] audio_enabled` config option. Keeping it as a manual override (e.g., for an operator who wants video-only by policy regardless of source capability) is harmless.
+
+This eliminates the `audio_enabled = false` config-flag foot-gun: an operator deploying a no-audio NDI sender (Screen Capture, muted mic, audio-disabled camera) doesn't have to know in advance — the pipeline adapts.
 
 ---
 
