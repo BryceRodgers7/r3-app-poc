@@ -77,7 +77,9 @@
       "Bash(python -m unittest discover -s tests -p test_playback_overlay_visibility.py -v)",
       "Bash(python -m unittest discover -s tests -p test_audio_missing_detection.py)",
       "Bash(python -m unittest discover -s tests -p test_recording_settings.py)",
-      "Bash(python -m unittest discover -s tests -p test_audio_dynamic_wiring.py -v)"
+      "Bash(python -m unittest discover -s tests -p test_audio_dynamic_wiring.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_resume_continuation.py)",
+      "Bash(python -m unittest discover -s tests -p test_play_manager.py)"
     ]
   }
 }

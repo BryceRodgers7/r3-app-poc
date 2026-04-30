@@ -36,6 +36,7 @@ from app.core.disk_budget import (
 from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
 from app.core.health_events import HealthSeverity, default_log as default_health_log
+from app.core.play_manager import PlayManager
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
 from app.core.session_state import SessionState
@@ -74,6 +75,7 @@ class ApplicationCoordinator:
         segment_index: SegmentIndex | None = None,
         session_clock: SessionClock | None = None,
         disk_budget: DiskBudgetAssessment | None = None,
+        play_manager: PlayManager | None = None,
     ) -> None:
         self._settings = settings
         self._session_manager = session_manager
@@ -132,6 +134,10 @@ class ApplicationCoordinator:
         # AND a viable crashed game exists; consumed by the first
         # toggle_long_session_recording start path.
         self._resume_continuation: _ResumeContinuation | None = None
+        # Phase 7.H.1: per-game play boundary tracker. None when the
+        # coordinator was constructed without one (older test paths
+        # that bypass `build_default_application_coordinator`).
+        self.play_manager = play_manager
 
     def get_feed_pipeline_mode(self, feed_id: str) -> PipelineMode:
         """Return the configured ingest pipeline mode for `feed_id`.
@@ -203,6 +209,13 @@ class ApplicationCoordinator:
                 runtime.pipeline_manager.disable_file_recording()
             recording_sm.transition_to(RecordingState.FINALIZING)
             recording_sm.transition_to(RecordingState.NOT_RECORDING)
+            # Phase 7.H.1: close the currently-open play. Captured
+            # AFTER recording stops so the play's end aligns with the
+            # last frame the operator saw recorded.
+            if self.play_manager is not None and self.session_clock is not None:
+                self.play_manager.stop_game(
+                    self.session_clock.now_session_time_ns()
+                )
             # Phase 7.B-ext: clear the per-game replay scope so a future
             # Start re-captures it. (The recording-state gate already
             # idles replay queries during the gap, but clearing avoids
@@ -272,6 +285,28 @@ class ApplicationCoordinator:
             self.replay_store.set_current_game_start_session_time(
                 game_start_session_time_ns
             )
+        # Phase 7.H.1: open the next play of this game. For a fresh
+        # game that's Play #1; for a Phase 7.D resume continuation
+        # (where the crashed game's pre-existing plays were
+        # auto-closed by `_setup_resume_continuation`) it's
+        # `max(existing) + 1`. The play's start session_time is the
+        # NOW reading (game_start_session_time_ns is the crashed
+        # game's earliest in resume; for a fresh game both align).
+        if (
+            self.play_manager is not None
+            and self.session_clock is not None
+        ):
+            play_start_ns = (
+                self.session_clock.now_session_time_ns()
+                if continuation is not None
+                else game_start_session_time_ns
+            )
+            if play_start_ns is not None:
+                self.play_manager.start_game(
+                    session_id=session_paths.session_id,
+                    game_subdir=game_subdir,
+                    start_session_time_ns=play_start_ns,
+                )
         recording_sm.transition_to(RecordingState.RECORDING)
         if session_sm is not None and session_sm.state == SessionState.CREATED:
             session_sm.transition_to(SessionState.RECORDING)
@@ -280,23 +315,47 @@ class ApplicationCoordinator:
         self.operator_controller.signals.status_message.emit("Game recording started.")
 
     def advance_short_segments(self) -> None:
-        """Close the current rally clip and start the next on every feed.
-
-        Slice 4.D: short-clip "advance segment" was driven by the legacy
-        `Recorder.advance_short_segment()` writer-rotation. Recording now
-        rotates segments inside `splitmuxsink` on a fixed cadence
-        (§6.5 — `recording_segment_duration_seconds`); manual advancement
-        will be re-introduced via splitmuxsink's `split-now` action signal
-        in a later slice. For now this method only emits status.
+        """Phase 7.H.2 will rebind the operator's "Next clip" button to
+        `mark_next_play` and rename to "Next Play". Until that slice
+        ships, this remains a no-op stub that emits a status hint.
         """
         if not self._recording_manager.is_any_recording():
-            self.operator_controller.signals.status_message.emit("Start game recording before starting a clip.")
+            self.operator_controller.signals.status_message.emit(
+                "Start game recording before marking a play boundary."
+            )
             return
-        # TODO(post-4.D): emit `splitmuxsink.split-now` per-feed when
-        # short-clip boundaries are reattached to the operator UI.
         self.operator_controller.signals.status_message.emit(
-            "Short-clip advance is paused while §6.5 segment cadence is splitmuxsink-driven."
+            "(stub — Phase 7.H.2 will wire this button to mark_next_play)"
         )
+
+    def mark_next_play(self) -> None:
+        """Close the currently-open play and open the next one (Phase 7.H.1).
+
+        The eventual "Next Play" operator button is wired to this in
+        Phase 7.H.2. Captures `session_clock.now_session_time_ns()` at
+        the press moment so the play boundary aligns with what the
+        operator just saw on screen.
+
+        No-op when:
+          - recording isn't active (no current play to advance)
+          - the coordinator was constructed without a `PlayManager`
+            (older test paths)
+          - `session_clock` isn't attached
+        """
+        if not self._recording_manager.is_any_recording():
+            self.operator_controller.signals.status_message.emit(
+                "Start game recording before marking a play boundary."
+            )
+            return
+        if self.play_manager is None or self.session_clock is None:
+            return
+        next_play = self.play_manager.mark_next_play(
+            self.session_clock.now_session_time_ns()
+        )
+        if next_play is not None:
+            self.operator_controller.signals.status_message.emit(
+                f"Play #{next_play.play_number} started."
+            )
 
     def initialize(self, *, resume_session_id: str | None = None) -> None:
         """Start storage, ingest, and playback sessions.
@@ -442,6 +501,17 @@ class ApplicationCoordinator:
             game_subdir=crashed_game_subdir,
             game_start_session_time_ns=game_start_ns,
         )
+        # Phase 7.H.1: auto-close any play whose end_session_time_ns
+        # is NULL (the operator never marked the close because the
+        # app crashed). Use the latest finalized segment's end as
+        # the fallback. This must run BEFORE the next `start_game`
+        # so the UNIQUE(session_id, game_subdir, play_number) check
+        # has a clean view.
+        if self.play_manager is not None:
+            self.play_manager.auto_close_open_plays_for_session(
+                session_id=session_paths.session_id,
+                fallback_end_session_time_ns=game_end_ns,
+            )
         LOGGER.info(
             "resume continuation: game=%s pre_crash_segments=%d game_start_ns=%d "
             "rebased_clock_to_ns=%d",
@@ -517,6 +587,10 @@ def build_default_application_coordinator(
     # finalized segments so the replay layer can resolve session-time
     # to a per-feed `(segment, offset)` pair.
     session_clock = SessionClock()
+    # Phase 7.H.1: per-game play boundary tracker. Owns the
+    # currently-open play and persists boundary transitions to the
+    # `plays` table.
+    play_manager = PlayManager(session_manager.get_metadata_db())
     feed_runtimes: dict[str, FeedRuntime] = {}
 
     # Slice 3.B: tell the telemetry hub how to drive saturation-based
@@ -596,6 +670,7 @@ def build_default_application_coordinator(
         segment_index=segment_index,
         session_clock=session_clock,
         disk_budget=disk_budget,
+        play_manager=play_manager,
     )
 
 

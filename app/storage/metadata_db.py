@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
-from app.core.models import EXPORT_STATUS_SUCCESS, ExportArtifact, Segment
+from app.core.models import EXPORT_STATUS_SUCCESS, ExportArtifact, Play, Segment
 
 LOGGER = logging.getLogger(__name__)
 
@@ -145,6 +145,33 @@ class MetadataDb:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS export_artifacts_by_session "
             "ON export_artifacts(session_id, status)"
+        )
+        # Phase 7.H: per-game play markers. Every moment of a
+        # recording belongs to a play; the operator marks boundaries
+        # via the "Next Play" button. `end_session_time_ns` is NULL
+        # while a play is currently open. `auto_closed_on_crash` is
+        # True only when the §11.4 recovery scan closed the play at
+        # the latest finalized segment's end (because the app
+        # crashed before the operator marked the boundary).
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plays (
+                play_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                game_subdir TEXT NOT NULL,
+                play_number INTEGER NOT NULL,
+                start_session_time_ns INTEGER NOT NULL,
+                end_session_time_ns INTEGER,
+                created_at TEXT NOT NULL,
+                auto_closed_on_crash INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id),
+                UNIQUE(session_id, game_subdir, play_number)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS plays_by_game "
+            "ON plays(session_id, game_subdir, play_number)"
         )
         connection.commit()
 
@@ -403,6 +430,102 @@ class MetadataDb:
             for row in rows
         }
 
+    # ----------------------------------------------------------------
+    # Phase 7.H: plays table CRUD
+    # ----------------------------------------------------------------
+
+    def insert_play(self, play: Play) -> int:
+        """Insert a `Play` row and return its `play_id`."""
+        connection = self.connect()
+        with self._write_lock:
+            cursor = connection.execute(
+                """
+                INSERT INTO plays (
+                    session_id, game_subdir, play_number,
+                    start_session_time_ns, end_session_time_ns,
+                    created_at, auto_closed_on_crash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    play.session_id,
+                    play.game_subdir,
+                    play.play_number,
+                    play.start_session_time_ns,
+                    play.end_session_time_ns,
+                    play.created_at,
+                    1 if play.auto_closed_on_crash else 0,
+                ),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def close_play(
+        self,
+        play_id: int,
+        end_session_time_ns: int,
+        *,
+        auto_closed_on_crash: bool = False,
+    ) -> None:
+        """Set `end_session_time_ns` (and optionally the
+        `auto_closed_on_crash` flag) on an existing play row.
+
+        Used by both the operator path (Next Play, Stop game recording)
+        and the §11.4 recovery scan path.
+        """
+        connection = self.connect()
+        with self._write_lock:
+            connection.execute(
+                """
+                UPDATE plays
+                SET end_session_time_ns = ?,
+                    auto_closed_on_crash = ?
+                WHERE play_id = ?
+                """,
+                (
+                    end_session_time_ns,
+                    1 if auto_closed_on_crash else 0,
+                    play_id,
+                ),
+            )
+            connection.commit()
+
+    def plays_for_game(
+        self, session_id: str, game_subdir: str
+    ) -> list[Play]:
+        """Return every play for `(session_id, game_subdir)`,
+        ordered by `play_number`."""
+        connection = self.connect()
+        with self._write_lock:
+            rows = connection.execute(
+                """
+                SELECT * FROM plays
+                WHERE session_id = ? AND game_subdir = ?
+                ORDER BY play_number
+                """,
+                (session_id, game_subdir),
+            ).fetchall()
+        return [_row_to_play(row) for row in rows]
+
+    def open_plays_for_session(self, session_id: str) -> list[Play]:
+        """Return every play in `session_id` whose `end_session_time_ns`
+        is NULL (still open).
+
+        Used by the §11.4 recovery scan to identify plays that need
+        to be auto-closed because the app crashed before the operator
+        marked their end.
+        """
+        connection = self.connect()
+        with self._write_lock:
+            rows = connection.execute(
+                """
+                SELECT * FROM plays
+                WHERE session_id = ? AND end_session_time_ns IS NULL
+                ORDER BY game_subdir, play_number
+                """,
+                (session_id,),
+            ).fetchall()
+        return [_row_to_play(row) for row in rows]
+
     def close(self) -> None:
         """Close the active database connection."""
         if self._connection is not None:
@@ -449,4 +572,17 @@ def _row_to_export_artifact(row: sqlite3.Row) -> ExportArtifact:
         duration_ns=row["duration_ns"],
         started_at=str(row["started_at"]),
         finalized_at=row["finalized_at"],
+    )
+
+
+def _row_to_play(row: sqlite3.Row) -> Play:
+    return Play(
+        play_id=int(row["play_id"]),
+        session_id=str(row["session_id"]),
+        game_subdir=str(row["game_subdir"]),
+        play_number=int(row["play_number"]),
+        start_session_time_ns=int(row["start_session_time_ns"]),
+        end_session_time_ns=row["end_session_time_ns"],
+        created_at=str(row["created_at"]),
+        auto_closed_on_crash=bool(row["auto_closed_on_crash"]),
     )

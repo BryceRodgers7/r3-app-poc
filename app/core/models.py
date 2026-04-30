@@ -238,6 +238,32 @@ EXPORT_STATUS_FAILED = "failed"
 
 
 @dataclass(slots=True, frozen=True)
+class Play:
+    """One operator-marked play within a game (Phase 7.H, §6.7).
+
+    Every moment of a recording belongs to a play — there is no
+    "between plays" state. Play #1 opens implicitly when "Start game
+    recording" fires; "Next Play" closes the currently-open play and
+    immediately opens the next one. Plays are operator-scoped (one
+    sequence per game across all feeds), not feed-scoped.
+
+    `end_session_time_ns` is NULL while a play is currently open.
+    `auto_closed_on_crash` is True only for plays the §11.4 recovery
+    scan auto-closed at the latest finalized segment's end (the
+    operator never marked the close because the app crashed).
+    """
+
+    session_id: str
+    game_subdir: str
+    play_number: int  # 1-based, unique within (session_id, game_subdir)
+    start_session_time_ns: int
+    created_at: str
+    play_id: int | None = None  # set on insert by SQLite
+    end_session_time_ns: int | None = None
+    auto_closed_on_crash: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class ExportArtifact:
     """One persisted export attempt.
 
