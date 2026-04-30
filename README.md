@@ -61,16 +61,18 @@ Behavior:
 - **File-locks** the session directory via `<session>/.processing.lock` so concurrent processors fail-fast. If the previous run crashed, delete the lock file manually and retry.
 - **Encodes** to H.264 (libx264, `-preset medium -crf 23`) + AAC (128 kbps), MP4 container.
 - **Output**: `<session_path>/processed/<game_NNN>/<feed_id>.mp4` per (game, feed). Existing outputs are overwritten (`-y`).
-- **Exit codes:** `0` — all artifacts encoded (or `--dry-run`); `1` — partial failure (one or more artifacts failed); `2` — pre-flight failure (validation, missing DB, missing ffmpeg, lock held).
+- **Idempotent re-runs (Phase 8.C)**: every export attempt persists a row into the `export_artifacts` SQLite table. A subsequent run skips any `(kind, game, feed)` triple that already has a `success` row — no wasted encode time. Failed attempts are retried automatically on re-run; pass `--force` to ignore prior successes too.
+- **Exit codes:** `0` — all artifacts encoded (or all skipped, or `--dry-run`); `1` — one or more artifacts failed; `2` — pre-flight failure (validation, missing DB, missing ffmpeg, lock held).
 
 Options:
 
 - `--dry-run` — print the export plan and exit without encoding.
+- `--force` — re-encode every artifact even when a prior `success` row exists.
 - `--ffmpeg-path PATH` — override ffmpeg binary location (otherwise `shutil.which("ffmpeg")`).
 - `--metadata-db PATH` — override DB location (default `<session_path>/../../metadata.db`, i.e. `<base_data_dir>/metadata.db`).
 - `-v` / `--verbose` — DEBUG-level logging.
 
-`8.B` ships long-form export only. Short-play MP4s (per-clip extracts using operator clip markers) are deferred until the §6.7 clip-marker system lands. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 8 sequencing notes for details.
+Phase 8 ships long-form export today. Short-play MP4s (per-clip extracts using operator clip markers) are deferred until the §6.7 clip-marker system lands. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 8 sequencing notes for details.
 
 - **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed. Production deployments use this exclusively.
 - **`kind = "synthetic"`**: deterministic synthetic test pattern from [app/media/test_source.py](app/media/test_source.py). Dev-only fallback for machines without NDI hardware.

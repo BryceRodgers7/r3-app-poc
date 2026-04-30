@@ -124,30 +124,44 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with acquire_lock(session_path):
+            # Phase 8.C: keep the DB open through encoding so the
+            # exporter can read the `successful_artifact_keys` set and
+            # write `export_artifacts` rows. The plan-building scope
+            # is unchanged — `build_plan` reads segments and is done.
             db = MetadataDb(db_path)
             try:
                 plan = build_plan(db, session_path)
+                print_plan(plan)
+                if args.dry_run or not plan.long_form:
+                    return 0
+                assert exporter is not None
+                from app.tools.long_form_export import export_all
+                results = export_all(
+                    exporter,
+                    plan.long_form,
+                    segment_paths_for=lambda item: list(item.segment_paths),
+                    db=db,
+                    session_id=plan.session_id,
+                    force=args.force,
+                )
             finally:
                 db.close()
-            print_plan(plan)
-            if args.dry_run or not plan.long_form:
-                return 0
-            assert exporter is not None
-            from app.tools.long_form_export import export_all
-            results = export_all(
-                exporter,
-                plan.long_form,
-                segment_paths_for=lambda item: list(item.segment_paths),
-            )
     except ValidationError as exc:
         LOGGER.error("%s", exc)
         return 2
 
-    failed = [r for r in results if r.status != "success"]
     succeeded = [r for r in results if r.status == "success"]
+    failed = [r for r in results if r.status == "failed"]
+    skipped = [r for r in results if r.status == "skipped"]
     print(
-        f"\nExport complete: {len(succeeded)} succeeded, {len(failed)} failed."
+        f"\nExport complete: {len(succeeded)} succeeded, "
+        f"{len(failed)} failed, {len(skipped)} skipped."
     )
+    for r in skipped:
+        print(
+            f"  SKIPPED {r.plan_item.game_subdir}/{r.plan_item.feed_id}: "
+            f"prior success row exists (use --force to re-encode)"
+        )
     for r in failed:
         print(
             f"  FAILED  {r.plan_item.game_subdir}/{r.plan_item.feed_id}: "
@@ -343,6 +357,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print the export plan and exit without encoding.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-encode artifacts even if a previous run already produced a "
+            "successful export. Default behavior is idempotent — artifacts "
+            "with a success row in `export_artifacts` are skipped."
+        ),
     )
     parser.add_argument(
         "--ffmpeg-path",

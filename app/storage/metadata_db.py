@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
-from app.core.models import Segment
+from app.core.models import EXPORT_STATUS_SUCCESS, ExportArtifact, Segment
 
 LOGGER = logging.getLogger(__name__)
 
@@ -119,6 +119,32 @@ class MetadataDb:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS segments_by_feed_pts "
             "ON segments(session_id, feed_id, start_pts_ns)"
+        )
+        # Phase 8.C: per-export bookkeeping. Existing DBs gain the
+        # table on next connect (CREATE IF NOT EXISTS — no migration
+        # of data needed since failure means no rows exist yet).
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS export_artifacts (
+                artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                game_subdir TEXT,
+                feed_id TEXT,
+                output_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                size_bytes INTEGER,
+                duration_ns INTEGER,
+                started_at TEXT NOT NULL,
+                finalized_at TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS export_artifacts_by_session "
+            "ON export_artifacts(session_id, status)"
         )
         connection.commit()
 
@@ -302,6 +328,81 @@ class MetadataDb:
             ).fetchall()
         return [str(row["session_id"]) for row in rows]
 
+    # ----------------------------------------------------------------
+    # Phase 8.C: export_artifacts table CRUD
+    # ----------------------------------------------------------------
+
+    def insert_export_artifact(self, artifact: ExportArtifact) -> int:
+        """Insert an `ExportArtifact` row and return its `artifact_id`."""
+        connection = self.connect()
+        with self._write_lock:
+            cursor = connection.execute(
+                """
+                INSERT INTO export_artifacts (
+                    session_id, kind, game_subdir, feed_id, output_path,
+                    status, error_message, size_bytes, duration_ns,
+                    started_at, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact.session_id,
+                    artifact.kind,
+                    artifact.game_subdir,
+                    artifact.feed_id,
+                    artifact.output_path,
+                    artifact.status,
+                    artifact.error_message,
+                    artifact.size_bytes,
+                    artifact.duration_ns,
+                    artifact.started_at,
+                    artifact.finalized_at,
+                ),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def export_artifacts_for_session(
+        self, session_id: str
+    ) -> list[ExportArtifact]:
+        """Return every export-artifact row for `session_id`, oldest first."""
+        connection = self.connect()
+        with self._write_lock:
+            rows = connection.execute(
+                "SELECT * FROM export_artifacts WHERE session_id = ? "
+                "ORDER BY artifact_id",
+                (session_id,),
+            ).fetchall()
+        return [_row_to_export_artifact(row) for row in rows]
+
+    def successful_artifact_keys(
+        self, session_id: str
+    ) -> set[tuple[str, str | None, str | None]]:
+        """Return `(kind, game_subdir, feed_id)` triples that already have
+        at least one successful export row for `session_id`.
+
+        Phase 8.C idempotency: the post-session processor uses this to
+        skip re-encoding artifacts that already succeeded on a prior
+        run. `--force` overrides by ignoring this set.
+        """
+        connection = self.connect()
+        with self._write_lock:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT kind, game_subdir, feed_id
+                FROM export_artifacts
+                WHERE session_id = ? AND status = ?
+                """,
+                (session_id, EXPORT_STATUS_SUCCESS),
+            ).fetchall()
+        return {
+            (
+                str(row["kind"]),
+                row["game_subdir"],
+                row["feed_id"],
+            )
+            for row in rows
+        }
+
     def close(self) -> None:
         """Close the active database connection."""
         if self._connection is not None:
@@ -331,4 +432,21 @@ def _row_to_segment(row: sqlite3.Row) -> Segment:
         pts_to_session_offset_ns=row["pts_to_session_offset_ns"],
         start_wall_clock_utc=row["start_wall_clock_utc"],
         end_wall_clock_utc=row["end_wall_clock_utc"],
+    )
+
+
+def _row_to_export_artifact(row: sqlite3.Row) -> ExportArtifact:
+    return ExportArtifact(
+        artifact_id=int(row["artifact_id"]),
+        session_id=str(row["session_id"]),
+        kind=str(row["kind"]),
+        game_subdir=row["game_subdir"],
+        feed_id=row["feed_id"],
+        output_path=str(row["output_path"]),
+        status=str(row["status"]),
+        error_message=row["error_message"],
+        size_bytes=row["size_bytes"],
+        duration_ns=row["duration_ns"],
+        started_at=str(row["started_at"]),
+        finalized_at=row["finalized_at"],
     )

@@ -71,7 +71,9 @@
       "Bash(python -m unittest discover -s tests -p test_long_form_export.py -v)",
       "Bash(python -m unittest discover -s tests -p test_long_form_export.py)",
       "Bash(python -m app.tools.post_session_processor c:/SportsReplay/sessions/session_118 --ffmpeg-path C:/msys64/ucrt64/bin/ffmpeg.exe)",
-      "Bash(python -m unittest discover -s tests -p test_audio_relink_on_rebuild.py -v)"
+      "Bash(python -m unittest discover -s tests -p test_audio_relink_on_rebuild.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_export_artifacts.py -v)",
+      "Bash(python -m app.tools.post_session_processor c:/SportsReplay/sessions/session_118 --ffmpeg-path C:/msys64/ucrt64/bin/ffmpeg.exe --force)"
     ]
   }
 }

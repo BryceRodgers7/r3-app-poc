@@ -216,6 +216,40 @@ SEGMENT_STATE_CORRUPT = "corrupt"
 SEGMENT_STATE_QUARANTINED = "quarantined"
 
 
+# Phase 8.C: post-session export artifact bookkeeping. Rows in the
+# `export_artifacts` SQLite table track every long-form / short-play
+# encoding attempt so re-runs are idempotent (a `success` row for a
+# given `(session_id, kind, game_subdir, feed_id)` makes the
+# processor skip that artifact unless `--force` is passed).
+EXPORT_KIND_LONG_FORM = "long_form"
+EXPORT_KIND_SHORT_PLAY = "short_play"  # 8.D — depends on §6.7 clip markers
+EXPORT_STATUS_SUCCESS = "success"
+EXPORT_STATUS_FAILED = "failed"
+
+
+@dataclass(slots=True, frozen=True)
+class ExportArtifact:
+    """One persisted export attempt.
+
+    `game_subdir` and `feed_id` are nullable for future short-play
+    artifacts that span multiple feeds (8.D). Long-form artifacts
+    always populate both.
+    """
+
+    session_id: str
+    kind: str  # EXPORT_KIND_*
+    output_path: str
+    status: str  # EXPORT_STATUS_*
+    started_at: str
+    artifact_id: int | None = None  # set on insert by SQLite
+    game_subdir: str | None = None
+    feed_id: str | None = None
+    error_message: str | None = None
+    size_bytes: int | None = None
+    duration_ns: int | None = None
+    finalized_at: str | None = None
+
+
 @dataclass(slots=True, frozen=True)
 class Segment:
     """One closed recording segment, matching the §6.3 schema.

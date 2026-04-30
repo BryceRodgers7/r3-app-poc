@@ -30,9 +30,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from app.core.models import (
+    EXPORT_KIND_LONG_FORM,
+    EXPORT_STATUS_FAILED,
+    EXPORT_STATUS_SUCCESS,
+    ExportArtifact,
+)
+from app.storage.metadata_db import MetadataDb
 from app.tools.post_session_processor import LongFormPlanItem
 
 LOGGER = logging.getLogger(__name__)
+
+# Phase 8.C: per-run "skipped" status that's tracked in the result
+# stream but NOT persisted to the export_artifacts table — skipping
+# means an earlier successful row already covers this artifact, so
+# inserting another would just be noise.
+_RESULT_STATUS_SKIPPED = "skipped"
 
 
 class FfmpegNotFoundError(RuntimeError):
@@ -43,12 +56,13 @@ class FfmpegNotFoundError(RuntimeError):
 class ExportResult:
     """Outcome of a single long-form export attempt.
 
-    Phase 8.C will persist these into the `export_artifacts` table.
-    For 8.B the results are just returned to the caller for logging.
+    Phase 8.C: success / failed results are persisted into the
+    `export_artifacts` table; `skipped` results indicate a prior
+    successful artifact exists and the operator did not pass `--force`.
     """
 
     plan_item: LongFormPlanItem
-    status: str  # 'success' | 'failed'
+    status: str  # 'success' | 'failed' | 'skipped'
     output_path: Path
     error_message: str | None = None
     size_bytes: int | None = None
@@ -232,20 +246,113 @@ def export_all(
     exporter: LongFormExporter,
     plan_items: Iterable[LongFormPlanItem],
     segment_paths_for: "callable",
+    *,
+    db: MetadataDb | None = None,
+    session_id: str | None = None,
+    force: bool = False,
 ) -> list[ExportResult]:
     """Run `exporter.export` for every plan item, collecting results.
 
     `segment_paths_for(plan_item)` is supplied by the caller (the CLI
-    main) so this function stays decoupled from the SegmentIndex /
-    MetadataDb. Returns one result per plan item, including failures
-    — caller decides how to surface them.
+    main) so this function stays decoupled from the SegmentIndex.
+
+    Phase 8.C: when `db` and `session_id` are provided, this function
+    becomes the persistence + idempotency point:
+
+      - Before encoding, look up the set of `(kind, game_subdir, feed_id)`
+        triples that already have a successful export row. Items in
+        that set are returned as `status='skipped'` without invoking
+        ffmpeg.
+      - After each encode attempt (success or failure), insert an
+        `ExportArtifact` row. Failed attempts are NOT replaced or
+        deleted on retry — every attempt persists, providing forensic
+        history.
+      - `force=True` ignores the success set and re-encodes everything.
+
+    `db` and `session_id` are optional so existing callers / tests
+    that only need the encode-and-collect-results flow keep working
+    without DB plumbing.
     """
+    plan_items_list = list(plan_items)
+    persist = db is not None and session_id is not None
+    if persist and not force:
+        already_done = db.successful_artifact_keys(session_id)
+    else:
+        already_done = set()
+
     results: list[ExportResult] = []
-    for plan_item in plan_items:
+    for plan_item in plan_items_list:
+        artifact_key = (
+            EXPORT_KIND_LONG_FORM,
+            plan_item.game_subdir,
+            plan_item.feed_id,
+        )
+        if artifact_key in already_done:
+            LOGGER.info(
+                "skipping %s/%s — prior success row exists "
+                "(pass --force to re-encode)",
+                plan_item.game_subdir,
+                plan_item.feed_id,
+            )
+            results.append(
+                ExportResult(
+                    plan_item=plan_item,
+                    status=_RESULT_STATUS_SKIPPED,
+                    output_path=plan_item.output_path,
+                )
+            )
+            continue
         segment_paths = segment_paths_for(plan_item)
         result = exporter.export(plan_item, segment_paths)
         results.append(result)
+        if persist:
+            _persist_result_locked(
+                db, session_id, plan_item, result
+            )
     return results
+
+
+def _persist_result_locked(
+    db: MetadataDb,
+    session_id: str,
+    plan_item: LongFormPlanItem,
+    result: ExportResult,
+) -> None:
+    """Insert an `ExportArtifact` row mirroring `result`.
+
+    'skipped' results never reach this function; only success/failure
+    attempts are persisted. The artifact's `duration_ns` comes from
+    the plan (sum of segment durations) — the actual MP4 duration may
+    differ slightly due to encoder timing, but the plan value is the
+    authoritative "intended" duration and is what the operator sees
+    in the readout.
+    """
+    status = (
+        EXPORT_STATUS_SUCCESS
+        if result.status == "success"
+        else EXPORT_STATUS_FAILED
+    )
+    artifact = ExportArtifact(
+        session_id=session_id,
+        kind=EXPORT_KIND_LONG_FORM,
+        game_subdir=plan_item.game_subdir,
+        feed_id=plan_item.feed_id,
+        output_path=str(result.output_path),
+        status=status,
+        error_message=result.error_message,
+        size_bytes=result.size_bytes,
+        duration_ns=plan_item.total_duration_ns,
+        started_at=result.started_at or "",
+        finalized_at=result.finalized_at,
+    )
+    try:
+        db.insert_export_artifact(artifact)
+    except Exception:
+        LOGGER.exception(
+            "failed to persist export_artifact row for %s/%s",
+            plan_item.game_subdir,
+            plan_item.feed_id,
+        )
 
 
 def _format_concat_line(path: Path) -> str:
