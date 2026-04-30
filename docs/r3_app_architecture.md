@@ -1515,6 +1515,8 @@ For program:
 
 A replay request is valid only when `recording_state == RECORDING`. Replay may target any completed recording segment range in the current active recording, from recording start through the latest replayable finalized segment. The configured instant-replay shortcuts are UI conveniences, not a storage or architecture limit.
 
+> Phase 7.C lock-in: `tests/test_replay_safety_invariants.py` asserts both halves of this rule — `state="writing"` segments are excluded from every replay query (`resolve`, `resolve_session_time`, `nearest_frame_location`, `latest_replayable_pts`, `latest_replayable_session_time`), and the operator transport methods (`rewind_10_seconds`, `pause_playback`, `set_playback_rate`, `jump_to_live`, `_on_replay_timer_tick`, `_render_at_session_time_ns`) take no filesystem-mutation or DB-write actions. A regression that touched `Path.unlink` / `os.remove` / `MetadataDb.update_segment_state` from a transport path would fail those tests loudly.
+
 A replay request is:
 
 ```text
@@ -1581,7 +1583,7 @@ Replay start and end points are **frame-accurate inside any completed segment**,
 Reason:
 
 - The active recording codecs mandated in §5.2 (ProRes, DNxHR, MJPEG) are intra-frame. Every frame is effectively a keyframe, so the decoder can begin output at any frame inside a completed segment.
-- The only segment-boundary constraint is **finalization**: the currently-writing segment is not safely readable until it is closed. Replay coverage is therefore `[recording_start, end_of_latest_finalized_segment]`, not `[recording_start, now]`.
+- The only segment-boundary constraint is **finalization**: the currently-writing segment is not safely readable until it is closed. Replay coverage is therefore `[recording_start, end_of_latest_finalized_segment]`, not `[recording_start, now]`. The "writing tail is excluded" half of this is locked in by `tests/test_replay_safety_invariants.py::WritingTailExclusionTests`.
 - With the default `segment_duration_seconds = 4`, the operator view "live edge" of replay lags wall-clock live by 0–4 seconds. The UI must surface this as `latest_replayable_session_time_ns` (§12.1) and not pretend replay extends to the present moment.
 
 Implications:
@@ -2300,11 +2302,35 @@ Phase 7 lands in three slices. 7.A and 7.B are independent (different surfaces) 
 
 **Out of scope for 7.C:** retention / cleanup policy enforcement (§6.8 — separate phase). 7.C only confirms the read path is harmless; cleanup happens elsewhere via the recovery scan + future retention sweeper.
 
+**7.D — Resume continues the crashed game**
+
+Without 7.D, "Resume" in the §11.4 recovery dialog only adopts the session and rebuilds the in-memory `SegmentIndex`. The first Start press after Resume allocates a fresh `game_NNN/` folder, so pre-crash content lives in a different game folder and is excluded from replay by the per-game filter (Phase 7.B-ext). Operators who want to replay highlights from the crashed game cannot.
+
+Worse, even if the per-game filter were relaxed to include pre-crash segments, the new `SessionClock` starts at `session_time = 0` for the resumed run, so post-resume `start_session_time_ns` values overlap pre-crash ones in raw integer terms. Comparison-based queries (`available_session_time_range`, `nearest_frame_location` clamping, the per-game filter) silently misbehave across the clock-domain seam.
+
+7.D fixes both halves:
+
+- **`SessionClock.rebase(anchor_session_time_ns)`** — sets `_start_monotonic_ns` so `now_session_time_ns()` returns the anchor at the moment of the call. Safe only before any buffer has been processed by the new clock (rebasing after the first segment's first-buffer probe would corrupt the writing segment's `start_session_time_ns`).
+- **`ApplicationCoordinator._setup_resume_continuation(session_paths)`** — runs immediately after `_populate_segment_index_from_resume`. Walks `<recording>/` for the highest `game_NNN/` folder, filters loaded segments to that folder via path-component match (avoids the `game_001` ⊂ `game_0011` substring trap), computes `min(start_session_time_ns)` and `max(end_session_time_ns)` across them, calls `session_clock.rebase(latest_end + 1ms)`, and stashes a `_ResumeContinuation(game_subdir, game_start_session_time_ns)` on the coordinator.
+- **`toggle_long_session_recording` Start path** — if `_resume_continuation` is set, reuse `continuation.game_subdir` (no new game folder is allocated), set the per-game filter to `continuation.game_start_session_time_ns` (so pre-crash segments stay visible to replay), then clear `_resume_continuation`. `find_next_fragment_index` against the existing `<game_NNN>/<feed_id>/` folder picks the next index past the pre-crash files, so segment filenames continue monotonically within the game.
+
+Bail-out branches (continuation stays None, fall through to the normal new-game path):
+
+- recording dir doesn't exist or has no `game_NNN/` folder
+- no segment in the index lives under the crashed game's folder
+- none of those segments has populated session-time fields (pre-5.A legacy rows can't anchor the rebase)
+- the coordinator has no `SessionClock` attached (test fixtures only)
+
+After 7.D the operator workflow for a crash mid-game becomes: app crashes → restart → recovery dialog → Resume → press Start → recording continues in the same game folder, fragment_index past the pre-crash tail, replay can scrub back into pre-crash highlights with no clock-domain confusion. Stop on the resumed game, then a subsequent Start, behaves normally — fresh `game_(N+1)/` folder, per-game filter resets to "now". Locked in by `tests/test_resume_continuation.py` and `tests/test_session_clock.py::SessionClockRebaseTests`.
+
+**Out of scope for 7.D:** post-session UI affordance to replay across all games in a finalized session (that's a separate read-only viewer concern); recovery for sessions that crashed before any segment finalized in the crashed game (continuation falls back to fresh-game allocation).
+
 ### Phase 7 sequencing notes
 
 - **7.A and 7.B are independent.** Either can land first; both are needed before Phase 7 is ✅. Recommend 7.A first because the disk-budget signal is what catches a misconfigured production deployment before the operator hits a wedged-recording bug — higher operational value than the latest-replayable surface, which is mostly diagnostic.
-- **7.C should land last.** It's a confirming/locking-in pass; the tests it adds are most valuable after the surfaces it covers exist.
-- **No hardware-specific risk** in any of the three slices. All testable against synthesized fixtures.
+- **7.C should land last among the original three.** It's a confirming/locking-in pass; the tests it adds are most valuable after the surfaces it covers exist.
+- **7.D depends on 7.B** because it reuses the per-game filter from 7.B-ext. Without that filter, the continuation has nothing to scope against.
+- **No hardware-specific risk** in any of the four slices. All testable against synthesized fixtures.
 
 ---
 

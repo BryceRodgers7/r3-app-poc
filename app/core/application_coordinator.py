@@ -4,10 +4,29 @@ from __future__ import annotations
 
 import logging
 
+from dataclasses import dataclass
+from pathlib import Path
+
 from app.config.settings import AppSettings
 from app.core.session_clock import SessionClock
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class _ResumeContinuation:
+    """Phase 7.D: state captured on resume so the first Start press
+    after resume continues the crashed game in the same folder.
+
+    Set by `_setup_resume_continuation` when the operator picks
+    Resume in the recovery dialog AND there is a viable crashed game
+    to continue (most-recent `game_NNN/` with at least one segment
+    carrying populated session-time fields). Consumed and cleared by
+    the first Start path of `toggle_long_session_recording`.
+    """
+
+    game_subdir: str
+    game_start_session_time_ns: int
 from app.core.application_state import AppState, compute_app_state
 from app.core.disk_budget import (
     BudgetVerdict,
@@ -109,6 +128,10 @@ class ApplicationCoordinator:
         )
         self._session_started = False
         self._shutting_down = False
+        # Phase 7.D: set on initialize() if the operator chose Resume
+        # AND a viable crashed game exists; consumed by the first
+        # toggle_long_session_recording start path.
+        self._resume_continuation: _ResumeContinuation | None = None
 
     def get_feed_pipeline_mode(self, feed_id: str) -> PipelineMode:
         """Return the configured ingest pipeline mode for `feed_id`.
@@ -192,14 +215,39 @@ class ApplicationCoordinator:
             self.operator_controller.signals.status_message.emit("Game recording stopped.")
             return
         recording_sm.transition_to(RecordingState.STARTING_RECORDING)
-        # Allocate a fresh `game_NNN` subdir under <session>/recording/ so
-        # each press of "Start game recording" gets its own folder. The
-        # index is one past the highest existing `game_NNN` on disk —
-        # see `find_next_game_index`. All feeds share the same subdir so
-        # a game's segments stay grouped across the camera fan-out.
-        game_subdir = GAME_DIR_FORMAT.format(
-            find_next_game_index(session_paths.recording_dir)
-        )
+        # Phase 7.D: if the operator picked Resume on launch and this
+        # is the first Start press of the run, continue the crashed
+        # game in its existing folder rather than allocating a fresh
+        # `game_NNN/`. The continuation also carries the per-game
+        # filter value (the crashed game's earliest start_session_time)
+        # so pre-crash segments stay visible for replay.
+        continuation = self._resume_continuation
+        if continuation is not None:
+            game_subdir = continuation.game_subdir
+            game_start_session_time_ns: int | None = (
+                continuation.game_start_session_time_ns
+            )
+            self._resume_continuation = None
+            LOGGER.info(
+                "continuing crashed game %s (game_start_ns=%d)",
+                game_subdir,
+                game_start_session_time_ns,
+            )
+        else:
+            # Allocate a fresh `game_NNN` subdir under <session>/recording/
+            # so each press of "Start game recording" gets its own folder.
+            # The index is one past the highest existing `game_NNN` on
+            # disk — see `find_next_game_index`. All feeds share the
+            # same subdir so a game's segments stay grouped across the
+            # camera fan-out.
+            game_subdir = GAME_DIR_FORMAT.format(
+                find_next_game_index(session_paths.recording_dir)
+            )
+            game_start_session_time_ns = (
+                self.session_clock.now_session_time_ns()
+                if self.session_clock is not None
+                else None
+            )
         game_dir = session_paths.recording_dir / game_subdir
         for runtime in self._feed_runtimes.values():
             # Per-game folder layout means segment names can safely
@@ -217,13 +265,12 @@ class ApplicationCoordinator:
                 start_fragment_index=start_index,
                 game_subdir=game_subdir,
             )
-        # Phase 7.B-ext: scope replay queries to this game. Captured
-        # AFTER the splitmuxsink valves open so the timestamp is on or
-        # just before the first segment's `start_session_time_ns`,
-        # never after.
-        if self.session_clock is not None:
+        # Phase 7.B-ext: scope replay queries to this game. For the
+        # resume continuation case (Phase 7.D), this is the crashed
+        # game's earliest start so pre-crash segments stay visible.
+        if game_start_session_time_ns is not None:
             self.replay_store.set_current_game_start_session_time(
-                self.session_clock.now_session_time_ns()
+                game_start_session_time_ns
             )
         recording_sm.transition_to(RecordingState.RECORDING)
         if session_sm is not None and session_sm.state == SessionState.CREATED:
@@ -273,6 +320,12 @@ class ApplicationCoordinator:
         if resume_session_id is not None:
             session_paths = self._session_manager.adopt_session(resume_session_id)
             self._populate_segment_index_from_resume(session_paths.session_id)
+            # Phase 7.D: detect the crashed game and rebase the new
+            # SessionClock past its latest session_time so the first
+            # Start press can continue the crashed game in the same
+            # folder, with pre-crash + post-resume segments treated
+            # as one continuous game by the per-game filter.
+            self._setup_resume_continuation(session_paths)
         else:
             session_paths = self._session_manager.start_new_session(
                 self.feed_registry.build_session_label()
@@ -325,6 +378,92 @@ class ApplicationCoordinator:
                 "feed_count": assessment.feed_count,
             },
         )
+
+    # Small gap appended to the rebase anchor so post-resume session
+    # times are STRICTLY greater than any pre-crash value. 1ms is more
+    # than enough to dodge floating-point or coarse-clock equality.
+    _RESUME_REBASE_GAP_NS = 1_000_000
+
+    def _setup_resume_continuation(self, session_paths) -> None:
+        """Phase 7.D: prepare the first Start after Resume to continue
+        the crashed game.
+
+        Walks the session's `recording/` directory for the highest
+        `game_NNN/` folder (the crashed game), filters loaded
+        segments to that folder, and computes:
+
+        - earliest `start_session_time_ns` across the crashed game's
+          segments — used as the per-game filter value when the
+          operator presses Start, so pre-crash content stays visible
+          to replay.
+        - latest `end_session_time_ns` across the crashed game's
+          segments — used to rebase the new `SessionClock` past it,
+          so post-resume session_time is strictly greater than
+          pre-crash and integer comparison stays meaningful.
+
+        No-op (continuation stays None) if any of:
+        - the recording dir doesn't exist or has no `game_NNN/` folder
+        - no loaded segment lives under the crashed game folder
+        - none of those segments have populated session-time fields
+          (legacy / pre-5.A rows can't anchor the rebase)
+        - no SessionClock is attached (test fixtures only)
+        """
+        if self.session_clock is None:
+            return
+        recording_root = session_paths.recording_dir
+        if not recording_root.exists():
+            return
+        crashed_game_index = find_next_game_index(recording_root) - 1
+        if crashed_game_index < 1:
+            return
+        crashed_game_subdir = GAME_DIR_FORMAT.format(crashed_game_index)
+        crashed_game_segments = list(
+            self._segments_under_game_subdir(crashed_game_subdir)
+        )
+        if not crashed_game_segments:
+            return
+        starts = [
+            s.start_session_time_ns
+            for s in crashed_game_segments
+            if s.start_session_time_ns is not None
+        ]
+        ends = [
+            s.end_session_time_ns
+            for s in crashed_game_segments
+            if s.end_session_time_ns is not None
+        ]
+        if not starts or not ends:
+            return
+        game_start_ns = min(starts)
+        game_end_ns = max(ends)
+        rebase_anchor_ns = game_end_ns + self._RESUME_REBASE_GAP_NS
+        self.session_clock.rebase(rebase_anchor_ns)
+        self._resume_continuation = _ResumeContinuation(
+            game_subdir=crashed_game_subdir,
+            game_start_session_time_ns=game_start_ns,
+        )
+        LOGGER.info(
+            "resume continuation: game=%s pre_crash_segments=%d game_start_ns=%d "
+            "rebased_clock_to_ns=%d",
+            crashed_game_subdir,
+            len(crashed_game_segments),
+            game_start_ns,
+            rebase_anchor_ns,
+        )
+
+    def _segments_under_game_subdir(self, game_subdir: str):
+        """Yield loaded segments whose file_path lies under `game_subdir`.
+
+        Matches by path component to avoid the `game_001` / `game_0011`
+        substring trap. Segments under the legacy flat layout
+        (`recording/<feed_id>/...`) never match — pre-Phase-4.E
+        sessions can't be resumed into the per-game continuation flow,
+        which is correct because they have no game folder to continue.
+        """
+        for feed_id in self.segment_index.feed_ids():
+            for segment in self.segment_index.all_for_feed(feed_id):
+                if game_subdir in Path(segment.file_path).parts:
+                    yield segment
 
     def _populate_segment_index_from_resume(self, session_id: str) -> None:
         """Seed the in-memory `SegmentIndex` from SQLite for an adopted session.

@@ -53,6 +53,42 @@ class SessionClockTests(unittest.TestCase):
         self.assertGreaterEqual(second, first)
 
 
+class SessionClockRebaseTests(unittest.TestCase):
+    """Phase 7.D: rebasing the clock past pre-crash session-time so the
+    resume-after-crash path can keep integer comparison meaningful."""
+
+    def test_rebase_makes_now_return_anchor(self) -> None:
+        clock_fn = _FakeNanosecondClock(start_ns=10_000_000_000)
+        sc = SessionClock(clock_ns=clock_fn)
+        self.assertEqual(sc.now_session_time_ns(), 0)
+        sc.rebase(30_000_000_000)
+        # now_session_time_ns() at the moment of rebase returns the anchor.
+        self.assertEqual(sc.now_session_time_ns(), 30_000_000_000)
+
+    def test_rebase_preserves_monotonic_advance(self) -> None:
+        clock_fn = _FakeNanosecondClock(start_ns=10_000_000_000)
+        sc = SessionClock(clock_ns=clock_fn)
+        sc.rebase(30_000_000_000)
+        # Advance underlying clock 5s.
+        clock_fn.advance_ns(5_000_000_000)
+        self.assertEqual(sc.now_session_time_ns(), 35_000_000_000)
+
+    def test_rebase_post_crash_anchor_above_pre_crash_session_time(self) -> None:
+        # Simulates the resume flow: latest pre-crash end_session_time = 30s.
+        # After rebase, post-resume "now" is strictly greater than 30s
+        # so integer comparison against pre-crash segment values stays
+        # well-defined.
+        pre_crash_latest_end_ns = 30_000_000_000
+        clock_fn = _FakeNanosecondClock(start_ns=99_000_000_000)
+        sc = SessionClock(clock_ns=clock_fn)
+        # Fresh clock starts at 0 — comparison would say
+        # `0 < 30_000_000_000`, putting "now" before pre-crash.
+        self.assertLess(sc.now_session_time_ns(), pre_crash_latest_end_ns)
+        # Rebase past the pre-crash latest with a 1ms gap.
+        sc.rebase(pre_crash_latest_end_ns + 1_000_000)
+        self.assertGreater(sc.now_session_time_ns(), pre_crash_latest_end_ns)
+
+
 class PipelineManagerSessionTimeCaptureTests(unittest.TestCase):
     """Drive `_on_jpegenc_buffer_probe` + `_finalize_pending_segment_locked`
     through a stub `PipelineManager` to confirm that session-time fields

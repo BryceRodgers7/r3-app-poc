@@ -27,6 +27,15 @@ class SessionClock:
     `now_session_time_ns()` returns nanoseconds since the clock was
     constructed. The optional `clock_ns` parameter lets tests inject a
     deterministic source.
+
+    Phase 7.D adds `rebase(anchor_session_time_ns)`. The session_time
+    origin is normally the moment the SessionClock is constructed, but
+    on resume-after-crash the coordinator rebases the new clock past
+    the latest pre-crash segment's `end_session_time_ns` so post-resume
+    session_time is strictly greater than any pre-crash value. That
+    keeps integer comparison meaningful across the crash and lets the
+    per-game filter (Phase 7.B-ext) treat pre-crash and post-resume
+    segments as one continuous game.
     """
 
     __slots__ = ("_clock_ns", "_start_monotonic_ns")
@@ -43,3 +52,22 @@ class SessionClock:
     def now_session_time_ns(self) -> int:
         """Return nanoseconds elapsed since session start."""
         return self._clock_ns() - self._start_monotonic_ns
+
+    def rebase(self, anchor_session_time_ns: int) -> None:
+        """Reset the clock origin so `now_session_time_ns()` returns
+        `anchor_session_time_ns` at the moment of this call.
+
+        Used by the resume-after-crash path: `coordinator.initialize`
+        loads pre-crash segments from SQLite, finds the latest
+        `end_session_time_ns`, and rebases the new SessionClock to
+        that value (plus a small gap). All post-resume segments are
+        then guaranteed to have session_time strictly greater than
+        any pre-crash segment, so the per-game filter and
+        cross-segment range queries stay correct across the crash.
+
+        Safe only before any buffer has been processed by the new
+        clock. Once `PipelineManager._on_jpegenc_buffer_probe` has
+        captured a `session_time` for a writing segment, rebasing
+        would corrupt that segment's metadata.
+        """
+        self._start_monotonic_ns = self._clock_ns() - anchor_session_time_ns

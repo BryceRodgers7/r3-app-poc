@@ -48,7 +48,10 @@
       "Bash(python -m unittest discover -s tests -p test_playback_controller.py -v)",
       "Bash(python -m unittest discover -s tests -p test_replay_store_per_game_scope.py -v)",
       "Bash(python -m unittest discover -s tests -p test_replay_store_per_game_scope.py)",
-      "Bash(python -m unittest discover -s tests -p test_playback_controller.py)"
+      "Bash(python -m unittest discover -s tests -p test_playback_controller.py)",
+      "Bash(python -m unittest discover -s tests -p test_replay_safety_invariants.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_session_clock.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_resume_continuation.py -v)"
     ]
   }
 }
