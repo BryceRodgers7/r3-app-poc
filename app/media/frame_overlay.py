@@ -54,6 +54,11 @@ def build_playback_overlay_lines(playback_overlay: PlaybackOverlayInfo) -> list[
     if not playback_overlay.is_recording:
         return []
     lines = [playback_overlay.mode.value]
+    # Phase 7.H.3: surface the currently-open play number so the
+    # operator can see which play they're inside of at a glance.
+    # Right under the mode badge, before the timestamps.
+    if playback_overlay.current_play_number is not None:
+        lines.append(f"Play #{playback_overlay.current_play_number}")
     if playback_overlay.status_text:
         lines.append(playback_overlay.status_text)
     if playback_overlay.playback_timestamp is not None:

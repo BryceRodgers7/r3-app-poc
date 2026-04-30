@@ -104,6 +104,12 @@ class ApplicationCoordinator:
         # math is anchored to the same monotonic origin as the segment
         # rows it queries.
         self.session_clock = session_clock if session_clock is not None else SessionClock()
+        # Phase 7.H.1: per-game play boundary tracker. None when the
+        # coordinator was constructed without one (older test paths
+        # that bypass `build_default_application_coordinator`). Must
+        # be set BEFORE the PlaybackControllers below so they can
+        # read it.
+        self.play_manager = play_manager
 
         primary_feed = feed_registry.get_primary_feed()
         enabled_feeds = feed_registry.get_enabled_feeds()
@@ -117,6 +123,7 @@ class ApplicationCoordinator:
             session_role="operator",
             live_only=False,
             session_clock=self.session_clock,
+            play_manager=self.play_manager,
         )
         self.program_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,
@@ -127,6 +134,7 @@ class ApplicationCoordinator:
             session_role="program",
             live_only=True,
             session_clock=self.session_clock,
+            play_manager=self.play_manager,
         )
         self._session_started = False
         self._shutting_down = False
@@ -134,10 +142,6 @@ class ApplicationCoordinator:
         # AND a viable crashed game exists; consumed by the first
         # toggle_long_session_recording start path.
         self._resume_continuation: _ResumeContinuation | None = None
-        # Phase 7.H.1: per-game play boundary tracker. None when the
-        # coordinator was constructed without one (older test paths
-        # that bypass `build_default_application_coordinator`).
-        self.play_manager = play_manager
 
     def get_feed_pipeline_mode(self, feed_id: str) -> PipelineMode:
         """Return the configured ingest pipeline mode for `feed_id`.

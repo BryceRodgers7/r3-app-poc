@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer
 
@@ -21,6 +22,9 @@ from app.media.output_renderer import MultiFeedOutputRenderer, OutputRenderer
 from app.media.recording_manager import RecordingManager
 from app.media.segment_decoder import SegmentDecoder
 from app.storage.segment_replay_store import RecordingSegmentReplayStore
+
+if TYPE_CHECKING:
+    from app.core.play_manager import PlayManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +68,7 @@ class PlaybackController:
         live_only: bool = False,
         decoder_factory: Callable[[str, str], SegmentDecoder] | None = None,
         session_clock: SessionClock | None = None,
+        play_manager: "PlayManager | None" = None,
     ) -> None:
         if not feed_runtimes:
             raise ValueError("PlaybackController requires at least one FeedRuntime.")
@@ -81,6 +86,10 @@ class PlaybackController:
         # quanta. Falls back to the segment-derived metric when no
         # clock is attached (test fixtures, headless tooling).
         self._session_clock = session_clock
+        # Phase 7.H.3: read-only access to the PlayManager so
+        # `_update_state_timestamps_locked` can populate the
+        # current play number on UiState + PlaybackOverlayInfo.
+        self._play_manager = play_manager
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
@@ -666,6 +675,14 @@ class PlaybackController:
         self._state.replay_available = (
             latest_session_time_ns is not None and is_recording
         )
+        # Phase 7.H.3: pull the currently-open play number from the
+        # PlayManager. None when no game is being recorded (PlayManager
+        # has no open play between Stop and the next Start).
+        self._state.current_play_number = (
+            self._play_manager.current_play_number()
+            if self._play_manager is not None
+            else None
+        )
         if latest_session_time_ns is None:
             self._state.live_lag_behind_replayable_seconds = 0.0
         elif self._session_clock is not None:
@@ -732,6 +749,7 @@ class PlaybackController:
             playback_rate=self._playback_rate,
             status_text=self._build_overlay_status_locked(),
             is_recording=self._state.is_recording,
+            current_play_number=self._state.current_play_number,
         )
 
     def _build_overlay_status_locked(self) -> str | None:

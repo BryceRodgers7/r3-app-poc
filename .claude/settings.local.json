@@ -84,7 +84,9 @@
       "Bash(python -m unittest discover -s tests -p test_next_play_button.py -v)",
       "Bash(timeout 30 python -m unittest tests.test_next_play_button.CoordinatorMarkNextPlayWiringTests)",
       "Bash(timeout 30 python -c ' *)",
-      "Bash(timeout 15 python -c ' *)"
+      "Bash(timeout 15 python -c ' *)",
+      "Bash(python -m unittest discover -s tests -p test_playback_overlay_visibility.py)",
+      "Bash(python -m unittest discover -s tests -p test_play_badge.py)"
     ]
   }
 }

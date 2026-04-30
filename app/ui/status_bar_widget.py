@@ -15,6 +15,7 @@ class StatusBarWidget(QFrame):
         self.app_state_value = QLabel("-")
         self.mode_value = QLabel("-")
         self.recording_value = QLabel("-")
+        self.play_value = QLabel("-")
         self.source_value = QLabel("-")
         self.ingest_value = QLabel("-")
         self.ingest_value.setWordWrap(True)
@@ -31,6 +32,7 @@ class StatusBarWidget(QFrame):
             ("App State", self.app_state_value),
             ("Mode", self.mode_value),
             ("Recording", self.recording_value),
+            ("Play", self.play_value),
             ("Source", self.source_value),
             ("Ingest", self.ingest_value),
             ("Session", self.session_value),
@@ -66,6 +68,7 @@ class StatusBarWidget(QFrame):
             self.mode_value.setText(state.current_playback_mode.value.replace("_", " "))
 
         self.recording_value.setText("RECORDING" if state.is_recording else "IDLE")
+        self.play_value.setText(_format_play_badge(state))
         self.source_value.setText(
             f"{state.current_source_name or 'Unknown'} ({'CONNECTED' if state.source_connected else 'DISCONNECTED'})"
         )
@@ -89,6 +92,19 @@ class StatusBarWidget(QFrame):
             )
         else:
             self.detail_value.setText("Showing newest live frame")
+
+
+def _format_play_badge(state: UiState) -> str:
+    """Phase 7.H.3 status-bar Play row.
+
+    Shows `Play #N` when a play is currently open. Outside of
+    recording (or before PlayManager has any state) reads "—" so the
+    operator can scan the status bar without scrolling past a
+    stale-looking number.
+    """
+    if state.current_play_number is None:
+        return "—"
+    return f"Play #{state.current_play_number}"
 
 
 def _format_mmss(seconds: float) -> str:

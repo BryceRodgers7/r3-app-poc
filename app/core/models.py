@@ -139,6 +139,10 @@ class PlaybackOverlayInfo:
     operator has no transport context worth surfacing (replay is
     unavailable per §10.4 / §15.2), so showing a static "LIVE" badge
     just adds visual noise.
+
+    Phase 7.H.3 adds `current_play_number` so the overlay can show
+    `Play #N` alongside the LIVE/REPLAY/PAUSED badge while a game is
+    in progress.
     """
 
     mode: PlaybackMode = PlaybackMode.SOURCE_LOST
@@ -148,6 +152,7 @@ class PlaybackOverlayInfo:
     playback_rate: float = 1.0
     status_text: str | None = None
     is_recording: bool = False
+    current_play_number: int | None = None
 
 
 @dataclass(slots=True)
