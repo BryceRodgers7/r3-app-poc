@@ -144,6 +144,17 @@ def main(argv: list[str] | None = None) -> int:
                     session_id=plan.session_id,
                     force=args.force,
                 )
+                # Phase 8.D: write `<game>/plays.json` sidecars,
+                # one per game in the plan. Independent of MP4
+                # encoding success — a play-marker file is useful
+                # forensically even if some encodes failed.
+                from app.tools.plays_json_export import (
+                    write_plays_sidecars_for_session,
+                )
+                game_subdirs = [item.game_subdir for item in plan.long_form]
+                sidecars = write_plays_sidecars_for_session(
+                    db, session_path, game_subdirs
+                )
             finally:
                 db.close()
     except ValidationError as exc:
@@ -157,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
         f"\nExport complete: {len(succeeded)} succeeded, "
         f"{len(failed)} failed, {len(skipped)} skipped."
     )
+    if sidecars:
+        print(f"plays.json sidecars: {len(sidecars)} written.")
     for r in skipped:
         print(
             f"  SKIPPED {r.plan_item.game_subdir}/{r.plan_item.feed_id}: "
