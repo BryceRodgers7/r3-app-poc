@@ -298,7 +298,7 @@ Responsibilities:
 - Refuse to run while the recording application is active.
 - Read `session.sqlite`, recording segment metadata, and play markers.
 - Create one long-form MP4 per feed/game recording.
-- Create short MP4 files for each marked play and selected feed/angle.
+- Write one `plays.json` sidecar per game, listing the play boundaries that downstream tooling can use to slice the long-form MP4.
 - Record output artifacts and failures in metadata.
 - Preserve source recording segments unchanged.
 
@@ -683,35 +683,48 @@ Rules:
 - Never delete recording segments as part of replay navigation or instant-replay shortcut management.
 - If disk pressure is severe, enter degraded mode and warn operator rather than evicting recording media.
 
-## 6.7 Clip model
+## 6.7 Play markers
 
-A clip/play should be metadata first, exported file second.
+Every moment of a recording belongs to a play. A play is a contiguous span of session time bounded by operator-driven markers; it carries no media of its own — its truth is the time range, which the replay path and the post-session processor consult against the existing segment store.
 
-A play marker should store:
+Lifecycle:
+
+- The first press of "Start game recording" implicitly opens **Play #1** at the same session time as the recording's first segment.
+- The "Next Play" button (replacing the slice 4.D `advance_short_segments` stub) closes the currently-open play and immediately opens the next one. There is no "between plays" state.
+- "Stop game recording" closes the currently-open play. The next "Start game recording" creates a new game and opens its own Play #1; the play counter resets per game.
+- A `plays` SQLite table is the durable source of truth. Each row stores `play_number` (1-based, per game), `start_session_time_ns`, and `end_session_time_ns` (NULL while a play is currently open).
+
+A play row stores:
 
 ```text
 play_id
 session_id
+game_subdir
+play_number              -- 1-based, unique within a game
 start_session_time_ns
-end_session_time_ns
-feed_ids
-primary_feed_id
-tags
-notes
+end_session_time_ns      -- NULL while open
 created_at
-
-source_segments_by_feed: { feed_id -> [segment_id, ...] }
+auto_closed_on_crash     -- TRUE when filled in by the resume path
 ```
 
-The marker's truth is the time range. `source_segments_by_feed` is a per-feed cache of which segments cover that range, recorded at marker-creation time so the post-session processor can locate source media without re-querying. A play crossing a segment edge on one feed but not another is handled naturally — each feed's list is independent. Clip cuts at export time are timestamp-based seek + trim inside those segments, not segment-aligned.
+`UNIQUE(session_id, game_subdir, play_number)` enforces the per-game numbering.
 
-Do not immediately create a physical video file for every play unless requested.
+The play list is **operator-scoped, not feed-scoped** — there is one play sequence per game that applies to every feed. A future per-feed override is unnecessary and would complicate the boundary semantics.
 
-Reason:
+Crash and resume:
 
-- Clip creation should be instant.
-- Export can happen later.
-- Multiple export formats/angles may be generated from the same metadata.
+- If the app crashes mid-play, the on-disk row for the open play has `end_session_time_ns = NULL`. The §11.4 resume path closes it: `end_session_time_ns` is set to the latest finalized segment's `end_session_time_ns` (the last frame the operator could possibly have seen) and `auto_closed_on_crash = TRUE` is set as a forensic flag.
+- The first "Next Play" press after resume opens the next play in sequence, just like a normal boundary tap.
+
+Replay use case:
+
+- A new transport button **"Replay Play"** seeks playback to the currently-open play's `start_session_time_ns` and resumes at 1.0x. To go further back, the operator stacks Rewind 10s clicks (the existing per-10-second offset path).
+- The current play number is rendered on the playback overlay (`Play #N`) so the operator always knows what they're inside of.
+
+Post-session export:
+
+- Alongside each `<game_NNN>/<feed>.mp4`, the post-session processor writes a single `<game_NNN>/plays.json` sidecar describing the play boundaries for that game. The JSON is per-game (not per-feed) because plays are operator-scoped. Editors / scrubbers / scoring tools consume the JSON to navigate the matching MP4.
+- The processor does not produce per-play sub-clips. The clip model is metadata-first; downstream tooling slices the long-form MP4 using `start_seconds` + `length_seconds` from the JSON when sub-clips are needed.
 
 ## 6.8 Retention and cleanup
 
@@ -1454,9 +1467,9 @@ last_seen_session_time_ns
 
 Fields listed in section 6.3.
 
-## 14.5 PlayMarker
+## 14.5 Play
 
-Fields listed in section 6.7.
+Schema in section 6.7. One row per play; spans are mutually exclusive within a game; `end_session_time_ns` is NULL only on the currently-open play.
 
 ## 14.6 ExportArtifact
 
@@ -1643,7 +1656,9 @@ Test:
 21. Instant replay shortcuts do not limit the maximum replayable range.
 22. Post-session processor refuses to run against an active session.
 23. Post-session processor creates long-form MP4 files after shutdown.
-24. Post-session processor creates short play MP4 files from play metadata after shutdown.
+24. Post-session processor writes a `plays.json` sidecar per game whose play boundaries match the in-DB `plays` rows.
+25. "Replay Play" seeks playback to the currently-open play's `start_session_time_ns` and resumes at 1.0x.
+26. The play counter resets to 1 for each new game; "Next Play" advances within a game without skipping numbers; "Stop game recording" closes the currently-open play.
 
 ## 16.3 Performance acceptance tests
 
@@ -2325,12 +2340,36 @@ After 7.D the operator workflow for a crash mid-game becomes: app crashes → re
 
 **Out of scope for 7.D:** post-session UI affordance to replay across all games in a finalized session (that's a separate read-only viewer concern); recovery for sessions that crashed before any segment finalized in the crashed game (continuation falls back to fresh-game allocation).
 
+**7.H — Play markers + Replay Play**
+
+The replay model has only had time-bounded rewind so far ("Rewind 10s" stacks 10-second offsets). 7.H adds a play-bounded mode: the operator marks play boundaries during the game with a **"Next Play"** button, and a new **"Replay Play"** transport button seeks to the start of the currently-open play.
+
+Implementation lands in four sub-slices:
+
+- **7.H.1 — `plays` SQLite table + `PlayManager`.** New table per the §6.7 schema; `UNIQUE(session_id, game_subdir, play_number)`. New `PlayManager` orchestration object owned by `ApplicationCoordinator`. Hooks: `toggle_long_session_recording` Start opens Play #1; `toggle_long_session_recording` Stop closes the current play; the Next Play button advances the boundary. Crash recovery (via the §11.4 recovery scan) auto-closes any open play whose `end_session_time_ns` is NULL using the latest finalized segment's end and sets `auto_closed_on_crash = TRUE`.
+- **7.H.2 — operator UI.** Reuse the existing "Next clip" button slot (currently bound to `advance_short_segments`, a slice 4.D no-op stub). Rebind it to a new `mark_next_play` coordinator method. Re-label to "Next Play". Disable when not RECORDING.
+- **7.H.3 — overlay current-play badge.** `UiState.current_play_number: int | None`, populated by `PlaybackController._update_state_timestamps_locked` from `PlayManager.current_play()`. Render `Play #N` on the playback overlay (alongside LIVE/REPLAY/PAUSED) and on the operator status bar.
+- **7.H.4 — "Replay Play" transport.** New `PlaybackController.replay_current_play()` method. Reads the currently-open play's `start_session_time_ns`, calls into the existing session-time replay path (Phase 5.C), pauses/resumes per the operator's choice. New transport button on the operator panel. Disabled when not RECORDING. No-op when no play is open (defensive — Play #1 should always be open when recording is active).
+
+Tests:
+
+- `plays` table CRUD round-trip; `UNIQUE` constraint enforcement.
+- PlayManager state machine: Start opens Play #1; Next Play closes current and opens next; Stop closes current; resume after crash auto-closes the in-flight play and sets the flag.
+- Per-game scope: starting game_002 resets the counter to Play #1 even within the same session.
+- `replay_current_play()` seeks to the right session_time; behaves correctly when called from LIVE / REPLAY / PAUSED.
+- UI toggle disabled when recording inactive; overlay badge populated.
+
+**Out of scope for 7.H:** per-play tags / notes / scoring metadata; multi-feed-aware play markers (one feed in a play, another not); a "Replay Play -2" / scroll-back-through-plays UI. The data structure supports those — the UI doesn't expose them in the MVP.
+
 ### Phase 7 sequencing notes
 
 - **7.A and 7.B are independent.** Either can land first; both are needed before Phase 7 is ✅. Recommend 7.A first because the disk-budget signal is what catches a misconfigured production deployment before the operator hits a wedged-recording bug — higher operational value than the latest-replayable surface, which is mostly diagnostic.
 - **7.C should land last among the original three.** It's a confirming/locking-in pass; the tests it adds are most valuable after the surfaces it covers exist.
 - **7.D depends on 7.B** because it reuses the per-game filter from 7.B-ext. Without that filter, the continuation has nothing to scope against.
-- **No hardware-specific risk** in any of the four slices. All testable against synthesized fixtures.
+- **7.E (audio-missing health event), 7.F (segments-table UNIQUE-constraint migration), and 7.G (audio re-link on splitmuxsink rebuild) are independent bug-fix slices** that landed after the original three. None gate the others.
+- **7.H depends on the per-game scoping of 7.B-ext** (plays are per-game, like segments). It doesn't depend on 7.D, but the resume-after-crash play auto-closure rides on 7.D's resume path.
+- **8.D depends on 7.H** because the `plays.json` sidecar reads the `plays` table that 7.H lands.
+- **No hardware-specific risk** in any Phase 7 slice. All testable against synthesized fixtures.
 
 ---
 
@@ -2338,16 +2377,16 @@ After 7.D the operator workflow for a crash mid-game becomes: app crashes → re
 
 Goal:
 
-- Add the separate manual processor that creates long-form and short-play MP4 deliverables after the recording app is shut down.
+- Add the separate manual processor that creates long-form MP4 deliverables and per-game `plays.json` sidecars after the recording app is shut down.
 
 Tasks:
 
 - Add a separate program in the same repository.
 - Accept a session folder as input.
 - Refuse to run if the session is active, recording, dirty, or not finalized.
-- Read `session.sqlite`, recording segments, and play metadata.
+- Read `session.sqlite`, recording segments, and the `plays` table.
 - Produce one long-form MP4 per feed/game recording.
-- Produce short MP4 files for each play and selected feed/angle.
+- Produce one `plays.json` sidecar per game, describing operator play boundaries.
 - Write `ExportArtifact` metadata for successful and failed outputs.
 - Preserve source recording segments unchanged.
 
@@ -2355,12 +2394,12 @@ Exit criteria:
 
 - Processor can be run manually after shutdown against a finalized session folder.
 - Long-form MP4 outputs are created.
-- Short play MP4 outputs are created from play metadata.
+- `plays.json` sidecars match the in-DB `plays` rows for each game.
 - Failed exports are recorded without damaging source media.
 
 ### Slices
 
-Phase 8 lands in four slices. 8.A, 8.B, 8.C are independent of any unbuilt feature and can ship now. 8.D depends on the §6.7 operator clip-marker system, which doesn't exist yet — call it out so the dependency is visible, but defer.
+Phase 8 lands in three slices.
 
 **8.A — CLI scaffold + session validation**
 
@@ -2393,7 +2432,7 @@ Phase 8 lands in four slices. 8.A, 8.B, 8.C are independent of any unbuilt featu
   CREATE TABLE export_artifacts (
       id INTEGER PRIMARY KEY,
       session_id TEXT NOT NULL,
-      kind TEXT NOT NULL,            -- 'long_form' | 'short_play'
+      kind TEXT NOT NULL,            -- 'long_form' (only kind today)
       game_subdir TEXT,              -- 'game_NNN'
       feed_id TEXT,                  -- nullable for multi-feed clips
       output_path TEXT NOT NULL,
@@ -2412,17 +2451,35 @@ Phase 8 lands in four slices. 8.A, 8.B, 8.C are independent of any unbuilt featu
 - Re-running the processor against the same session is **idempotent**: 8.B skips artifacts whose `(session_id, kind, game_subdir, feed_id)` already has a `success` row. `--force` re-runs.
 - Tests: schema round-trip (insert / query); idempotent re-run skips successes but retries failures.
 
-**8.D — Short-play MP4 export (deferred)**
+**8.D — `plays.json` sidecar per game**
 
-- Depends on the §6.7 operator clip-marker system, which is not yet implemented. A `plays` table (or equivalent) needs to exist before 8.D can iterate over plays.
-- When the dependency lands, 8.D adds: for each play `(start_session_time_ns, end_session_time_ns, selected_feed_ids)`, identify the segments overlapping the time range per feed, extract sub-clips via GStreamer's `gnlcomposition` or ffmpeg's `-ss / -to`, mux to MP4 in `<session_path>/processed/plays/<play_id>_<feed_id>.mp4`. ExportArtifact rows use `kind='short_play'`.
-- Phase 8 ships 8.A → 8.B → 8.C without 8.D. The slice spec exists so the integration shape is documented for whoever builds the clip-marker system.
+- Depends on Phase 7.H (which lands the `plays` SQLite table). Without that table 8.D has nothing to read; with it, 8.D is a small "iterate plays for game N, render JSON" pass alongside the long-form MP4 emit in 8.B.
+- For each `game_subdir` whose long-form MP4(s) succeeded in 8.B (or unconditionally — implementation detail), query `plays` for that game, render `<session_path>/processed/<game_subdir>/plays.json`:
+
+  ```json
+  {
+    "session_id": "session_NNN",
+    "game_subdir": "game_NNN",
+    "game_start_session_time_ns": 0,
+    "game_duration_seconds": 217.4,
+    "plays": [
+      { "play_number": 1, "start_seconds": 0.0, "length_seconds": 4.5 },
+      { "play_number": 2, "start_seconds": 4.5, "length_seconds": 3.2 }
+    ]
+  }
+  ```
+
+- `start_seconds` is **game-relative** (seconds since the game's first segment, not since the session). Editors and scoring tools consume this directly to seek inside the matching `<feed>.mp4`. `length_seconds` is `(end_session_time_ns - start_session_time_ns) / 1e9` for the closed plays. The currently-open play is excluded from the JSON of an active game; for a finalized game, every play is closed (the operator's "Stop game recording" closes the last one).
+- One JSON per game (not per feed) because plays are operator-scoped.
+- Tests: shape lock-in against a synthetic `plays` fixture; multi-game session writes one JSON per game; an empty `plays` table writes a JSON with `"plays": []`; auto-closed-on-crash plays are included normally (the JSON doesn't expose the `auto_closed_on_crash` flag).
+
+**Out of scope for 8.D:** per-play sub-clip MP4s. The decision (per §6.7) is that the JSON sidecar plus the long-form MP4 covers the consumer use case; downstream tooling handles slicing if needed.
 
 ### Phase 8 sequencing notes
 
 - **8.A first.** The validation gate is what keeps the processor from corrupting an active session.
 - **8.C before 8.B.** 8.B writes to 8.C's table; landing the schema first means 8.B is testable end-to-end.
-- **8.D deferred.** Strong dependency on §6.7 (clip markers). Don't block Phase 8 closure on it.
+- **8.D depends on 7.H.** The `plays` table is built in Phase 7.H; without it the sidecar has nothing to render. 8.A/8.B/8.C ship without 8.D — the long-form MP4s are still useful on their own, the sidecar joins later.
 - **Encoder availability is the only deployment risk.** x264enc is in `gst-plugins-ugly` (license restriction); some UCRT64 distributions don't ship it. The fallback is an ffmpeg subprocess. Detect at startup and surface clearly which path is being used.
 
 ---

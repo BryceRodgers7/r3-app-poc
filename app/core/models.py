@@ -217,12 +217,14 @@ SEGMENT_STATE_QUARANTINED = "quarantined"
 
 
 # Phase 8.C: post-session export artifact bookkeeping. Rows in the
-# `export_artifacts` SQLite table track every long-form / short-play
-# encoding attempt so re-runs are idempotent (a `success` row for a
-# given `(session_id, kind, game_subdir, feed_id)` makes the
-# processor skip that artifact unless `--force` is passed).
+# `export_artifacts` SQLite table track every long-form encoding
+# attempt so re-runs are idempotent (a `success` row for a given
+# `(session_id, kind, game_subdir, feed_id)` makes the processor
+# skip that artifact unless `--force` is passed). The only `kind`
+# today is `long_form`; the post-session processor also writes a
+# `plays.json` sidecar per game (Phase 8.D), but that's a single
+# JSON file per game rather than a per-artifact row.
 EXPORT_KIND_LONG_FORM = "long_form"
-EXPORT_KIND_SHORT_PLAY = "short_play"  # 8.D — depends on §6.7 clip markers
 EXPORT_STATUS_SUCCESS = "success"
 EXPORT_STATUS_FAILED = "failed"
 
@@ -231,9 +233,9 @@ EXPORT_STATUS_FAILED = "failed"
 class ExportArtifact:
     """One persisted export attempt.
 
-    `game_subdir` and `feed_id` are nullable for future short-play
-    artifacts that span multiple feeds (8.D). Long-form artifacts
-    always populate both.
+    `game_subdir` and `feed_id` are nullable for future kinds that
+    might span multiple feeds. Long-form artifacts always populate
+    both.
     """
 
     session_id: str

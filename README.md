@@ -72,7 +72,7 @@ Options:
 - `--metadata-db PATH` — override DB location (default `<session_path>/../../metadata.db`, i.e. `<base_data_dir>/metadata.db`).
 - `-v` / `--verbose` — DEBUG-level logging.
 
-Phase 8 ships long-form export today. Short-play MP4s (per-clip extracts using operator clip markers) are deferred until the §6.7 clip-marker system lands. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 8 sequencing notes for details.
+Phase 8.A/B/C ship long-form MP4 export today. Phase 8.D adds a `<game_NNN>/plays.json` sidecar per game once Phase 7.H lands the `plays` SQLite table (operator-marked play boundaries during recording). The sidecar describes play start times + lengths so downstream tooling can navigate the long-form MP4. There are no short-clip MP4 outputs — that requirement was dropped in favor of the JSON sidecar + long-form MP4 combination. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 7 / 8 sequencing notes for details.
 
 - **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed. Production deployments use this exclusively.
 - **`kind = "synthetic"`**: deterministic synthetic test pattern from [app/media/test_source.py](app/media/test_source.py). Dev-only fallback for machines without NDI hardware.
