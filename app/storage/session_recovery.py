@@ -412,9 +412,8 @@ def _session_paths_for_existing(sessions_root: Path, session_id: str) -> Session
         session_id=session_id,
         root_dir=root_dir,
         recording_dir=root_dir / "recording",
-        rolling_dir=root_dir / "rolling",
-        clips_dir=root_dir / "clips",
         quarantine_dir=root_dir / "quarantine",
+        logs_dir=root_dir / "logs",
     )
 
 

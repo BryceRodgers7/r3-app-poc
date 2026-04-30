@@ -1,20 +1,56 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working
+with code in this repository.
 
 ## What this project is
 
-Windows desktop proof-of-concept for live multi-feed sports video replay. PySide6 UI on top of a GStreamer-centered media path (preview, file recording, rolling replay). Production ingest is **NDI-only** (`kind = "ndi"`); a synthetic test source (`kind = "synthetic"`) is the dev fallback for camera-less work. Both still push frames through Python today — Phase 3.A is the slice that converts NDI to a native GStreamer source bin. Two top-level windows (operator + program) drive two independent `PlaybackController` instances over a shared graph of per-feed `FeedRuntime`s.
+Windows desktop proof-of-concept for live multi-feed sports video replay.
+PySide6 UI on top of a GStreamer-centered media path (preview, file
+recording, replay-from-segments). Production ingest is **NDI-only**
+(`kind = "ndi"`); a synthetic test source (`kind = "synthetic"`) is the
+dev fallback for camera-less work. Production NDI ingest is fully native
+(Phase 3.A.2 + 3.A.3 retry — d3d11videosink preview + native source
+chain); the synthetic source intentionally stays on the python_push path.
+Two top-level windows (operator + program) drive two independent
+`PlaybackController` instances over a shared graph of per-feed
+`FeedRuntime`s.
 
-The repo is between proof-of-concept and production. Two architecture documents coexist:
-- [ARCHITECTURE.md](ARCHITECTURE.md) — describes the **current** code's object graph and what is "still open."
-- [docs/r3_app_architecture.md](docs/r3_app_architecture.md) — declared **authoritative target** production architecture. It is aspirational; the current code does not yet conform to it (see "Architecture doc vs current code" below).
+## Where to find things
 
-When asked to design or refactor toward production, treat `docs/r3_app_architecture.md` as the spec and the `ARCHITECTURE.md` "Still open" list as the gap. When asked to fix or extend current behavior, read the actual code first — the production doc describes intent, not implementation.
+The design and implementation reference lives in the [`docs/`](docs/)
+tree. Start at [`docs/README.md`](docs/README.md) — it's a goal-driven
+index ("I want to understand the system before proposing an
+extension" / "I'm refactoring the pipeline" / etc.) that points at:
+
+- [`docs/r3_app_architecture.md`](docs/r3_app_architecture.md) —
+  declared **target** production architecture. It is aspirational; the
+  current code does not yet conform to it. § numbers used elsewhere
+  refer to this file.
+- [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) — **current
+  implementation** reference: state machines, threading model,
+  recording / replay / recovery lifecycle, schema evolution, layer
+  map. **This is the doc to read when extending current behavior.**
+- [`docs/GSTREAMER_INVARIANTS.md`](docs/GSTREAMER_INVARIANTS.md) —
+  GStreamer construction rules. Read before refactoring
+  `pipeline_manager.py`.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — current code's object graph
+  as a status snapshot. Older framing; substantial overlap with
+  `IMPLEMENTATION.md`.
+
+When asked to design or refactor toward production, treat the target
+spec as authoritative and `IMPLEMENTATION.md` + the source code as the
+gap. When asked to fix or extend current behavior, read
+`IMPLEMENTATION.md` and the actual code first — the target spec
+describes intent, not implementation.
 
 ## Run / install / test
 
-The Windows GStreamer + `gi` (PyGObject) stack must match the Python interpreter — see [docs/UCRT64_DEVELOPMENT.md](docs/UCRT64_DEVELOPMENT.md) for the MSYS2 UCRT64 setup. NDI feeds additionally require `gst-plugins-rs` and the NewTek NDI runtime — see [docs/NDI_SETUP.md](docs/NDI_SETUP.md).
+The Windows GStreamer + `gi` (PyGObject) stack must match the Python
+interpreter — see [docs/UCRT64_DEVELOPMENT.md](docs/UCRT64_DEVELOPMENT.md)
+for the MSYS2 UCRT64 setup. NDI feeds additionally require
+`gst-plugins-rs` and the NewTek NDI runtime — see
+[docs/NDI_SETUP.md](docs/NDI_SETUP.md).
 
 ```
 python -m venv .venv
@@ -33,100 +69,49 @@ python -m unittest tests.test_segment_replay_store.ReplayStoreResolveTests.test_
 
 There is no lint/format config in the repo; don't invent one.
 
-Optional `app_settings.toml` in the working directory configures feeds and paths. With `[[feeds]]` rows present, the legacy `[source]` block is ignored and at least one feed must have `enabled = true`. See `app_settings.toml.example` and `app/config/settings.py`.
-
-## High-level architecture
-
-```
-main.py
-  └─ build_application
-       ├─ AppSettings.load()                       # app/config/settings.py
-       ├─ FileManager + MetadataDb + SessionManager  # app/storage/*
-       ├─ build_default_application_coordinator    # app/core/application_coordinator.py
-       │     ├─ FeedRegistry                       # one FeedDefinition per [[feeds]] row
-       │     ├─ shared SegmentIndex (in-memory) + RecordingSegmentReplayStore
-       │     └─ for each enabled feed:
-       │           Source (NDI / synthetic)
-       │           PreviewOutput
-       │           PipelineManager (owns the GStreamer graph + tee fan-out
-       │                            + splitmuxsink-driven recording branch
-       │                            that writes one MKV per segment +
-       │                            inserts segment rows into MetadataDb +
-       │                            SegmentIndex)
-       │           FeedRuntime (bundles the above)
-       │     └─ RecordingManager (just owns the global RecordingState machine)
-       ├─ Two MultiFeedOutputRenderer instances (operator, program)
-       ├─ Two PlaybackController instances built inside the coordinator
-       │     (operator: full transport; program: live_only=True)
-       └─ Two MainWindow instances (operator shows controls; program does not)
-```
-
-Key invariants worth knowing before editing:
-
-- **Per-feed everything.** `FeedRegistry` → `FeedRuntime` → its own `PipelineManager` / `PreviewOutput`. Do not reintroduce a single global source or shared preview surface.
-- **Two output channels.** Operator and program windows each have their own `PlaybackController`, `MultiFeedOutputRenderer`, and `MainWindow`. Program is `live_only`; only the operator has pause / replay / slow / jump-to-live. Long recording continues regardless of what either window is showing.
-- **Recording is segmented and native.** Each feed's `PipelineManager` runs a `tee → valve → videoconvert → jpegenc → splitmuxsink` branch (slice 4.A). Segment metadata (PTS span, frame count, file size) is persisted to a SQLite `segments` table and indexed in-memory by `SegmentIndex` (slice 4.B). Slice 4.D removed the legacy `Recorder` / `MuxedMediaWriter` / `ReplayBuffer` / `ReplayStoreManager` rolling-frame stack — don't reintroduce them. Slice 4.F muxes audio into the same `splitmuxsink` via an `audio_tee → queue → valve → audioconvert → audioresample → opusenc → splitmuxsink.audio_%u` chain. Phase 9.C makes audio wiring **dynamic** — the audio_record branch is built only when an audio buffer has actually been observed on the source's audio tee, and only re-attached on `_rebuild_splitmuxsink_locked` if presence is still observed. The `[recording] audio_enabled` flag is now an upper-bound override (set False to force video-only regardless of source capability); when True the runtime decides per-game.
-- **Per-game folder layout.** Each press of "Start game recording" allocates a fresh `game_NNN` subdirectory under `<session>/recording/`. Segments for that game land under `recording/<game_NNN>/<feed_id>/segment_NNNNN.mkv`. The next index comes from `find_next_game_index` (`app/storage/session_recovery.py`) which is `max(NNN)+1` over existing game dirs on disk. **Phase 7.B-ext:** `fragment_index` resets to 0 each game — `find_next_fragment_index` is now scoped to the per-game-feed folder (`<recording>/<game_NNN>/<feed_id>/`), not the whole session. Per-game folder isolation makes this safe (no cross-game name collision risk). For the resume-after-crash continuation case (Phase 7.D), the game folder already has files and `find_next_fragment_index` returns `max+1` past them. Recovery helpers (`validate_session_segments`, `find_next_fragment_index`) walk `recording/` recursively via `rglob` and infer `feed_id` from the immediate parent directory name; both nested and legacy flat layouts are supported.
-- **Per-game replay scoping (Phase 7.B-ext).** `RecordingSegmentReplayStore` carries a `_current_game_start_session_time_ns` filter set by `ApplicationCoordinator.toggle_long_session_recording` on each Start press. All session-time queries (`available_session_time_range`, `nearest_frame_location`, `resolve_session_time`, `feeds_with_coverage_at`, per-feed earliest/latest helpers) return only segments whose `start_session_time_ns >= filter`. Without this, after a Stop/Start cycle within one session the operator could rewind into the previous game's recording and the status bar would advertise stale ranges. `replay_available` is also gated on `recording_state == RECORDING` so between games the status bar reads "not available — start a game recording".
-- **Resume continues the crashed game (Phase 7.D).** When the operator picks Resume in the §11.4 recovery dialog, `ApplicationCoordinator._setup_resume_continuation` runs after `_populate_segment_index_from_resume`. It walks for the highest `game_NNN/` folder, filters loaded segments to that folder by path-component match (`game_001` ⊂ `game_0011` substring trap is avoided by inspecting `Path.parts`), captures `min(start_session_time_ns)` and `max(end_session_time_ns)` across them, calls `session_clock.rebase(latest_end + 1ms)` to push post-resume session_time strictly past pre-crash, and stashes a `_ResumeContinuation(game_subdir, game_start_session_time_ns)`. The first `toggle_long_session_recording` Start press consumes the continuation: reuses the crashed `game_NNN/` instead of allocating `game_(N+1)/`, sets the per-game filter to the crashed game's earliest start (so pre-crash segments stay visible to replay), then clears `_resume_continuation`. Subsequent Stop/Start cycles in the resumed run behave normally. `SessionClock.rebase()` is safe ONLY before any buffer has been processed by the new clock — calling it after the first segment's first-buffer probe would corrupt that segment's `start_session_time_ns`.
-- **Recording stop/start lifecycle.** The flow has been hardened iteratively — every step matters:
-  1. `disable_file_recording` (Stop) emits `splitmuxsink.split-now` **while the valve is still open**, sleeps ~300ms so the next buffer triggers the rotation (matroskamux writes the trailer for the in-flight segment), then closes the valve. If `_recording_segment_counter` advanced during the sleep the split fired and the post-split pending segment (the throwaway one that received no buffers, or only a few) is dropped (`self._pending_segment = None`) so it doesn't end up in the DB. Final `set_state(NULL)` fully tears the element down. **Known artifact:** splitmuxsink opens an empty/short "dud" segment file as part of the rotation that we then drop from the DB. The file stays on disk and is unwatchable; the startup recovery scan quarantines or marks it dirty on the next launch. This is acceptable.
-  2. `enable_file_recording` (Start, after a prior Stop) **rebuilds the splitmuxsink element from scratch** via `_rebuild_splitmuxsink_locked` — state-cycling (NULL→PLAYING) on the existing element wasn't sufficient because splitmuxsink retains an internal "current file" pointer across state changes, which made post-Start buffers append to the previous game's last file. The rebuild unlinks `jpegenc → old splitmuxsink`, removes the old element, builds a fresh one with the same config, links + `sync_state_with_parent`. The `_recording_was_disabled` flag drives this branch.
-  3. The pre-Start segment-counter seeding (`find_next_fragment_index`) is scoped to the per-game-feed folder (Phase 7.B-ext). For a fresh game the folder is empty → counter = 0. For Phase 7.D resume continuation the folder has pre-crash files → counter = `max+1`.
-- **Startup recovery (slices 4.E + §11.4 — full)** runs in `main._run_startup_recovery_flow` *before* `ApplicationCoordinator.initialize` so the coordinator's new-session path never sees dirty manifests. `app/storage/session_recovery.py` marks unfinished `session.json` files as `dirty`, walks `<session>/recording/` recursively (via `rglob`) to find every `segment_*.mkv` under both the legacy flat layout and the per-game nested layout (`recording/<game_NNN>/<feed_id>/`), validates each via `cv2.VideoCapture`, infers `feed_id` from the immediate parent directory name, quarantines corrupt files to `<session>/quarantine/<feed_id>/`, and inserts `dirty` SQLite rows for valid in-progress files that lost their finalize step (this includes the trailer-less "dud" file that `disable_file_recording` produces at the tail of every game — see Recording stop/start lifecycle). `app/ui/recovery_dialog.py` then shows a modal per dirty session with three working actions: **Resume** (only offered on the most recent dirty session — calls `SessionManager.adopt_session`, rebuilds `SegmentIndex` from prior SQLite rows, and via Phase 7.D `_setup_resume_continuation` rebases the new `SessionClock` past the latest pre-crash `end_session_time_ns` so the first Start press continues the crashed `game_NNN/` folder with pre-crash segments visible for replay; the per-game-feed `find_next_fragment_index` then picks the next index past the pre-crash files), **End and finalize**, and **Discard**.
-- **Replay query goes through `RecordingSegmentReplayStore`** (slice 4.C). It enforces §10.4 / §6.6 (replay only while `recording_state == RECORDING`; only `state == "complete"` segments are returned). After Phase 5 it has both PTS-time (`resolve`) and session-time (`resolve_session_time`, `nearest_frame_location`) APIs. `PlaybackController` runs in **session-time** (slice 5.C) and renders decoded segment frames via per-feed `SegmentDecoder` (`app/media/segment_decoder.py`, MJPEG `cv2.VideoCapture` wrappers) through `MultiFeedOutputRenderer.show_frame`. Every operator tile renders something on every replay tick: feeds with coverage at the target render that frame; feeds without coverage freeze on their nearest available frame per the §8.6.1 clamping rule. Repeated Rewind 10s clicks accumulate (anchored on current playback position when in REPLAY/PAUSED).
-- **Transport overlay + "behind live" counter invariants.** These are easy to regress; tests in `tests/test_playback_controller.py` lock the contracts down:
-  - **Smooth `seconds_behind_live`.** The counter MUST advance with wall-clock during PAUSE/REPLAY (1 second per real second). It used to jump 4s every 4s because it was derived from segment-row PTS spans (which only change at rotation boundaries). Now `_update_state_timestamps_locked` reads `session_clock.now_session_time_ns()` so the value is monotonic at sub-segment resolution. `refresh_recording_state` ALWAYS calls this after `_refresh_recording_state_locked` so the overlay re-renders even when the recording-state machine alone hasn't changed.
-  - **Slow-motion buttons must NOT auto-rewind.** `Slow 1/2x` and `Slow 1/4x` only change playback rate. When pressed from LIVE_WHILE_RECORDING, `set_playback_rate` bounces the replay state machine through `SEEKING → REPLAYING` to make the rate change valid (the FSM rejects `LIVE_WHILE_RECORDING → SLOW_MOTION` directly), but no jump-to-past happens. Operator initiates rewind via `Rewind 10s`, not via slow-mo.
-  - **Stop clears stale playback overlay.** When recording stops, all transport counters return to the fresh-startup baseline. `refresh_recording_state` re-syncs replay state and forces an overlay-snapshot rebuild via `_sync_replay_state_with_recording_locked` so leftover "12s behind live" / "PAUSED" badges from a prior game don't bleed into the no-recording UI.
-  - **Start (after a previous Stop) re-shows the overlay immediately.** `refresh_recording_state` runs on both controllers right after `enable_file_recording` so the LIVE state is reflected without waiting for a button press.
-- **Degraded-replay FROZEN badges (Phase 6).** `SegmentReplayLocation.is_freeze` is `True` for the three clamping branches and `False` for exact coverage. `UiState.feeds_in_freeze_frame` collects the per-tick freeze list; `VideoWidget.set_freeze_indicator` toggles a small amber "FROZEN" badge in each tile's top-right corner; `MultiFeedVideoPanel.apply_freeze_indicators` routes by `feed_id`. The badge surfaces in the operator UI whenever a tile is rendering a clamped freeze frame instead of an exact-coverage match — typically when a feed joined later than the rewind target or was disconnected at that session time.
-- **Long game recording is opt-in.** Sessions are created on startup, but recording on disk only starts when the operator presses "Start game recording" (`ApplicationCoordinator.toggle_long_session_recording`).
-- **Play markers (Phase 7.H — shipped).** Every moment of a recording belongs to a play; there is no "between plays" state. "Start game recording" implicitly opens **Play #1** via `PlayManager.start_game` in `app/core/play_manager.py`. The **"Next Play"** operator button (in `ControlsWidget`) is wired to `coordinator.mark_next_play()` which closes the currently-open play and immediately opens the next — incrementing a per-game `play_number`. "Stop game recording" closes the currently-open play. A **"Replay Play"** transport button is wired to `PlaybackController.replay_current_play()` which seeks playback to the currently-open play's `start_session_time_ns` and resumes at 1.0x. Plays persist in the `plays` SQLite table with `UNIQUE(session_id, game_subdir, play_number)`. Crash recovery auto-closes any play whose `end_session_time_ns` is NULL via `PlayManager.auto_close_open_plays_for_session` (called from `ApplicationCoordinator._setup_resume_continuation`); auto-closed rows carry `auto_closed_on_crash=TRUE` for forensics. Plays are operator-scoped (one sequence per game across all feeds), not feed-scoped. The current play number renders as `Play #N` on both the playback overlay (`PlaybackOverlayInfo.current_play_number`) and the operator status bar's "Play" row. Phase 8.D writes one `<game>/plays.json` sidecar per game during post-session processing.
-- **`PlaybackController` still leans on the primary feed** (first enabled feed) for some replay paths — `_primary_runtime`, `_primary_feed_id`. True symmetric multi-feed replay is not yet implemented.
-- **Frames that flow through Python** (BGR `MediaFrame` for the synthetic source) are the transitional path — the production target is for these to stay inside GStreamer.
-- **Native preview path (slice 3.A.3 retry).** NATIVE-mode sources (NDI) feed d3d11videosink directly into each `VideoWidget._live_surface` child window — no `appsink → MediaFrame → QImage` hop on the live path. Replay still goes through the existing `SegmentDecoder → display_frame → QLabel` route; `VideoWidget.set_video_surface_visible(enabled, live=...)` flips the QStackedLayout between `_live_surface` (LIVE) and `_frame_label` (REPLAY/PAUSED). `display_frame()` itself auto-flips to QLabel in native mode for the same reason. `[app] force_python_push_preview = true` in `app_settings.toml` is the escape hatch — falls back to the qimage path even for NATIVE sources, useful if d3d11 misbehaves on local hardware.
-- **Per-branch queue policies and saturation health (slice 3.B + 3.C).** The preview branch is leaky-downstream and time-bounded (200ms); the recording branch is non-leaky and time-bounded to one segment duration. `TelemetryHub.register_queue_depth_sampler` runs `PipelineManager.sample_queue_depths` once per log tick; sustained record saturation drives `RecordingState.RECORDING → RECORDING_ERROR` and sustained preview saturation drives `FeedState.LIVE → DEGRADED`. The diagnostics widget shows queue gauges per feed plus a transitional pipeline banner when any feed runs python_push (escalates to a high-contrast warning when `[app] app_mode = "production"` in `app_settings.toml`).
-
-### Layer map
-
-- `app/config/` — `AppSettings` dataclass + TOML loader (legacy `[source]` and new `[[feeds]]`).
-- `app/core/` — coordinator, registry, playback controller, app state, signals, dataclasses (`models.py` defines `MediaFrame`, `AudioChunk`, `SessionPaths`, `Segment`, `PlaybackMode`).
-- `app/media/` — sources (`source_interface`, `source_factory`, `ndi_receiver`, `test_source`), pipeline (`pipeline_manager` — owns ingest tee + splitmuxsink-driven recording), `recording_manager` (just the `RecordingState` machine), output (`output_renderer`, `preview_output`), telemetry/overlay helpers.
-- `app/storage/` — filesystem layout (`file_manager`), SQLite metadata (`metadata_db`, with the `segments` table), session lifecycle (`session_manager`), in-memory segment index (`segment_index`), replay query layer (`segment_replay_store`), startup crash recovery (`session_recovery`).
-- `app/core/session_clock.py` — slice 5.A. Monotonic-anchored `SessionClock` (`now_session_time_ns()`). Each `PipelineManager` captures `session_time` on the first buffer of every segment so `_finalize_pending_segment_locked` can stamp `start/end_session_time_ns` + `pts_to_session_offset_ns` on the `Segment` row. The replay layer queries that read those fields land in 5.B and the `PlaybackController` switch to session-time lands in 5.C.
-- `app/ui/` — `MainWindow` (re-used for both operator and program with flags), `controls_widget`, `multi_feed_video_panel`, `status_bar_widget`, `video_widget`.
-- `tests/` — fast unit tests using stdlib `unittest`. They mock or stub GStreamer where needed; do not require real cameras to run.
+Optional `app_settings.toml` in the working directory configures feeds
+and paths. With `[[feeds]]` rows present, the legacy `[source]` block
+is ignored and at least one feed must have `enabled = true`. See
+`app_settings.toml.example` and `app/config/settings.py`.
 
 ## Working in this codebase
 
-- Do not bypass the per-feed seams. Code that touches recording or ingest should go through `FeedRuntime`, `RecordingManager`, or each feed's `PipelineManager`. Replay queries go through `RecordingSegmentReplayStore`.
-- The `PreviewOutput` / `OutputRenderer` split is intentional: a feed's `PreviewOutput` is its own ingest sink, while operator/program windows render via `MultiFeedOutputRenderer`. Do not collapse them.
-- The synthetic source in `app/media/test_source.py` is the only non-NDI path the app builds. It is the dev fallback for camera-less environments — don't remove it as part of unrelated work.
-- `MediaFrame` payloads are `numpy` BGR images (OpenCV ordering convention). When adding overlays, use `app/media/frame_overlay.py`.
-- For UI changes, run `python main.py` and exercise the relevant transport (start/stop recording, rewind 10s, slow 1/2x, slow 1/4x, jump to live) — type checks won't catch playback regressions.
+- **Don't bypass the per-feed seams.** Code that touches recording or
+  ingest goes through `FeedRuntime`, `RecordingManager`, or each feed's
+  `PipelineManager`. Replay queries go through
+  `RecordingSegmentReplayStore`. See `IMPLEMENTATION.md` §2 for the
+  full list of seams.
+- **The `PreviewOutput` / `OutputRenderer` split is intentional** — a
+  feed's `PreviewOutput` is its own ingest sink, while operator and
+  program windows render via `MultiFeedOutputRenderer`. Don't
+  collapse them.
+- **The synthetic source in `app/media/test_source.py` is the only
+  non-NDI path the app builds.** It is the dev fallback for
+  camera-less environments — don't remove it as part of unrelated work.
+- **`MediaFrame` payloads are `numpy` BGR images** (OpenCV ordering
+  convention). When adding overlays, use `app/media/frame_overlay.py`.
+- **For UI changes, run `python main.py`** and exercise the relevant
+  transport (start/stop recording, rewind 10s, slow 1/2x, slow 1/4x,
+  jump to live, Replay Play). Type checks won't catch playback
+  regressions.
+- **When in doubt about an invariant**, check `IMPLEMENTATION.md`
+  before reading code. Most non-obvious behaviors are documented
+  there with file:line refs.
 
-## Architecture doc vs current code (gaps and contradictions in `docs/r3_app_architecture.md`)
+## Codebase conventions
 
-The doc declares itself "authoritative" but several parts contradict the code as it stands today, and a few are internally inconsistent. Worth flagging when working from it:
-
-**Contradictions with current code (mostly resolved by Phase 4)**
-- §2.4 / §5 / §20 used to forbid JPEG-per-frame replay buffers — slice 4.D removed `app/media/replay_buffer.py` and the rolling JPEG/segment path entirely. The synthetic dev source still pushes frames from Python through an `appsrc` (production NDI ingest goes native in Phase 3.A).
-- §3 / §5.4 / §6.3 require ProRes/DNxHR/MJPEG segments in `.mov`/`.mxf`/`.mkv`/`.ts` for the active recording. Slice 4.A landed MJPEG-in-MKV via `splitmuxsink`; ProRes/DNxHR remain deferred (their encoders ship in `gst-plugins-bad`, which isn't always available on UCRT64).
-- §15 / §10.4 say replay must be unavailable when recording is not active and only completed recording segments are eligible. `RecordingSegmentReplayStore` now enforces both rules; segment-file replay rendering itself lands in slice 4.C.tail.
-- §3 mentions a single "operator playback controller"; the current app correctly runs **two** (`operator_controller` and `program_controller`). The doc's §15.1 and the runtime ownership block in §3.2 are slightly inconsistent on this — code is right, doc text is loose.
-
-**Internal inconsistencies in the doc**
-- Section numbering is broken. After §16 ("Testing and Validation Strategy") the subsections are numbered §17.1/§17.2/§17.3/§17.4, then a new top-level §17 ("AI Coding Assistant Implementation Rules") appears with subsections §18.1/§18.2/§18.3/§18.4, and the next top-level becomes §18 with §17.x subsections nowhere. The numbering needs a pass.
-- §21 references a path `docs/architecture/production-replay-architecture.md` that does not exist in this repo — the actual file is `docs/r3_app_architecture.md`.
-- §1.1 and §3.2 are slightly inconsistent on whether replay is purely from the active recording or also from "instant-replay shortcut" buffers; §3.2 ultimately says "Replay playback reads from the recording store rather than from a feed pipeline branch" — this is the consistent position and the rest of the doc should be read through it.
-- §19 ("Recommended Implementation Defaults") lists `recording segment duration: 4 seconds` and `instant replay shortcuts: 10, 30, 60, 120 seconds`. The current code's `recording_segment_duration_seconds = 4.0` matches the segment cadence; the rewind-shortcut presets are a 4.C.tail concern.
-
-**Gaps (real but unspecified)**
-- No statement on how the per-feed `SessionClock` / PTS map is initialized when a feed joins late versus when a feed reconnects mid-recording. §8.4 says "feed joins/leaves should be represented in the timeline" but does not say where that representation lives (segment metadata? feed timeline table? both?).
-- No spec for what happens to the in-memory replay index across an app restart of an active session. §6.4 says "rebuild in-memory indexes on startup" but §10.4 implies replay is unavailable outside `recording_state == RECORDING` — so the rebuild semantics for a crash-and-resume are undefined.
-- §6.7 plays are operator-scoped (one play sequence per game across all feeds), so they don't depend on segment boundaries — the time range is the truth and segment crossings are handled naturally by the existing replay path. The doc is correct on this point but it's worth knowing the design choice was deliberate, not unspecified.
-- No retention/cleanup policy for `processed/` MP4 deliverables or `quarantine/` segments — only a "do not delete recording media" rule (§6.6).
-- No definition of "finalized session" used by the post-session processor in §3.2 / §18 Phase 8 — the state machine in §10 doesn't include a `FINALIZED` session state.
-
-If you want, I can either prepare a patch to fix the numbering / dead path / contradictions in the doc, or open issues for the gaps. Most of the contradictions are already implicit in the doc's "this is the target, not the current code" framing — they only need to be made explicit at the top.
+- Tests use stdlib `unittest`, not pytest. Match the existing style
+  in `tests/`.
+- Logging via `LOGGER = logging.getLogger(__name__)` per module. No
+  print statements in production code.
+- New SQLite columns/tables: extend `MetadataDb._initialize_schema`,
+  not a separate migration framework. The Phase 7.F migration in
+  `_migrate_segments_unique_constraint_locked` is the model for any
+  destructive migration.
+- New health-event categories: add them where they're emitted, no
+  central registry. The `HealthSeverity` enum is in
+  `app/core/health_events.py`.
+- New state machines: build via the generic `StateMachine[E]` in
+  `app/core/state_machine.py`. The framework rejects illegal
+  transitions and emits an `invalid_transition` health event so
+  bugs surface in the JSONL log.

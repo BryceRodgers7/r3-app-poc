@@ -182,8 +182,6 @@ class FeedPaths:
 
     feed_id: str
     recording_dir: Path
-    rolling_dir: Path
-    clips_dir: Path
     quarantine_dir: Path
 
 
@@ -194,17 +192,17 @@ class SessionPaths:
     session_id: str
     root_dir: Path
     recording_dir: Path
-    rolling_dir: Path
-    clips_dir: Path
     quarantine_dir: Path | None = None
+    logs_dir: Path | None = None
 
     def __post_init__(self) -> None:
-        # Ergonomic default for test fixtures that don't pass an explicit
-        # quarantine_dir: derive `<root>/quarantine`. Production code goes
-        # through `FileManager.create_session_paths` which sets it
-        # explicitly.
+        # Ergonomic defaults for test fixtures that don't pass these
+        # explicitly. Production code goes through
+        # `FileManager.create_session_paths` which sets both.
         if self.quarantine_dir is None:
             self.quarantine_dir = self.root_dir / "quarantine"
+        if self.logs_dir is None:
+            self.logs_dir = self.root_dir / "logs"
 
     def get_feed_paths(self, feed_id: str) -> FeedPaths:
         """Return the per-feed directories used inside the session tree."""
@@ -213,8 +211,6 @@ class SessionPaths:
         return FeedPaths(
             feed_id=safe_feed_id,
             recording_dir=self.recording_dir / safe_feed_id,
-            rolling_dir=self.rolling_dir / safe_feed_id,
-            clips_dir=self.clips_dir / safe_feed_id,
             quarantine_dir=self.quarantine_dir / safe_feed_id,
         )
 

@@ -44,20 +44,18 @@ class FileManager:
         self.ensure_base_directories()
         root_dir = self._settings.sessions_root / session_id
         recording_dir = root_dir / "recording"
-        rolling_dir = root_dir / "rolling"
-        clips_dir = root_dir / "clips"
         quarantine_dir = root_dir / "quarantine"
+        logs_dir = root_dir / "logs"
 
-        for path in (root_dir, recording_dir, rolling_dir, clips_dir):
+        for path in (root_dir, recording_dir, logs_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         return SessionPaths(
             session_id=session_id,
             root_dir=root_dir,
             recording_dir=recording_dir,
-            rolling_dir=rolling_dir,
-            clips_dir=clips_dir,
             quarantine_dir=quarantine_dir,
+            logs_dir=logs_dir,
         )
 
     def session_root(self, session_id: str) -> Path:
@@ -75,16 +73,14 @@ class FileManager:
             session_id=session_id,
             root_dir=root_dir,
             recording_dir=root_dir / "recording",
-            rolling_dir=root_dir / "rolling",
-            clips_dir=root_dir / "clips",
             quarantine_dir=root_dir / "quarantine",
+            logs_dir=root_dir / "logs",
         )
 
     def ensure_feed_paths(self, session_paths: SessionPaths, feed_id: str) -> FeedPaths:
         """Create and return the per-feed folder layout inside a session."""
         feed_paths = session_paths.get_feed_paths(feed_id)
-        for path in (feed_paths.recording_dir, feed_paths.rolling_dir, feed_paths.clips_dir):
-            path.mkdir(parents=True, exist_ok=True)
+        feed_paths.recording_dir.mkdir(parents=True, exist_ok=True)
         return feed_paths
 
     def get_recording_manifest_path(self, session_paths: SessionPaths) -> Path:

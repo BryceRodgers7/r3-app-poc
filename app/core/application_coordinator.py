@@ -312,7 +312,16 @@ class ApplicationCoordinator:
                     start_session_time_ns=play_start_ns,
                 )
         recording_sm.transition_to(RecordingState.RECORDING)
-        if session_sm is not None and session_sm.state == SessionState.CREATED:
+        # Drive the session manifest forward on every Start press, not
+        # just the first. After Stop, the session is in STOPPED; the
+        # second game's Start needs to flip it back to RECORDING so
+        # `session.json` accurately reflects "a game is being recorded
+        # right now" — important for the dirty-detection rule on next
+        # launch and for any external forensic tool reading the manifest.
+        if session_sm is not None and session_sm.state in {
+            SessionState.CREATED,
+            SessionState.STOPPED,
+        }:
             session_sm.transition_to(SessionState.RECORDING)
         self.operator_controller.refresh_recording_state()
         self.program_controller.refresh_recording_state()
@@ -379,8 +388,9 @@ class ApplicationCoordinator:
             session_paths = self._session_manager.start_new_session(
                 self.feed_registry.build_session_label()
             )
+        assert session_paths.logs_dir is not None  # set by SessionPaths.__post_init__
         default_health_log().open(
-            session_paths.root_dir / "logs" / "health_events.jsonl",
+            session_paths.logs_dir / "health_events.jsonl",
             session_paths.session_id,
         )
         self._emit_disk_budget_health_event()

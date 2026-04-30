@@ -42,7 +42,14 @@ _SESSION_TRANSITIONS: dict[SessionState, set[SessionState]] = {
         SessionState.STOPPED,
         SessionState.DIRTY,
     },
+    # `STOPPED → RECORDING` covers the multi-game-per-session flow:
+    # the operator stops game N and presses Start to begin game N+1
+    # within the same session. Without this transition the manifest
+    # would stay at "stopped" while a new game is actively recording,
+    # which is misleading for any external tool reading session.json
+    # mid-run. Per `r3_app_architecture.md` §10.6.
     SessionState.STOPPED: {
+        SessionState.RECORDING,
         SessionState.FINALIZED,
         SessionState.DIRTY,
     },

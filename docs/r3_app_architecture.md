@@ -449,6 +449,8 @@ Optional/testing only:
 
 4. FFV1 / UTVideo, when disk budget and playback support are validated.
 
+> **Currently shipped:** MJPEG-in-MKV only. `recording_codec` and `recording_container` accept other values in TOML but the pipeline only wires the MJPEG/MKV path. ProRes / DNxHR encoders live in `gst-plugins-bad`, which isn't always present on UCRT64; the disk-budget estimator's codec-coefficient table (`app/core/disk_budget.py`) also has only an MJPEG entry today. Codec selection is queued for Phase 11 because hardware acceleration ties into encoder choice — see Phase 11 task list.
+
 Avoid for replay:
 
 - H.264
@@ -480,6 +482,8 @@ Reason:
 - MP4 often requires finalization metadata.
 - Active rolling buffers and crash recovery are harder with MP4.
 - MP4 is suitable for post-session exports, not the active recording path.
+
+> **Currently shipped:** MKV only. The splitmuxsink branch and the on-disk segment naming in `app/media/pipeline_manager.py` are wired specifically for matroskamux. Other values for `[recording] container` are accepted by the TOML loader but would fail at pipeline-build time. `.mov` (the natural ProRes / DNxHR container) is queued alongside Phase 11's codec work — see §5.2 and Phase 11's TODO sub-item (d).
 
 ## 5.4 Long game recording format
 
@@ -560,32 +564,41 @@ base_data_dir = "C:\\SportsReplay"
 
 ## 6.2 Session directory structure
 
-Recommended structure:
-
 ```text
 C:\SportsReplay\
+  metadata.db                    -- shared across every session
   sessions\
-    2026-04-26_18-30-00_GameName\
-      session.json
-      session.sqlite
+    session_001\
+      session.json               -- session-state manifest (§14.2)
       logs\
-      metrics\
+        health_events.jsonl      -- §14.6
       recording\
+        game_001\                -- one subdir per Start/Stop cycle (§6.2.1)
+          feed_001\
+            segment_00000.mkv
+            segment_00001.mkv
+          feed_002\
+            segment_00000.mkv
+        game_002\
+          feed_001\
+            segment_00000.mkv
+      processed\                 -- created by the post-session processor
+        game_001\
+          feed_001.mp4
+          feed_002.mp4
+          plays.json             -- §6.7 / §8.D
+      quarantine\                -- created on demand by the recovery scan
         feed_001\
-          segment_000001.mov
-          segment_000002.mov
-        feed_002\
-          segment_000001.mov
-          segment_000002.mov
-      processed\
-        game\
-          feed_001_game.mp4
-          feed_002_game.mp4
-        play_0001\
-          play_0001_angle1.mp4
-          play_0001_angle2.mp4
-      quarantine\
+          segment_00007.mkv
 ```
+
+### 6.2.1 Per-game recording subdirectory
+
+Each press of "Start game recording" allocates a fresh `game_NNN/` subdirectory under `recording/`. Inside it, every enabled feed gets its own `<feed_id>/segment_NNNNN.mkv` file series. `fragment_index` resets to 0 at the start of each new game; cross-game collisions are impossible because the game folder is part of the path.
+
+The Phase 7.D resume-continuation flow (§11.4 Resume) reuses the crashed game's existing `game_NNN/` instead of allocating `game_(N+1)/`. In that case `find_next_fragment_index` walks the existing folder and picks `max+1` past the pre-crash files, so segment filenames continue monotonically within the game.
+
+Sessions are named `session_NNN` (monotonic per `base_data_dir`); `metadata.db` lives at the base directory level, not inside each session, so the post-session processor can address every session through a single SQLite file.
 
 ## 6.3 Segment metadata
 
@@ -595,7 +608,7 @@ Each segment must have metadata:
 segment_id
 session_id
 feed_id
-segment_type: recording
+fragment_index
 file_path
 codec
 container
@@ -606,8 +619,6 @@ end_session_time_ns
 duration_ns
 start_wall_clock_utc
 end_wall_clock_utc
-first_keyframe_pts_ns
-last_keyframe_pts_ns
 frame_count_estimate
 size_bytes
 state: writing | complete | dirty | corrupt | quarantined
@@ -617,6 +628,8 @@ finalized_at
 ```
 
 Each segment carries its own `pts_to_session_offset_ns`. The feed clock is allowed to jump across a reconnect — a new segment is started with a fresh offset. The feed timeline is therefore not stored as a separate table; it is a runtime view computed from segments (see §14.1).
+
+`first_keyframe_pts_ns` / `last_keyframe_pts_ns` are required only when an inter-frame codec is in use (§5.6). For the intra-frame codecs §5.2 mandates (ProRes, DNxHR, MJPEG) every frame is a keyframe and the keyframe PTS is identical to the segment's `start_pts_ns` / last frame, so the columns add no information; the current MJPEG-only implementation omits them.
 
 ## 6.4 Metadata storage
 
@@ -675,6 +688,8 @@ max_replay_scope = "current_recording"
 completed_segments_only = true
 ```
 
+> **Currently shipped:** the `[replay]` block is not read by the loader (see §13.2). The behaviors it would gate are already correct as hard-coded constants: `requires_recording = true` is enforced unconditionally, `completed_segments_only = true` is enforced by `RecordingSegmentReplayStore` (Phase 7.C lock-in), and the operator UI ships only the **Rewind 10s** shortcut today (the 30 / 60 / 120 buttons listed above are queued — see §15.3).
+
 Rules:
 
 - Replay is unavailable unless recording is active.
@@ -729,6 +744,8 @@ Post-session export:
 ## 6.8 Retention and cleanup
 
 The live recording app **never** deletes anything on disk. Cleanup is a separate, manually invoked operation (a flag on the post-session processor or a dedicated CLI), never an automatic action during a session.
+
+> **Currently shipped:** the "never delete" half is satisfied — no code path in the live app calls `Path.unlink` against recording media; `tests/test_replay_safety_invariants.py` locks this in for the operator transport methods. The manual cleanup tool prescribed below is **not yet implemented**: there is no `[retention]` reader, no `--cleanup-older-than` flag on the post-session processor, and no standalone cleanup CLI. Tracked in §13.2 ("Future config sections") with the deferral rationale; the right tool shape (subcommand of the post-session processor vs. separate CLI) will be picked the first time a deployment generates enough on-disk volume to need it.
 
 Config:
 
@@ -1086,7 +1103,6 @@ Replay states:
 ```text
 REPLAY_UNAVAILABLE_NOT_RECORDING
 LIVE_WHILE_RECORDING
-REPLAY_AVAILABLE
 SEEKING
 REPLAYING
 PAUSED
@@ -1098,9 +1114,10 @@ REPLAY_DEGRADED
 Rules:
 
 - `REPLAY_UNAVAILABLE_NOT_RECORDING` is the replay state whenever recording is not active.
-- `REPLAY_AVAILABLE` means completed recording segments exist in the current active recording and can satisfy at least part of a requested replay range.
 - Replay requests must be rejected when `recording_state != RECORDING`.
 - Replay availability is based on completed segments only, so the UI should expose the latest replayable session time.
+
+> **Storage readiness vs operator state.** Earlier drafts of this doc listed `REPLAY_AVAILABLE` as a separate replay state. Phase 2.C folded it into `LIVE_WHILE_RECORDING` because it described **storage** readiness (does the segment store contain at least one completed segment?), not the operator's view. Storage readiness now lives on `RecordingSegmentReplayStore.is_replay_available` and is surfaced as `UiState.replay_available` for the status bar; the operator is in `LIVE_WHILE_RECORDING` regardless of whether a finalized segment exists yet, and the UI shows "Replay not yet available — first segment finalizing" until one does.
 
 ## 10.5 State transition rules
 
@@ -1127,11 +1144,13 @@ Rules:
 
 The session has its own state machine, separate from the per-recording state machine in §10.3. The session state is what the post-session processor and the recovery flow on next launch read.
 
+A session is one-per-app-run. The `session_NNN` directory is allocated at launch (`FileManager.get_next_session_id`) and holds **every** game the operator records during that run — multiple Start/Stop cycles all live in the same session. This is intentional: the per-game subdir layout (`recording/<game_NNN>/`, see §6.2.1) makes per-game export possible without splitting the SQLite metadata across many small DBs.
+
 ```text
-CREATED         # session folder + sqlite exist, no recording yet
+CREATED         # session folder + manifest exist, no recording yet
 RECORDING       # at least one feed actively recording
-STOPPED         # operator pressed End Game; finalization in progress
-FINALIZED       # all per-feed segments closed, manifest written, sqlite committed
+STOPPED         # operator pressed Stop game recording; another game may follow within the same session
+FINALIZED       # session manager has closed the session (typically at app shutdown)
 DIRTY           # crashed or hard-killed mid-session; not yet recovered or discarded
 ARCHIVED        # post-session processor has produced deliverables
 ```
@@ -1139,20 +1158,24 @@ ARCHIVED        # post-session processor has produced deliverables
 Transitions:
 
 ```text
-CREATED  → RECORDING            (operator starts game recording)
-RECORDING → STOPPED             (operator ends game)
-STOPPED  → FINALIZED            (last segment closed, manifest written) — automatic
+CREATED   → RECORDING           (operator starts a game recording)
+RECORDING → STOPPED             (operator stops the current game)
+STOPPED   → RECORDING           (operator starts another game in the same session — fresh game_NNN/ folder)
+STOPPED   → FINALIZED           (SessionManager.close() runs — typically at app shutdown)
+RECORDING → FINALIZED           (SessionManager.close() runs while a game is still active — graceful-shutdown path)
 RECORDING/STOPPED → DIRTY       (crash or hard-kill; detected on next launch)
-DIRTY    → FINALIZED            (operator chose Resume → finalize completes)
-DIRTY    → CREATED              (operator chose Discard, leaving an empty shell session)
+DIRTY     → FINALIZED           (operator chose Resume → finalize completes)
+DIRTY     → CREATED             (operator chose Discard, leaving an empty shell session)
 FINALIZED → ARCHIVED            (post-session processor success)
 ```
+
+`STOPPED → FINALIZED` is **not** a per-Stop-press automatic transition — `STOPPED` is the legitimate resting state between games within one session. The transition fires only when the session itself closes (today, only via `SessionManager.close()` at app shutdown). A future explicit "End Session" UI button would drive it via the same code path; until that button exists, sessions finalize at process exit.
 
 Rules:
 
 - The post-session processor refuses any session whose state is not `FINALIZED` or `ARCHIVED`.
 - The operator UI must surface session state plainly. "Game ready for export" maps to `FINALIZED`/`ARCHIVED`; "Game in progress" maps to `RECORDING`/`STOPPED`. The volunteer operator must be able to tell at a glance whether it is safe to walk away.
-- The transition `RECORDING/STOPPED → DIRTY` is detected by the absence of a `finalized_at` timestamp on the session row at next launch — there is no separate heartbeat needed.
+- The transition `RECORDING/STOPPED → DIRTY` is detected by the absence of a `finalized_at` timestamp on the session manifest at next launch — there is no separate heartbeat needed.
 - Cleanup (§6.8) refuses any session in `RECORDING`, `STOPPED`, or `DIRTY`.
 
 ---
@@ -1210,13 +1233,14 @@ On application startup, if any session is in state `DIRTY` (see §10.6), the ope
 
 Recovery prompt options:
 
-- **Resume** (default highlighted): scan `recording/{feed_id}/` for incomplete segments, mark partial files `quarantined`, rebuild the in-memory index from completed segments only, continue with new segment numbering, transition the session back into `RECORDING`. Replay coverage during the resumed session uses the surviving completed segments; the gap caused by the crash shows up as missing media (§15.5).
+- **Resume** (default highlighted, **most recent dirty session only**): scan `recording/<game_NNN>/<feed_id>/` for incomplete segments, mark partial files `quarantined`, rebuild the in-memory index from surviving completed/dirty segments, transition the session back into `RECORDING` via `DIRTY → CREATED → RECORDING`. The Phase 7.D continuation logic then reuses the crashed `game_NNN/` folder (rather than allocating `game_(N+1)/`) and rebases the new `SessionClock` past the last pre-crash segment so post-resume `start_session_time_ns` values do not collide with pre-crash ones. Replay coverage during the resumed session includes the surviving pre-crash segments; the gap caused by the crash shows up as missing media (§15.5).
 - **End and finalize**: do not resume recording; close the session into `FINALIZED` so the post-session processor can run against whatever was successfully captured.
 - **Discard**: transition the session to `CREATED` (empty shell), leaving its source segments on disk for retention rules (§6.8) to handle later.
 
 Rules:
 
 - Auto-resume without operator confirmation is forbidden — the cause of the crash (disk full, broken camera, OS update) often persists, and a silent retry loop is worse than a visible prompt.
+- **Resume is offered only on the most recent dirty session.** Older dirty sessions get only End-and-finalize / Discard. Resuming two crashes at once isn't meaningful — only one game folder can be the "currently in progress" target for the next Start press, the per-game replay scope can only filter to one crashed game, and the `SessionClock.rebase` anchor is a single point in time. The dialog iterates dirty sessions in directory-sorted order; only `dirty[-1]` is offered the Resume button. Once Resume is accepted (or all sessions have been resolved), the dialog dismisses.
 - Partial segments are never repaired in-place. Quarantine and move on. Repair tooling, if any, is offline-only.
 - The recovery prompt does not violate the rule "replay unavailable when not RECORDING" (§10.4); the prompt blocks the media UI entirely until a new session state is chosen.
 
@@ -1224,63 +1248,118 @@ Rules:
 
 # 12. Metrics, Logging, and Observability
 
-## 12.1 Required per-feed metrics
+## 12.1 Per-feed metrics — target surface
 
-Track:
+This is the long-term target metric set. The diagnostics widget consumes a subset (the snapshot fields below), supplemented by cross-feed values on `UiState` and per-feed sub-state machines. The full target list is preserved here so future readers can see the eventual surface, not the current one.
+
+### Currently shipped (`FeedMetricsSnapshot`, `app/core/telemetry.py`)
 
 ```text
 feed_id
+display_name
 source_fps
 preview_fps
-program_fps
 recording_fps
-dropped_buffers_preview
-dropped_buffers_program
+dropped_per_sec
+python_frames_per_sec
+pipeline_mode             -- "python_push" | "native"
 queue_depth_preview
 queue_depth_recording
+queue_max_preview
+queue_max_recording
+```
+
+The diagnostics widget renders these directly. `feed_state` is read from each `FeedState` machine alongside the snapshot rather than duplicated into it; replay coverage is rendered cross-feed (`UiState.latest_replayable_session_time_ns` / `replay_available`) because the operator's mental model is "is there replay to scrub?" not "which feed has the most segments."
+
+### Target additions (deferred — no current consumer)
+
+```text
+program_fps
+dropped_buffers_preview
+dropped_buffers_program
 encode_latency_ms
 segment_write_latency_ms
 last_completed_segment_end_time
-latest_replayable_session_time_ns
+latest_replayable_session_time_ns      -- per-feed (today: cross-feed only)
 recording_segments_available_for_replay
-feed_state
+feed_state                             -- in-snapshot (today: parallel lookup)
 ```
 
-## 12.2 Required system metrics
+Per-bucket status:
 
-Track:
+- **`program_fps` / split `dropped_buffers_preview` vs `dropped_buffers_program`** — the operator and program windows render through `MultiFeedOutputRenderer` instances that share the upstream tee. Today the snapshot collapses both into one `preview_fps` / `dropped_per_sec`. Splitting requires per-window-sink instrumentation; deferred until a use case appears (e.g. one window stutters while the other doesn't).
+- **`encode_latency_ms` / `segment_write_latency_ms`** — the underlying data is already collected by `LatencySampler` (Phase 1.D), just keyed globally (`segment_write_video`, etc.) rather than per-feed. Joining requires re-keying as `(feed_id, name)`; deferred until per-feed latency divergence becomes a real diagnostic question.
+- **`last_completed_segment_end_time` / per-feed `latest_replayable_session_time_ns` / `recording_segments_available_for_replay`** — derivable from `SegmentIndex` on demand without storing in the snapshot. The diagnostics widget reads cross-feed values from `UiState` because they match the operator's single-game-at-a-time mental model. Per-feed values would be additive when a multi-feed-aware diagnostics view is built.
+- **`feed_state` in-snapshot** — minor inconvenience only; the parallel lookup works. Adding it would deduplicate one read.
+
+None of these are blocked by missing infrastructure — each is a small additive wiring slice that lands when a consumer needs it.
+
+## 12.2 System metrics — target surface
+
+### Currently shipped
 
 ```text
-disk_write_mb_s
-disk_free_gb
+disk_write_mb_s              -- DiskSampler (Phase 1.C), 5s cadence
+disk_free_gb                 -- DiskSampler
+active_feeds                 -- derivable from FeedRegistry / TelemetryHub
+recording_state              -- RecordingState machine, observable
+replay_state                 -- ReplayState machine, observable (per operator controller)
+```
+
+### Target additions (deferred — Phase 11)
+
+```text
 cpu_percent
 memory_mb
 gpu_encoder_usage_if_available
-active_feeds
-recording_state
-replay_state
-
 ```
 
-## 12.3 Required replay metrics
+These three host-resource metrics have no producer today. Adding them requires:
 
-Track:
+- `cpu_percent` / `memory_mb`: a `psutil` dependency (new — not currently in the project) and a sampler in the telemetry hub.
+- `gpu_encoder_usage_if_available`: vendor-specific querying (NVAPI for NVIDIA, Intel PresentMon, AMD AGS), with graceful fallback when the GPU isn't a recognized vendor or the runtime library isn't installed.
+
+Phase 11 (Hardware Acceleration and Performance Tuning) is the natural home: that phase already measures CPU headroom against the chosen hwaccel encoder path, and the GPU encoder utilization is meaningful only once a specific encoder (NVENC / QuickSync / AMF) has been selected. Until then there is no decision the metric would inform.
+
+## 12.3 Replay metrics — target surface
+
+### Currently shipped
 
 ```text
-replay_request_time
-requested_start_session_time
-requested_end_session_time
-latest_replayable_session_time_ns
-available_replay_duration_seconds
-replay_index_lag_ms
-feeds_available
-feeds_missing
-completed_segments_selected
-replay_read_seek_latency_ms
-time_to_first_frame_ms
-slow_motion_factor
-rejected_not_recording_count
+replay_seek                  -- LatencySampler (Phase 1.D); count / avg / p95 / max
+                                over the trailing window for operator-initiated lookups
+                                (rewind_10_seconds resolves through the replay store).
 ```
+
+### Target additions (deferred — implementation lands when a diagnostic need appears)
+
+The metrics below split cleanly into two groups: **derivable** ones that are already computed for runtime state and just not logged, and **new-instrumentation** ones that would require fresh probes in the playback pipeline.
+
+```text
+# Derivable from existing state (cheap to expose)
+replay_request_time                   -- known at the call site (transport methods)
+requested_start_session_time          -- known at the call site
+requested_end_session_time            -- known at the call site
+latest_replayable_session_time_ns     -- already on UiState (cross-feed)
+available_replay_duration_seconds     -- already on UiState (live_lag_behind_replayable_seconds derives this)
+feeds_available                       -- SegmentIndex.feeds_with_coverage_at(target_session_time_ns)
+feeds_missing                         -- complement of feeds_available
+completed_segments_selected           -- per-feed nearest_frame_location() results
+slow_motion_factor                    -- PlaybackController._playback_rate
+rejected_not_recording_count          -- counter on PlaybackController; gated by ReplayState's
+                                          REPLAY_UNAVAILABLE_NOT_RECORDING transition
+
+# Needs new instrumentation
+replay_index_lag_ms                   -- distance between latest finalized segment row and
+                                          live wall-clock; would diagnose a wedged splitmuxsink
+                                          beyond the existing live_lag_behind_replayable_seconds
+replay_read_seek_latency_ms           -- per-tick SegmentDecoder seek (cv2.VideoCapture.set);
+                                          the existing replay_seek covers store lookup, not decode
+time_to_first_frame_ms                -- wall-clock from operator transport press to first
+                                          rendered frame; currently un-instrumented
+```
+
+None of these are blocked by missing infrastructure — each is an additive logging or counter slice. The reason they aren't shipped is that replay performance in practice has not produced a diagnostic question worth answering. When one appears (e.g. an operator reports a perceptible "click Rewind, see frame" delay), the relevant metrics from this list become a small, focused slice rather than a speculative observability buildout.
 
 ## 12.4 Logging requirements
 
@@ -1312,99 +1391,140 @@ At minimum, provide a debug/diagnostics panel or log output showing:
 
 # 13. Configuration Schema
 
-Use explicit config rather than hardcoding.
+The TOML schema below mirrors what `AppSettings.load`
+(`app/config/settings.py`) actually reads today. Sections that the doc
+once aspired to but the loader does not consume are listed under §13.2
+"Future config sections" with the phase that would land them.
 
-Example TOML:
+## 13.1 Shipped TOML schema
 
 ```toml
 [app]
-mode = "production" # development | production
+# Window titles and identity strings (purely cosmetic).
+app_name              = "Sports Replay POC"
+window_title          = "Sports Replay Control"
+operator_window_title = "Sports Replay Operator"
+program_window_title  = "Sports Replay Program"
+
+# All session media + metadata lives under here.
 base_data_dir = "C:\\SportsReplay"
 
-[session]
-default_name_prefix = "Game"
-auto_create_session = true
+# Phase 3.C — surfaces the python_push transitional banner loudly when
+# any feed is still on the Python push path. "development" hides it.
+app_mode = "development"   # development | production
 
-[media]
-pipeline_mode = "gstreamer_native" # gstreamer_native | python_test
-hardware_acceleration = "auto" # auto | none | nvidia | intel | amd
-default_width = 1920
-default_height = 1080
-default_fps = 30
+# Phase 3.A.3 escape hatch. When true, NATIVE-mode sources still use
+# the legacy appsink → QImage preview path (avoids the d3d11videosink
+# binding bug on misbehaving hardware). Cost: preview stays Python-bound
+# (~720p ceiling). Default off.
+force_python_push_preview = false
 
-[replay]
-enabled = true
-requires_recording = true
-default_instant_replay_seconds = 60
-quick_replay_seconds = [10, 30, 60, 120]
-max_replay_scope = "current_recording"
-completed_segments_only = true
+# Live-preview cap. Raising past 1280×720@30 requires a working native
+# preview path on every enabled feed (see §3.A.3 / §4); the synthetic
+# dev source stays python_push so it caps the rig.
+target_frame_width  = 1280
+target_frame_height = 720
+target_fps          = 30.0
+
+# Audio (per-feed embedded — no master-source mixer). `enable_embedded_audio`
+# is the upper bound; `[recording] audio_enabled` is the recording-side
+# override; Phase 9.C decides per-feed at runtime based on whether the
+# source actually produces audio buffers.
+enable_embedded_audio       = true
+live_audio_monitor_enabled  = true
+audio_sample_rate           = 48000
+audio_channels              = 2
+audio_bitrate               = 128000
+
+# Operator UI button height (touch-screen ergonomics).
+touch_button_height = 72
 
 [recording]
-enabled = true
-segment_duration_seconds = 4
-codec = "prores" # prores | dnxhr | mjpeg
-container = "mov" # mov | mxf | mkv | ts
+# Phase 4 splitmuxsink-driven segmented recording.
+enabled                  = true
+segment_duration_seconds = 4.0
+codec                    = "mjpeg"   # only "mjpeg" wired today; see §5.2
+container                = "mkv"     # only "mkv" wired today; see §5.3
+# Phase 4.F + Phase 9.C. Upper-bound override: false forces video-only
+# regardless of source capability. When true, the runtime detects audio
+# presence per feed and wires the audio_record branch only if buffers flow.
+audio_enabled            = true
+# Phase 7.A. Aggregate disk-write budget in MB/s. Validator at startup
+# compares estimated throughput (feed_count × frame size × fps × codec
+# coefficient) against this number. 200 ≈ conservative SATA SSD; raise
+# for NVMe, lower for spinning disks.
+disk_budget_mb_s         = 200.0
 
-[retention]
-keep_source_segments_days = 14
-keep_processed_exports_days = 90
-keep_quarantine_days = 7
-
-[post_processing]
-enabled = true
-mode = "manual_after_app_shutdown"
-output_container = "mp4"
-long_clip_codec = "h264"
-short_clip_codec = "h264"
-audio_codec = "aac"
-refuse_active_session = true
-
-
-[audio]
-mode = "master" # none | master | per_feed
-master_feed_id = "feed_001"
-include_audio_in_replay = true
-include_audio_in_recording = true
-include_audio_in_exports = false
-
-[preview]
-max_latency_ms = 200
-drop_when_late = true
-
-
-[monitoring]
-metrics_enabled = true
-diagnostics_overlay = true
-log_gstreamer_bus = true
+# Multi-feed configuration (preferred). One [[feeds]] row per camera.
+# Production deployments use kind = "ndi". The synthetic source is the
+# dev-time fallback for camera-less environments.
+[[feeds]]
+feed_id      = "ndi_main"
+display_name = "Main Camera"
+kind         = "ndi"            # ndi | synthetic
+ndi_name     = "HOSTNAME (Camera 1)"
+enabled      = true
 
 [[feeds]]
-id = "feed_001"
-name = "Main Camera"
-kind = "ndi" # ndi | synthetic
-ndi_name = "HOSTNAME (Camera 1)"
-enabled = true
-role = "primary"
+feed_id      = "ndi_angle"
+display_name = "Angle 2"
+kind         = "ndi"
+ndi_name     = "HOSTNAME (Camera 2)"
+enabled      = true
 
-[[feeds]]
-id = "feed_002"
-name = "Angle 2"
-kind = "ndi"
-ndi_name = "HOSTNAME (Camera 2)"
-enabled = true
-role = "secondary"
-
-# Dev-only synthetic fallback (no NDI hardware required). Comment out for prod.
+# Dev-only synthetic feed (no NDI hardware needed). Comment out for prod.
 # [[feeds]]
-# id = "feed_dev"
-# name = "Synthetic Test Pattern"
-# kind = "synthetic"
-# enabled = true
+# feed_id      = "feed_dev"
+# display_name = "Synthetic Test Pattern"
+# kind         = "synthetic"
+# enabled      = true
+
+# Legacy single-feed mode. Used only when no [[feeds]] rows are present.
+# Modern configs should use [[feeds]] above.
+# [source]
+# feed_id      = "feed_main"
+# display_name = "Test Source"
+# kind         = "synthetic"
+# ndi_name     = ""
 ```
 
-Config rules:
+### Loader behavior
 
-- Every feed must have a stable ID.
+- The loader is forgiving on missing keys: every field above has an
+  in-code default, so a `[recording]` block with only `codec = "mjpeg"`
+  works.
+- `kind` accepts only `"ndi"` or `"synthetic"`. Any other value is a hard
+  config error with a migration hint (the legacy `kind = "auto"`
+  specifically calls out Phase 2.5's USB-camera removal).
+- `app_mode` accepts only `"development"` or `"production"`; unknown
+  values raise at load time.
+- When `[[feeds]]` rows are present, the legacy `[source]` block is
+  ignored. At least one feed must have `enabled = true`.
+
+## 13.2 Future config sections (not read today)
+
+These were in earlier drafts of the doc but the loader does not
+consume them. Each is queued behind a phase whose work would land the
+reader at the same time as the behavior the section gates.
+
+| Section | Status | Lands with |
+|---|---|---|
+| `[app] mode` | doc had `mode`, code has `app_mode` (renamed for clarity) | already shipped |
+| `[session] default_name_prefix / auto_create_session` | unimplemented; sessions are always auto-created and named `session_NNN` | no plan to add — naming convention is fixed |
+| `[media] pipeline_mode` | unimplemented; `SourceInterface.pipeline_mode` is hard-coded per source kind | no plan to add — the per-source declaration is the right surface |
+| `[media] hardware_acceleration` | unimplemented | Phase 11 |
+| `[media] default_width / default_height / default_fps` | code reads these from `[app] target_frame_*` instead | doc-only rename |
+| `[replay]` block | unimplemented; `requires_recording = true` is enforced unconditionally, `quick_replay_seconds` is contradicted by the code's single Rewind 10s button | no plan to add — the constants are correct |
+| `[retention]` block | unimplemented; the live recording app never deletes anything (§6.8) | future cleanup CLI / post-session processor flag |
+| `[post_processing]` block | unimplemented; the post-session processor uses hard-coded ffmpeg defaults (`libx264` / `aac` via subprocess) | future Phase-8 follow-up if a deployment needs to override the encoder |
+| `[audio] mode = "master"` and friends | obsoleted by Phase 9's per-feed embedded-audio model. The doc's old master-audio TOML described a workflow that was never built. | n/a — drop from §13 in a future edit |
+| `[preview] max_latency_ms / drop_when_late` | unimplemented; preview queue policy is a hard-coded `leaky=2 / 200ms / 4 buffers` (Phase 3.B) | future tuning slice if hardware testing demands per-deployment tuning |
+| `[monitoring]` block | unimplemented; metrics, diagnostics overlay, and gst bus logging are unconditionally on | no plan to add — there's no use case for turning observability off |
+| `[[feeds]] id / name / role` | doc used `id`/`name`/`role`; code uses `feed_id` / `display_name` and ignores `role` | doc-only rename (see §13.1 above) |
+
+## 13.3 Config rules (still apply)
+
+- Every feed must have a stable `feed_id`.
 - Feed IDs must not depend on device order.
 - Defaults must be explicit.
 - `kind` accepts only `"ndi"` (production) or `"synthetic"` (dev). Any other value is a hard config error.
@@ -1420,93 +1540,76 @@ Minimum durable entities:
 
 ```text
 Session
-Feed
 Segment
-Recording
-PlayMarker
+Play
 ExportArtifact
-
-HealthEvent
-MetricSample
 ```
 
-`FeedTimeline` is **not** a durable entity. It is a runtime-computed view of `(feed_id, [available_intervals])` derived from the `Segment` table on demand (see §8.7). Replay queries operate against `Segment` directly; there is no separate timeline table to keep in sync.
+Notes on entities that are **not** durable tables:
+
+- `FeedTimeline` is a runtime-computed view of `(feed_id, [available_intervals])` derived from the `Segment` table on demand (see §8.7). Replay queries operate against `Segment` directly; there is no separate timeline table to keep in sync.
+- `Feed` per-session state (`first_seen_session_time_ns`, `last_seen_session_time_ns`, `state`) is not persisted. The post-session processor and replay queries derive feed presence from segment rows; in-process feed state lives in the `FeedState` machine (§10.2) and the diagnostics widget. Add a `Feed` table only when a consumer needs cross-run per-feed forensics.
+- `Recording` (the long-form game) is identified by `(session_id, game_subdir)` and is reconstructable from the segment rows that share that pair; no separate row is needed.
+- `HealthEvent` is persisted as append-only JSONL under `<session>/logs/health_events.jsonl` (§14.6 below) rather than SQLite. Move it to SQLite when a consumer needs `resolved_at` semantics or joins against session/feed rows.
+- `MetricSample` is not persisted. Live values flow through `TelemetryHub` and the diagnostics widget; the periodic log lines are the historical trail. Persist samples only if Phase 10/11 introduces a post-game performance review tool.
 
 ## 14.2 Session
 
-Fields:
+The `sessions` SQLite row holds the durable identity:
 
 ```text
-id
-name
-created_at_utc
-started_at_utc
-ended_at_utc
-base_path
-state
-config_snapshot_json
-```
-
-## 14.3 Feed
-
-Fields:
-
-```text
-id
 session_id
-name
-kind
-source_identifier
-role
-state
-first_seen_session_time_ns
-last_seen_session_time_ns
+source_name
+started_at
 ```
 
-## 14.4 Segment
+Operational state (`state`, `created_at`, `finalized_at`) lives in `<session>/session.json`, the manifest the §11.4 recovery flow reads to detect a `DIRTY` session — the absence of `finalized_at` is the dirty marker, so a single source-of-truth file avoids the manifest/SQLite-row consistency problem.
+
+## 14.3 Segment
 
 Fields listed in section 6.3.
 
-## 14.5 Play
+## 14.4 Play
 
 Schema in section 6.7. One row per play; spans are mutually exclusive within a game; `end_session_time_ns` is NULL only on the currently-open play.
 
-## 14.6 ExportArtifact
+## 14.5 ExportArtifact
 
-Fields:
+The post-session processor (Phase 8) emits one row per attempted long-form encode. `(session_id, kind, game_subdir, feed_id)` is the natural key — re-runs use it for idempotent skip-on-success.
 
 ```text
-id
+artifact_id
 session_id
-play_id
-feed_ids
-start_session_time_ns
-end_session_time_ns
+kind                 -- 'long_form' (only kind today)
+game_subdir          -- nullable
+feed_id              -- nullable; populated for per-feed long-form
 output_path
-codec
-container
-state
-error_message
-created_at
+status               -- 'success' | 'failed'
+error_message        -- nullable
+size_bytes           -- nullable, populated on success
+duration_ns          -- nullable, populated on success
 started_at
-completed_at
+finalized_at         -- nullable
 ```
 
-## 14.7 HealthEvent
+Per-play sub-clip exports are intentionally absent (§6.7): the long-form MP4 plus the `plays.json` sidecar covers the consumer use case, and downstream tooling slices when needed.
 
-Fields:
+## 14.6 HealthEvent (JSONL, not SQLite)
+
+One JSON object per line under `<session>/logs/health_events.jsonl`:
 
 ```text
-id
+id                   -- monotonic counter, per-process
 session_id
-feed_id nullable
-severity
+feed_id              -- nullable
+severity             -- 'info' | 'warning' | 'error'
 category
 message
-created_at
-resolved_at
-metadata_json
+created_at           -- UTC ISO-8601
+metadata             -- arbitrary JSON object
 ```
+
+`resolved_at` is reserved for the future SQLite migration; the append-only JSONL log has no resolve step today.
 
 ---
 
@@ -1640,11 +1743,11 @@ Test:
 5. Replay last 60 seconds.
 6. Replay while recording continues.
 7. Program output remains live while operator replays.
-8. Feed disconnect during recording.
-9. Feed reconnect during recording.
-10. Disk slowdown simulation.
-11. Disk full simulation.
-12. App crash during segment write.
+8. **Feed disconnect during recording.** *(Deferred — Phase 10.)*
+9. **Feed reconnect during recording.** *(Deferred — Phase 10.)*
+10. **Disk slowdown simulation.** *(Deferred — Phase 10.)*
+11. **Disk full simulation.** *(Deferred — Phase 10.)*
+12. **App crash during segment write.** *(Deferred — Phase 10. The recovery side, scenario #13, is covered by `tests/test_session_recovery.py` against synthesized dirty fixtures, but no test injects a crash mid-write.)*
 13. Restart and recover session.
 14. Corrupt segment quarantine.
 15. Missing feed during replay.
@@ -1659,6 +1762,8 @@ Test:
 24. Post-session processor writes a `plays.json` sidecar per game whose play boundaries match the in-DB `plays` rows.
 25. "Replay Play" seeks playback to the currently-open play's `start_session_time_ns` and resumes at 1.0x.
 26. The play counter resets to 1 for each new game; "Next Play" advances within a game without skipping numbers; "Stop game recording" closes the currently-open play.
+
+> **Deferred-to-Phase-10 note.** Scenarios #8–#12 cover camera disconnect/reconnect, disk pressure, and crash-during-write. All require either real failure injection (NDI source-side disconnect simulation, disk-pressure tooling) or harness scaffolding (a `_FakeFilesystem` that fails writes after N bytes, a `_FakePipelineManager` that abruptly transitions to `NULL` mid-buffer). They land alongside the Phase 10 hardening work that handles those failure modes in production code; running the tests in advance of the production handling would just lock in the current "no-op on failure" behavior.
 
 ## 16.3 Performance acceptance tests
 
@@ -1852,9 +1957,9 @@ Slices delivered:
 - **2.C — `ReplayState` enforcement (user-visible behavior change).** `ReplayState` enum (§10.4, with `REPLAY_AVAILABLE` folded into `LIVE_WHILE_RECORDING` because it described storage readiness rather than a distinct operator-view state — worth a one-line correction in §10.4). One state machine per operator `PlaybackController`. The transport methods (`pause_playback`, `rewind_10_seconds`, `set_playback_rate`, `jump_to_live`) drive explicit transitions. **The doc's rule from §10.4 / §15.2 is now enforced:** replay actions are rejected when `recording_state != RECORDING`, and a recording-stop mid-replay snaps the operator back to live. The status-bar message *"Replay unavailable: start game recording first."* surfaces the rejection.
 - **2.D — Aggregate `AppState` enum + UI surfacing.** `AppState` (§10.1) is a *derived* enum, not a fifth state machine — `compute_app_state(feed_states, recording_state, replay_state, shutting_down)` aggregates from the four authoritative machines. Precedence (highest first): `SHUTTING_DOWN`, `ERROR`, `REPLAYING`/`PAUSED`/`SLOW_MOTION`, `DEGRADED`, `RECORDING`, `PREVIEWING`, `STARTING`, `IDLE`. `DEGRADED` is intentionally below the operator's active replay states so user-action context is not buried under a side indicator; the diagnostics widget surfaces all four sub-states regardless. `StatusBarWidget` got a top "App State" row; `DiagnosticsWidget` shows per-feed `FeedState` next to FPS + drops/sec, the operator's `ReplayState`, and lifetime counts of `invalid_transitions` / `feed_lost` / `disk_low`.
 
-### Doc fix queued from Phase 2
+### Doc fix queued from Phase 2 — ✅ resolved
 
-§10.4 lists `REPLAY_AVAILABLE` and `LIVE_WHILE_RECORDING` as separate states. In implementation 2.C folded them — `REPLAY_AVAILABLE` describes the storage's readiness, not the operator's view, and giving it a separate operator-state slot was redundant. §10.4 should be tightened to describe `REPLAY_AVAILABLE` as a property of the replay store rather than as a state of the operator's playback session. Tracking, not blocking.
+§10.4 has been updated: `REPLAY_AVAILABLE` is removed from the enum and the section now points at `RecordingSegmentReplayStore.is_replay_available` / `UiState.replay_available` for storage readiness.
 
 ### Was out of scope for Phase 2 (still open)
 
@@ -2570,6 +2675,16 @@ Tasks:
 
 - Add hardware acceleration selection.
 - Add software fallback.
+- **TODO: Add ProRes / DNxHR codec support** (§5.2 deferral). Concretely:
+  (a) detect `gst-plugins-bad` element availability at startup and gate the
+  `[recording] codec` selector accordingly; (b) wire `proresenc` /
+  `avenc_dnxhd` into the splitmuxsink branch alongside the existing `jpegenc`
+  path; (c) add codec coefficients to `_CODEC_RATIO_VS_RAW_RGB` in
+  `app/core/disk_budget.py` so Phase 7.A's startup validator covers them;
+  (d) extend `[recording] container` to accept `mov` (the natural ProRes/DNxHR
+  container) and validate against the chosen codec at load time. This is
+  bundled into Phase 11 because hwaccel encoder paths (NVENC, QuickSync) and
+  codec choice are co-decided.
 - Tune queue sizes.
 - Tune segment duration.
 - Tune encoder settings.
@@ -2581,29 +2696,30 @@ Exit criteria:
 - Primary hardware target passes acceptance test.
 - CPU/GPU/disk metrics are within safe limits.
 - No unbounded memory growth.
+- ProRes / DNxHR ships as a config-selectable codec (or the §5.2 ranking is
+  rewritten to reflect MJPEG-as-final).
 
 ---
 
 # 19. Recommended Implementation Defaults
 
-Use these defaults unless hardware testing proves otherwise:
+Use these defaults unless hardware testing proves otherwise. The "shipped" column shows the current state; the "target" column shows the long-term default.
 
-```text
-recording/replay-source codec: ProRes or DNxHR
-recording/replay-source fallback codec: MJPEG
-recording/replay-source container: MOV or MKV
-recording segment duration: 4 seconds
-in-session replay scope: recording start through latest completed segment while recording is active
-instant replay shortcuts: 10, 30, 60, and 120 seconds
-preview latency target: < 200 ms
-replay seek target: < 500 ms
-audio mode: one master feed
-post-session export: H.264/AAC MP4
-config format: TOML
-metadata DB: SQLite
-hot index: in-memory
-storage: NVMe SSD strongly preferred
-```
+| Setting | Shipped today | Long-term target |
+|---|---|---|
+| Recording / replay-source codec | MJPEG | ProRes or DNxHR (Phase 11; see §5.2) |
+| Recording / replay-source container | MKV | MOV or MKV |
+| Recording segment duration | 4 seconds | 4 seconds |
+| In-session replay scope | recording start through latest finalized segment while recording is active | same |
+| Instant replay shortcuts | Rewind 10s only | 10 / 30 / 60 / 120 seconds (additional shortcuts queued — see §15.3) |
+| Preview latency target | configured queue policy: leaky=2 / 200 ms / 4 buffers | < 200 ms measured |
+| Replay seek target | not formally measured | < 500 ms |
+| Audio mode | per-feed embedded (Phase 9.C dynamic) | per-feed embedded |
+| Post-session export | H.264 / AAC MP4 via ffmpeg subprocess (Phase 8.B) | H.264 / AAC MP4 |
+| Config format | TOML (subset; see §13) | TOML (full schema in §13) |
+| Metadata DB | SQLite | SQLite |
+| Hot index | in-memory | in-memory |
+| Storage | NVMe SSD strongly preferred | NVMe SSD strongly preferred |
 
 ---
 

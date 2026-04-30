@@ -313,9 +313,25 @@ class PipelineManager:
             try:
                 self._rebuild_splitmuxsink_locked()
             except Exception:
+                # ERROR-level + a health event so the symptom
+                # (no segments written for game N+1) lines up with a
+                # visible failure in the operator's diagnostics rather
+                # than a silent exception buried in the log.
                 LOGGER.exception(
-                    "splitmuxsink rebuild failed on re-enable for feed_id=%s",
+                    "splitmuxsink rebuild raised on re-enable for feed_id=%s — "
+                    "subsequent game will record zero segments. Inspect the "
+                    "stack trace and the bus log.",
                     self._recording_feed_id,
+                )
+                record_health_event(
+                    severity=HealthSeverity.ERROR,
+                    category="recording_error",
+                    message=(
+                        f"splitmuxsink rebuild raised on re-enable for "
+                        f"feed_id={self._recording_feed_id}; the next game "
+                        f"will record zero segments."
+                    ),
+                    feed_id=self._recording_feed_id,
                 )
         else:
             # Phase 9.C: first Start (no prior rebuild). If audio has
@@ -1233,12 +1249,22 @@ class PipelineManager:
             or self._Gst is None
         ):
             LOGGER.warning(
-                "rebuild_splitmuxsink: prerequisites missing; skipping rebuild"
+                "rebuild_splitmuxsink: prerequisites missing; skipping rebuild "
+                "(splitmuxsink=%s jpegenc=%s branch=%s pipeline=%s Gst=%s)",
+                self._splitmuxsink is not None,
+                self._record_branch_jpegenc is not None,
+                self._record_branch_name is not None,
+                self._pipeline is not None,
+                self._Gst is not None,
             )
             return
         old = self._splitmuxsink
         jpegenc = self._record_branch_jpegenc
         branch_name = self._record_branch_name
+        LOGGER.info(
+            "rebuild_splitmuxsink: starting for feed_id=%s",
+            self._recording_feed_id,
+        )
         try:
             jpegenc.unlink(old)
         except Exception:
@@ -1248,11 +1274,19 @@ class PipelineManager:
         except Exception:
             LOGGER.debug("rebuild_splitmuxsink: old set_state(NULL) raised", exc_info=True)
         try:
-            self._pipeline.remove(old)
+            removed_ok = self._pipeline.remove(old)
+            LOGGER.info(
+                "rebuild_splitmuxsink: pipeline.remove(old) returned %s",
+                removed_ok,
+            )
         except Exception:
             LOGGER.exception("rebuild_splitmuxsink: pipeline.remove(old) failed")
         new_sink = self._build_splitmuxsink_element(branch_name)
-        self._pipeline.add(new_sink)
+        added_ok = self._pipeline.add(new_sink)
+        LOGGER.info(
+            "rebuild_splitmuxsink: pipeline.add(new) returned %s",
+            added_ok,
+        )
         # Update the splitmuxsink reference now so downstream helpers
         # (`_ensure_audio_record_branch_built_locked` ⇒
         # `_add_audio_record_branch_to_splitmuxsink`) operate on the
@@ -1270,15 +1304,47 @@ class PipelineManager:
         # `_add_audio_record_branch_to_splitmuxsink`). No-op when
         # `_audio_record_encoder` is None (audio never observed).
         self._link_audio_encoder_to_splitmuxsink_locked(new_sink)
-        if not jpegenc.link(new_sink):
+        link_ok = jpegenc.link(new_sink)
+        LOGGER.info(
+            "rebuild_splitmuxsink: jpegenc.link(new) returned %s",
+            link_ok,
+        )
+        if not link_ok:
             raise RuntimeError(
                 "rebuild_splitmuxsink: failed to link jpegenc → new splitmuxsink"
             )
-        new_sink.sync_state_with_parent()
-        LOGGER.info(
-            "splitmuxsink rebuilt for feed_id=%s (fresh format-location callback ready)",
-            self._recording_feed_id,
-        )
+        # `sync_state_with_parent()` returns a `bool`. If False, the
+        # new splitmuxsink failed to enter the parent's state and
+        # would silently never call `format-location` — which is
+        # exactly the symptom of "no MKV files for game 2+". Surface
+        # the return value loudly.
+        sync_ok = new_sink.sync_state_with_parent()
+        if sync_ok:
+            LOGGER.info(
+                "splitmuxsink rebuilt for feed_id=%s "
+                "(sync_state_with_parent returned True; "
+                "fresh format-location callback ready)",
+                self._recording_feed_id,
+            )
+        else:
+            LOGGER.error(
+                "rebuild_splitmuxsink: sync_state_with_parent returned %s for "
+                "feed_id=%s — new splitmuxsink may be stuck in NULL/READY and "
+                "will not write any segments. Inspect the bus log for the "
+                "underlying error.",
+                sync_ok,
+                self._recording_feed_id,
+            )
+            record_health_event(
+                severity=HealthSeverity.ERROR,
+                category="recording_error",
+                message=(
+                    f"splitmuxsink rebuild failed to sync to parent state for "
+                    f"feed_id={self._recording_feed_id}; game N+1 will record "
+                    f"zero segments."
+                ),
+                feed_id=self._recording_feed_id,
+            )
 
     def _on_splitmuxsink_format_location(self, _splitmuxsink: Any, fragment_id: int) -> str:
         """Pick a per-segment filename based on the active recording session.

@@ -184,17 +184,13 @@ class PlaybackControllerTests(unittest.TestCase):
         self._temp_dir = TemporaryDirectory()
         root_dir = Path(self._temp_dir.name) / "session_001"
         recording_dir = root_dir / "recording"
-        rolling_dir = root_dir / "rolling"
-        clips_dir = root_dir / "clips"
-        for path in (root_dir, recording_dir, rolling_dir, clips_dir):
+        for path in (root_dir, recording_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         self.session_paths = SessionPaths(
             session_id="session_001",
             root_dir=root_dir,
             recording_dir=recording_dir,
-            rolling_dir=rolling_dir,
-            clips_dir=clips_dir,
         )
         self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
         fake_source = _FakeSource(self.feed.feed_id)
@@ -553,14 +549,11 @@ class SecondsBehindLiveSmoothnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = TemporaryDirectory()
         root_dir = Path(self._temp_dir.name) / "session_001"
-        for sub in ("recording", "rolling", "clips"):
-            (root_dir / sub).mkdir(parents=True, exist_ok=True)
+        (root_dir / "recording").mkdir(parents=True, exist_ok=True)
         self.session_paths = SessionPaths(
             session_id="session_001",
             root_dir=root_dir,
             recording_dir=root_dir / "recording",
-            rolling_dir=root_dir / "rolling",
-            clips_dir=root_dir / "clips",
         )
         self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
         self.recording_manager = RecordingManager()
@@ -669,14 +662,11 @@ class LatestReplayableSurfaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = TemporaryDirectory()
         root_dir = Path(self._temp_dir.name) / "session_001"
-        for sub in ("recording", "rolling", "clips"):
-            (root_dir / sub).mkdir(parents=True, exist_ok=True)
+        (root_dir / "recording").mkdir(parents=True, exist_ok=True)
         self.session_paths = SessionPaths(
             session_id="session_001",
             root_dir=root_dir,
             recording_dir=root_dir / "recording",
-            rolling_dir=root_dir / "rolling",
-            clips_dir=root_dir / "clips",
         )
         self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
         self.recording_manager = RecordingManager()
@@ -839,16 +829,12 @@ class MultiFeedRenderTests(unittest.TestCase):
         self._temp_dir = TemporaryDirectory()
         root_dir = Path(self._temp_dir.name) / "session_001"
         recording_dir = root_dir / "recording"
-        rolling_dir = root_dir / "rolling"
-        clips_dir = root_dir / "clips"
-        for path in (root_dir, recording_dir, rolling_dir, clips_dir):
+        for path in (root_dir, recording_dir):
             path.mkdir(parents=True, exist_ok=True)
         self.session_paths = SessionPaths(
             session_id="session_001",
             root_dir=root_dir,
             recording_dir=recording_dir,
-            rolling_dir=rolling_dir,
-            clips_dir=clips_dir,
         )
 
         self.feed_a = FeedDefinition(feed_id="ndi_a", display_name="Feed A")

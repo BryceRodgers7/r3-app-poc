@@ -109,16 +109,12 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
 
     def _session_paths(self, root: Path) -> SessionPaths:
         recording_dir = root / "recording"
-        rolling_dir = root / "rolling"
-        clips_dir = root / "clips"
-        for d in (root, recording_dir, rolling_dir, clips_dir):
+        for d in (root, recording_dir):
             d.mkdir(parents=True, exist_ok=True)
         return SessionPaths(
             session_id="session_001",
             root_dir=root,
             recording_dir=recording_dir,
-            rolling_dir=rolling_dir,
-            clips_dir=clips_dir,
         )
 
     def test_path_format_uses_local_counter_not_gst_fragment_id(self) -> None:

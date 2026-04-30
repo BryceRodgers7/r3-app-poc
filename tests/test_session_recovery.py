@@ -60,17 +60,13 @@ def _read_manifest(session_dir: Path) -> dict:
 def _build_session_paths(root: Path, session_id: str) -> SessionPaths:
     session_root = root / session_id
     recording = session_root / "recording"
-    rolling = session_root / "rolling"
-    clips = session_root / "clips"
     quarantine = session_root / "quarantine"
-    for d in (session_root, recording, rolling, clips):
+    for d in (session_root, recording):
         d.mkdir(parents=True, exist_ok=True)
     return SessionPaths(
         session_id=session_id,
         root_dir=session_root,
         recording_dir=recording,
-        rolling_dir=rolling,
-        clips_dir=clips,
         quarantine_dir=quarantine,
     )
 
@@ -627,8 +623,7 @@ class SessionManagerAdoptTests(unittest.TestCase):
             state="dirty",
             finalized_at=None,
         )
-        for sub in ("recording", "rolling", "clips"):
-            (session_dir / sub).mkdir(parents=True, exist_ok=True)
+        (session_dir / "recording").mkdir(parents=True, exist_ok=True)
         db = MetadataDb(settings.metadata_db_path)
         try:
             db.create_session(
@@ -823,16 +818,12 @@ class FormatLocationGameSubdirTests(unittest.TestCase):
 
     def _session_paths(self, root: Path) -> SessionPaths:
         recording = root / "recording"
-        rolling = root / "rolling"
-        clips = root / "clips"
-        for d in (root, recording, rolling, clips):
+        for d in (root, recording):
             d.mkdir(parents=True, exist_ok=True)
         return SessionPaths(
             session_id="session_001",
             root_dir=root,
             recording_dir=recording,
-            rolling_dir=rolling,
-            clips_dir=clips,
         )
 
     def test_path_includes_game_subdir_when_set(self) -> None:

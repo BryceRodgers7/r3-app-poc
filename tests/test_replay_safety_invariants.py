@@ -243,14 +243,11 @@ class TransportMethodsAreReadOnlyTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = TemporaryDirectory()
         root_dir = Path(self._temp_dir.name) / "session_001"
-        for sub in ("recording", "rolling", "clips"):
-            (root_dir / sub).mkdir(parents=True, exist_ok=True)
+        (root_dir / "recording").mkdir(parents=True, exist_ok=True)
         self.session_paths = SessionPaths(
             session_id="session_001",
             root_dir=root_dir,
             recording_dir=root_dir / "recording",
-            rolling_dir=root_dir / "rolling",
-            clips_dir=root_dir / "clips",
         )
         self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
         self.recording_manager = RecordingManager()

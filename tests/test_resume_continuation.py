@@ -104,14 +104,11 @@ class SetupResumeContinuationTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = TemporaryDirectory()
         root = Path(self._temp_dir.name) / "session_001"
-        for sub in ("recording", "rolling", "clips"):
-            (root / sub).mkdir(parents=True, exist_ok=True)
+        (root / "recording").mkdir(parents=True, exist_ok=True)
         self.session_paths = SessionPaths(
             session_id="session_001",
             root_dir=root,
             recording_dir=root / "recording",
-            rolling_dir=root / "rolling",
-            clips_dir=root / "clips",
         )
 
     def tearDown(self) -> None:
@@ -183,8 +180,6 @@ class SetupResumeContinuationTests(unittest.TestCase):
             session_id="session_001",
             root_dir=Path(self._temp_dir.name) / "nonexistent",
             recording_dir=Path(self._temp_dir.name) / "nonexistent" / "recording",
-            rolling_dir=Path(self._temp_dir.name) / "nonexistent" / "rolling",
-            clips_dir=Path(self._temp_dir.name) / "nonexistent" / "clips",
         )
         coord._setup_resume_continuation(bogus)
         self.assertIsNone(coord._resume_continuation)

@@ -88,6 +88,22 @@ class SessionStateTransitionTests(unittest.TestCase):
             sm.transition_to(SessionState.FINALIZED)
             self.assertFalse(sm.transition_to(SessionState.RECORDING))
 
+    def test_stopped_to_recording_for_multi_game_session(self) -> None:
+        # Multi-game-per-session flow: after game 1's Stop the session
+        # is in STOPPED; the operator's next Start must flip the
+        # manifest back to RECORDING so external tooling reading
+        # session.json sees an accurate "in progress" marker.
+        with TemporaryDirectory() as tmp:
+            manifest = SessionManifest(Path(tmp) / SESSION_MANIFEST_FILENAME)
+            sm = make_session_state_machine(session_id="s1", manifest=manifest)
+            sm.transition_to(SessionState.RECORDING)
+            sm.transition_to(SessionState.STOPPED)
+            self.assertTrue(sm.transition_to(SessionState.RECORDING))
+            self.assertEqual(sm.state, SessionState.RECORDING)
+            payload = manifest.read()
+            self.assertEqual(payload["state"], "recording")
+            self.assertIsNone(payload["finalized_at"])
+
 
 class SessionManifestTests(unittest.TestCase):
     def test_atomic_write_via_tmp_file(self) -> None:
