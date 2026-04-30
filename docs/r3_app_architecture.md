@@ -2358,6 +2358,73 @@ Exit criteria:
 - Short play MP4 outputs are created from play metadata.
 - Failed exports are recorded without damaging source media.
 
+### Slices
+
+Phase 8 lands in four slices. 8.A, 8.B, 8.C are independent of any unbuilt feature and can ship now. 8.D depends on the §6.7 operator clip-marker system, which doesn't exist yet — call it out so the dependency is visible, but defer.
+
+**8.A — CLI scaffold + session validation**
+
+- New module: `app/tools/post_session_processor.py`. Standalone entry point: `python -m app.tools.post_session_processor <session_path>`.
+- Reads `<session_path>/session.json`, validates `state == "finalized"`. Refuses every other state (`created`, `recording`, `stopped`, `dirty`, `archived`) with an explicit error message naming what's wrong.
+- File-locks `<session_path>/.processing.lock` for the duration of the run so two concurrent processes can't trample each other.
+- Reads the segments table from the shared `metadata.db` (filter by `session_id`) to produce a *plan* — list of long-form artifacts that would be exported, grouped by `(game_subdir, feed_id)`. `--dry-run` prints the plan; the default also prints it for visibility.
+- No actual encoding yet; 8.A is the gate-and-plan pass.
+- Tests: each invalid `state` rejected with a clear error; valid state accepted; lock acquire / release; plan generation against a synthetic session fixture.
+
+**Out of scope for 8.A:** any encoder logic. 8.A is plumbing.
+
+**8.B — Long-form MP4 export**
+
+- For each `(game_subdir, feed_id)` in the 8.A plan:
+  - Resolve the ordered list of `state="complete"` segments belonging to that game folder + feed.
+  - Build a GStreamer pipeline: `concat → decodebin → x264enc → mp4mux → filesink` (or equivalent ffmpeg subprocess if `gst-plugins-bad` x264enc isn't available on the deployment). MJPEG decode → H.264 encode → MP4 mux. Output goes to `<session_path>/processed/<game_subdir>/<feed_id>.mp4`.
+  - Audio handling: when segments contain audio (post-Phase-9.B will be the common case), pass it through to MP4 via `aacenc` or `avenc_aac`. When audio is absent, mux video-only.
+- Source MKVs stay untouched on disk.
+- Per-artifact progress is logged so a long export shows incremental status.
+- Tests: synthesized MKV fixtures (single 1-frame segments) → verify MP4 output exists, has expected duration via `gst-discoverer-1.0` or ffprobe; verify source files are unmodified.
+
+**Out of scope for 8.B:** GPU-accelerated encoding (NVENC, etc.). Software x264 is fine for a manual post-process; speed matters less than reliability.
+
+**8.C — `ExportArtifact` metadata table**
+
+- New SQLite table in `metadata.db`:
+
+  ```sql
+  CREATE TABLE export_artifacts (
+      id INTEGER PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      kind TEXT NOT NULL,            -- 'long_form' | 'short_play'
+      game_subdir TEXT,              -- 'game_NNN'
+      feed_id TEXT,                  -- nullable for multi-feed clips
+      output_path TEXT NOT NULL,
+      status TEXT NOT NULL,          -- 'success' | 'failed'
+      error_message TEXT,
+      size_bytes INTEGER,
+      duration_ns INTEGER,
+      started_at TEXT NOT NULL,
+      finalized_at TEXT,
+      FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+  );
+  ```
+
+- Schema migration applied by `MetadataDb._initialize_schema` so existing DBs gain the table on first run.
+- 8.B writes one row per attempted artifact: `success` rows include `size_bytes` + `duration_ns`; `failed` rows include `error_message` and the partial output path (if any) for forensics.
+- Re-running the processor against the same session is **idempotent**: 8.B skips artifacts whose `(session_id, kind, game_subdir, feed_id)` already has a `success` row. `--force` re-runs.
+- Tests: schema round-trip (insert / query); idempotent re-run skips successes but retries failures.
+
+**8.D — Short-play MP4 export (deferred)**
+
+- Depends on the §6.7 operator clip-marker system, which is not yet implemented. A `plays` table (or equivalent) needs to exist before 8.D can iterate over plays.
+- When the dependency lands, 8.D adds: for each play `(start_session_time_ns, end_session_time_ns, selected_feed_ids)`, identify the segments overlapping the time range per feed, extract sub-clips via GStreamer's `gnlcomposition` or ffmpeg's `-ss / -to`, mux to MP4 in `<session_path>/processed/plays/<play_id>_<feed_id>.mp4`. ExportArtifact rows use `kind='short_play'`.
+- Phase 8 ships 8.A → 8.B → 8.C without 8.D. The slice spec exists so the integration shape is documented for whoever builds the clip-marker system.
+
+### Phase 8 sequencing notes
+
+- **8.A first.** The validation gate is what keeps the processor from corrupting an active session.
+- **8.C before 8.B.** 8.B writes to 8.C's table; landing the schema first means 8.B is testable end-to-end.
+- **8.D deferred.** Strong dependency on §6.7 (clip markers). Don't block Phase 8 closure on it.
+- **Encoder availability is the only deployment risk.** x264enc is in `gst-plugins-ugly` (license restriction); some UCRT64 distributions don't ship it. The fallback is an ffmpeg subprocess. Detect at startup and surface clearly which path is being used.
+
 ---
 
 ## Phase 9 – Audio Integration
@@ -2373,13 +2440,29 @@ Tasks:
 - Include audio in recording.
 - Include audio in replay if enabled.
 - Include audio in export.
-- Handle missing audio gracefully.
+- Handle missing audio gracefully (replace the Phase 7.E config-flag workaround with dynamic adaptation).
 
 Exit criteria:
 
 - Master audio records correctly.
 - Audio remains aligned during replay.
 - Missing audio does not break video replay.
+- Operator does not have to know whether the source produces audio in advance — pipeline adapts at runtime.
+
+### Slices
+
+**9.A — Master audio source selection** (TBD when phase begins). Pick the canonical audio source (per-feed embedded audio vs. a separate dedicated capture device). Establish PTS-to-session-time mapping for it.
+
+**9.B — Audio in replay + export** (TBD). Currently `splitmuxsink` muxes audio into segment files via the `audio_%u` pad, so segments contain audio whenever the source produced it. 9.B wires that audio through the replay decode path and through Phase 8 export (long-form MP4 with audio).
+
+**9.C — Dynamic no-audio handling** (replaces the Phase 7.E workaround). Today, the audio chain is wired into `splitmuxsink` unconditionally based on `[recording] audio_enabled`. If the source has no audio, splitmuxsink waits indefinitely for audio buffers, the record queue back-pressures the tee, and the live preview freezes. Phase 7.E logs a `category=audio_missing` health event after a 5s grace period so operators get a paper trail in `health_events.jsonl` plus a counter in the diagnostics widget. Phase 9.C makes the pipeline self-healing instead of just warning:
+
+- Defer wiring the audio chain into splitmuxsink until the NDI receiver has emitted a `pad-added: pad='audio'` event (or until a configurable grace period expires).
+- If audio appears: wire the audio chain into splitmuxsink as today; segments are video+audio.
+- If the grace period expires with no audio pad: skip wiring; segments are video-only; emit `audio_missing` (existing 7.E health event) plus an `INFO`-level "recording in video-only mode" log so the operator sees the runtime decision.
+- Dynamic recovery: if audio appears later in the session, the next `_rebuild_splitmuxsink_locked` cycle (next Stop/Start) can pick it up without operator intervention. Mid-game audio re-attach is out of scope — splitmuxsink can't add a sink pad mid-stream.
+
+This eliminates the `audio_enabled = false` config-flag foot-gun: an operator deploying a no-audio NDI sender (Screen Capture, muted mic) doesn't have to know in advance — the pipeline adapts.
 
 ---
 

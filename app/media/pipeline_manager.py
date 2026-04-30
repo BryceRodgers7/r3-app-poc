@@ -19,6 +19,7 @@ import numpy as np
 from datetime import datetime, timezone
 
 from app.core.feed_state import FeedState
+from app.core.health_events import HealthSeverity, record_health_event
 from app.core.models import (
     AudioFormat,
     FrameOverlayInfo,
@@ -209,6 +210,18 @@ class PipelineManager:
                 f"Got codec={self._recording_codec!r} container={self._recording_container!r}. "
                 f"ProRes/DNxHR support is deferred."
             )
+        # Phase 7.E: audio-missing detection. When `recording_audio_enabled`
+        # is True but the source produces no audio buffers, splitmuxsink
+        # waits indefinitely for audio data and the recording queue
+        # back-pressures the tee, freezing the live preview. This is
+        # documented in CLAUDE.md as the "set audio_enabled = false for
+        # no-audio sources" caveat. The probe + grace-timer below logs a
+        # `category=audio_missing` health event after 5s if the audio
+        # chain is wired but no buffer has flowed, so the operator gets
+        # a visible paper trail instead of a silent freeze.
+        self._pipeline_started_monotonic_ns: int | None = None
+        self._audio_record_first_buffer_at_ns: int | None = None
+        self._audio_missing_warned: bool = False
 
     def describe_architecture(self) -> str:
         """Describe the current tee/fan-out architecture."""
@@ -729,6 +742,11 @@ class PipelineManager:
             state_change = pipeline.set_state(Gst.State.PLAYING)
             if state_change == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("Failed to move the GStreamer pipeline to PLAYING.")
+            # Phase 7.E: anchor the audio-missing grace timer. The
+            # _on_record_branch_buffer_probe checks elapsed time vs
+            # this anchor and emits a health event if `recording_audio_enabled`
+            # is True but no audio buffer has arrived after the grace.
+            self._pipeline_started_monotonic_ns = time.monotonic_ns()
 
     def _configure_preview_queue(self, queue: Any, branch_name: str) -> None:
         """Apply the §4.3 preview queue policy.
@@ -1432,7 +1450,73 @@ class PipelineManager:
             return 0  # Gst.PadProbeReturn.OK
         if self._recording_running and self._feed_metrics is not None:
             self._feed_metrics.tick_recording()
+        # Phase 7.E: piggyback the audio-missing grace check on the
+        # video record probe. Cheap (a couple of None comparisons +
+        # one subtraction in the common case).
+        self._maybe_warn_audio_missing()
         return Gst.PadProbeReturn.OK
+
+    def _on_audio_record_buffer_probe(
+        self, _pad: Any, _info: Any, _user: Any
+    ) -> Any:
+        """Phase 7.E: capture the moment the first audio record-branch
+        buffer flowed past opusenc. Used by `_maybe_warn_audio_missing`
+        to differentiate "audio chain wired and producing" from "audio
+        chain wired but source has no audio"."""
+        Gst = self._Gst
+        if Gst is None:
+            return 0
+        if self._audio_record_first_buffer_at_ns is None:
+            self._audio_record_first_buffer_at_ns = time.monotonic_ns()
+        return Gst.PadProbeReturn.OK
+
+    AUDIO_MISSING_GRACE_SECONDS = 5.0
+
+    def _maybe_warn_audio_missing(self) -> None:
+        """Emit a `category=audio_missing` health event once when the
+        recording audio chain is wired but the source produced no audio
+        within the grace window.
+
+        Symptom this catches: with `recording_audio_enabled = true`
+        AND a source that doesn't emit audio (NDI Tools Screen Capture
+        or a sender whose audio stream is muted), splitmuxsink waits
+        for audio buffers indefinitely, the recording queue
+        backpressures the tee, and the live preview freezes. The
+        config-side workaround is `[recording] audio_enabled = false`;
+        Phase 9 will replace this warning with dynamic adaptation.
+
+        Called from the video record-branch buffer probe so the check
+        runs at video-buffer cadence — no separate timer thread.
+        """
+        if self._audio_missing_warned:
+            return
+        if not self._recording_audio_enabled:
+            return
+        if self._audio_record_first_buffer_at_ns is not None:
+            return
+        if self._pipeline_started_monotonic_ns is None:
+            return
+        elapsed_ns = time.monotonic_ns() - self._pipeline_started_monotonic_ns
+        if elapsed_ns < int(self.AUDIO_MISSING_GRACE_SECONDS * 1_000_000_000):
+            return
+        self._audio_missing_warned = True
+        feed_id = self._source.get_feed_id() if self._source is not None else None
+        record_health_event(
+            severity=HealthSeverity.WARNING,
+            category="audio_missing",
+            message=(
+                f"recording_audio_enabled is true but no audio buffer arrived "
+                f"within {self.AUDIO_MISSING_GRACE_SECONDS:.0f}s. The recording "
+                f"queue will back-pressure the tee and the live preview may "
+                f"freeze. Set `[recording] audio_enabled = false` in "
+                f"app_settings.toml if the source has no audio."
+            ),
+            feed_id=feed_id,
+            metadata={
+                "grace_seconds": self.AUDIO_MISSING_GRACE_SECONDS,
+                "elapsed_ns": elapsed_ns,
+            },
+        )
 
     def _build_audio_path_locked(self) -> None:
         assert self._pipeline is not None
@@ -1608,6 +1692,15 @@ class PipelineManager:
             raise RuntimeError(
                 "Failed to link opusenc.src to splitmuxsink.audio_%u"
             )
+        # Phase 7.E: detect "audio chain is wired but source produced
+        # no audio" by capturing the timestamp of the first buffer
+        # leaving opusenc. The grace check in
+        # `_on_record_branch_buffer_probe` reads this field.
+        encoder_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._on_audio_record_buffer_probe,
+            None,
+        )
 
         tee_src_pad = self._request_audio_tee_pad()
         queue_sink_pad = queue.get_static_pad("sink")

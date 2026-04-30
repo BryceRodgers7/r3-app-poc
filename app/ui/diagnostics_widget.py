@@ -170,7 +170,8 @@ class DiagnosticsWidget(QFrame):
             f"feed_lost: {log.category_count('feed_lost')}  "
             f"disk_low: {log.category_count('disk_low')}  "
             f"recording_branch_saturated: "
-            f"{log.category_count('recording_branch_saturated')}"
+            f"{log.category_count('recording_branch_saturated')}  "
+            f"audio_missing: {log.category_count('audio_missing')}"
         )
 
     def _update_replay_lag_label(self) -> None:
