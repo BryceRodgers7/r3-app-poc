@@ -132,7 +132,14 @@ class FrameOverlayInfo:
 
 @dataclass(slots=True, frozen=True)
 class PlaybackOverlayInfo:
-    """Dynamic metadata about the operator's current playback context."""
+    """Dynamic metadata about the operator's current playback context.
+
+    `is_recording` gates overlay visibility — the overlay only renders
+    when a game is actively being recorded. Outside of recording the
+    operator has no transport context worth surfacing (replay is
+    unavailable per §10.4 / §15.2), so showing a static "LIVE" badge
+    just adds visual noise.
+    """
 
     mode: PlaybackMode = PlaybackMode.SOURCE_LOST
     playback_timestamp: float | None = None
@@ -140,6 +147,7 @@ class PlaybackOverlayInfo:
     seconds_behind_live: float = 0.0
     playback_rate: float = 1.0
     status_text: str | None = None
+    is_recording: bool = False
 
 
 @dataclass(slots=True)

@@ -41,7 +41,18 @@ def build_frame_overlay_lines(frame_overlay: FrameOverlayInfo) -> list[str]:
 
 
 def build_playback_overlay_lines(playback_overlay: PlaybackOverlayInfo) -> list[str]:
-    """Build operator-view playback lines for the transient UI overlay."""
+    """Build operator-view playback lines for the transient UI overlay.
+
+    Returns an empty list when recording is not active. The panel's
+    `set_playback_overlay` hides the overlay label when it gets an
+    empty list, so the overlay appears the moment the operator presses
+    "Start game recording" and disappears on Stop. Outside of
+    recording, replay is unavailable (§10.4 / §15.2) and the LIVE
+    badge alone has no actionable meaning, so we hide entirely rather
+    than show a static label.
+    """
+    if not playback_overlay.is_recording:
+        return []
     lines = [playback_overlay.mode.value]
     if playback_overlay.status_text:
         lines.append(playback_overlay.status_text)

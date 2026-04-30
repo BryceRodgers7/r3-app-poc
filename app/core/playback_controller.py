@@ -731,6 +731,7 @@ class PlaybackController:
             seconds_behind_live=self._state.seconds_behind_live,
             playback_rate=self._playback_rate,
             status_text=self._build_overlay_status_locked(),
+            is_recording=self._state.is_recording,
         )
 
     def _build_overlay_status_locked(self) -> str | None:
