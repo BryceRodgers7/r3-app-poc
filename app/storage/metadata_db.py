@@ -2,12 +2,72 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Iterable
 
 from app.core.models import Segment
+
+LOGGER = logging.getLogger(__name__)
+
+
+# Phase 7.F: column list shared between the migration's CREATE and INSERT.
+# Listing columns explicitly (rather than `INSERT INTO ... SELECT *`) means
+# adding a future column to the schema doesn't silently break the migration.
+_SEGMENT_COLUMNS = (
+    "segment_id",
+    "session_id",
+    "feed_id",
+    "fragment_index",
+    "file_path",
+    "codec",
+    "container",
+    "start_pts_ns",
+    "end_pts_ns",
+    "duration_ns",
+    "frame_count_estimate",
+    "size_bytes",
+    "state",
+    "created_at",
+    "finalized_at",
+    "start_session_time_ns",
+    "end_session_time_ns",
+    "pts_to_session_offset_ns",
+    "start_wall_clock_utc",
+    "end_wall_clock_utc",
+)
+
+# Phase 7.F: per-game folder layout (Phase 4.E) plus per-game fragment_index
+# reset (Phase 7.B-ext) means file_path is the natural unique key — splitmuxsink
+# generates a fresh path on each rotation. The previous constraint forbade
+# duplicate (session_id, feed_id, fragment_index) tuples, which broke the
+# moment two games per session shared a fragment_index. The migration in
+# `_migrate_segments_unique_constraint_locked` rewrites pre-Phase-7.F DBs.
+_SEGMENTS_TABLE_BODY = """
+    segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    feed_id TEXT NOT NULL,
+    fragment_index INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    codec TEXT NOT NULL,
+    container TEXT NOT NULL,
+    start_pts_ns INTEGER NOT NULL,
+    end_pts_ns INTEGER NOT NULL,
+    duration_ns INTEGER NOT NULL,
+    frame_count_estimate INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finalized_at TEXT,
+    start_session_time_ns INTEGER,
+    end_session_time_ns INTEGER,
+    pts_to_session_offset_ns INTEGER,
+    start_wall_clock_utc TEXT,
+    end_wall_clock_utc TEXT,
+    UNIQUE(file_path)
+"""
 
 
 class MetadataDb:
@@ -46,38 +106,76 @@ class MetadataDb:
             )
             """
         )
+        # Phase 7.F: migrate any pre-existing segments table from the
+        # legacy UNIQUE(session_id, feed_id, fragment_index) constraint
+        # to the new UNIQUE(file_path) constraint BEFORE the
+        # CREATE TABLE IF NOT EXISTS below — otherwise IF NOT EXISTS
+        # would no-op on the legacy schema and leave the bad
+        # constraint in place.
+        self._migrate_segments_unique_constraint_locked(connection)
         connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS segments (
-                segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                feed_id TEXT NOT NULL,
-                fragment_index INTEGER NOT NULL,
-                file_path TEXT NOT NULL,
-                codec TEXT NOT NULL,
-                container TEXT NOT NULL,
-                start_pts_ns INTEGER NOT NULL,
-                end_pts_ns INTEGER NOT NULL,
-                duration_ns INTEGER NOT NULL,
-                frame_count_estimate INTEGER NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                state TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                finalized_at TEXT,
-                start_session_time_ns INTEGER,
-                end_session_time_ns INTEGER,
-                pts_to_session_offset_ns INTEGER,
-                start_wall_clock_utc TEXT,
-                end_wall_clock_utc TEXT,
-                UNIQUE(session_id, feed_id, fragment_index)
-            )
-            """
+            f"CREATE TABLE IF NOT EXISTS segments ({_SEGMENTS_TABLE_BODY})"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS segments_by_feed_pts "
             "ON segments(session_id, feed_id, start_pts_ns)"
         )
         connection.commit()
+
+    def _migrate_segments_unique_constraint_locked(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Phase 7.F: rewrite the segments table with `UNIQUE(file_path)`.
+
+        Phase 7.B-ext made `fragment_index` reset to 0 each game (per-game
+        folder layout makes filenames unique even with reset indices),
+        but the schema still forbade duplicate
+        `(session_id, feed_id, fragment_index)` tuples. The first
+        multi-game session on the new code would silently drop every
+        segment after the first game's last fragment_index.
+
+        Detection looks for the literal substring of the legacy
+        constraint inside the table's stored CREATE statement. This is
+        good enough — the only way that substring shows up is the
+        legacy schema. Migration uses the standard SQLite
+        rename + recreate + copy + drop dance inside a transaction so
+        a crash mid-migration doesn't leave the DB inconsistent.
+        """
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='segments'"
+        ).fetchone()
+        if row is None:
+            return  # fresh DB; CREATE TABLE below will use the new schema
+        sql_normalized = "".join((row["sql"] or "").lower().split())
+        if "unique(session_id,feed_id,fragment_index)" not in sql_normalized:
+            return  # already on the new schema
+        LOGGER.info(
+            "migrating segments table from legacy UNIQUE constraint "
+            "(Phase 7.F schema fix)"
+        )
+        try:
+            connection.execute("BEGIN")
+            # Drop indexes that reference the old table — they'll be
+            # recreated by `_initialize_schema` after migration completes.
+            connection.execute("DROP INDEX IF EXISTS segments_by_feed_pts")
+            connection.execute(
+                "ALTER TABLE segments RENAME TO segments_legacy_pre_per_game"
+            )
+            connection.execute(
+                f"CREATE TABLE segments ({_SEGMENTS_TABLE_BODY})"
+            )
+            columns_csv = ", ".join(_SEGMENT_COLUMNS)
+            connection.execute(
+                f"INSERT INTO segments ({columns_csv}) "
+                f"SELECT {columns_csv} FROM segments_legacy_pre_per_game"
+            )
+            connection.execute("DROP TABLE segments_legacy_pre_per_game")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        LOGGER.info("segments table migration complete")
 
     def create_session(self, session_id: str, source_name: str, started_at: str) -> None:
         """Insert a session row into the metadata database."""

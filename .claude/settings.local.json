@@ -52,7 +52,19 @@
       "Bash(python -m unittest discover -s tests -p test_replay_safety_invariants.py -v)",
       "Bash(python -m unittest discover -s tests -p test_session_clock.py -v)",
       "Bash(python -m unittest discover -s tests -p test_resume_continuation.py -v)",
-      "Bash(python -m unittest discover -s tests -p test_audio_missing_detection.py -v)"
+      "Bash(python -m unittest discover -s tests -p test_audio_missing_detection.py -v)",
+      "Bash(python -m app.tools.post_session_processor --help)",
+      "Bash(python -m app.tools.post_session_processor c:/SportsReplay/sessions/session_123)",
+      "Bash(python -m app.tools.post_session_processor c:/SportsReplay/sessions/session_118)",
+      "Bash(python -m unittest discover -s tests -p test_post_session_processor.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_post_session_processor.py)",
+      "Bash(python -m unittest discover -s tests -p test_metadata_db_segments.py -v)",
+      "Bash(python -m unittest discover -s tests -p test_metadata_db_segments.py)",
+      "Bash(grep -E \"ok$|FAIL|ERROR\")",
+      "Bash(python -m unittest tests.test_metadata_db_segments.MetadataDbSegmentTests.test_duplicate_fragment_index_allowed_with_distinct_paths)",
+      "Bash(python -m unittest test_metadata_db_segments.MetadataDbSegmentTests.test_duplicate_fragment_index_allowed_with_distinct_paths)",
+      "Bash(python -m unittest discover -s tests -p test_metadata_db_segments.py -k duplicate_fragment_index_allowed -v)",
+      "Bash(python -m unittest discover -s tests -p test_metadata_db_segments.py -k duplicate_fragment_index_allowed)"
     ]
   }
 }
