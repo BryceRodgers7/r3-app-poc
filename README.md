@@ -72,7 +72,7 @@ Options:
 - `--metadata-db PATH` — override DB location (default `<session_path>/../../metadata.db`, i.e. `<base_data_dir>/metadata.db`).
 - `-v` / `--verbose` — DEBUG-level logging.
 
-Phase 8.A/B/C ship long-form MP4 export today. Phase 8.D adds a `<game_NNN>/plays.json` sidecar per game once Phase 7.H lands the `plays` SQLite table (operator-marked play boundaries during recording). The sidecar describes play start times + lengths so downstream tooling can navigate the long-form MP4. There are no short-clip MP4 outputs — that requirement was dropped in favor of the JSON sidecar + long-form MP4 combination. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 7 / 8 sequencing notes for details.
+Phase 8 (✅ shipped end-to-end) produces a long-form MP4 per `(game, feed)` plus a `<game_NNN>/plays.json` sidecar per game describing the operator-marked play boundaries (`play_number`, `start_seconds` game-relative, `length_seconds`). Downstream tooling consumes the JSON to navigate the matching MP4. There are no short-clip MP4 outputs — that requirement was dropped in favor of the JSON sidecar + long-form MP4 combination. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 7 / 8 sequencing notes for details.
 
 - **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed. Production deployments use this exclusively.
 - **`kind = "synthetic"`**: deterministic synthetic test pattern from [app/media/test_source.py](app/media/test_source.py). Dev-only fallback for machines without NDI hardware.
@@ -88,6 +88,8 @@ USB / OpenCV / GStreamer-camera ingest was removed in Phase 2.5; `kind = "auto"`
 - **Rewind 10s** switches the view to buffered content while ingest continues; repeated clicks accumulate. **Jump to live** returns to the newest frame.
 - **Slow 1/2x** and **Slow 1/4x** (operator) adjust replay playback rate only — they do not auto-rewind. Ingest and disk recording are independent of the viewed rate.
 - **Stop game recording** finalizes the in-flight segment (matroskamux trailer is forced via `splitmuxsink.split-now`) and clears all transport overlays back to fresh-startup state. The next Start creates a new `game_NNN` folder and a fresh splitmuxsink instance — no risk of appending to the previous game's last file. **Caveat:** the split-on-stop sequence leaves one short, trailer-less "dud" file at the tail of each game's folder that is not openable in media players. The startup recovery scan quarantines or marks it dirty on the next launch.
+- **Mark plays during recording.** Every moment of a recording belongs to a play (Phase 7.H). Press **Start game recording** → Play #1 opens implicitly. Press **Next Play** to close the current play and open the next; press **Replay Play** to seek playback to the current play's start at 1.0x. Both buttons are greyed out when not recording. The current `Play #N` shows in the playback overlay and the operator status bar's Play row. Plays persist to a SQLite `plays` table, scoped per-game (the counter resets each game).
+- **Audio is dynamic** (Phase 9.C). The audio_record branch is wired into `splitmuxsink` only after a buffer probe sees an audio buffer flow from the source. NDI feeds without an audio stream produce video-only segments without operator intervention. `[recording] audio_enabled = false` is preserved as a manual override for forced video-only.
 
 ## Temporary vs intended to remain
 

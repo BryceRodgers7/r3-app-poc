@@ -2340,16 +2340,16 @@ After 7.D the operator workflow for a crash mid-game becomes: app crashes → re
 
 **Out of scope for 7.D:** post-session UI affordance to replay across all games in a finalized session (that's a separate read-only viewer concern); recovery for sessions that crashed before any segment finalized in the crashed game (continuation falls back to fresh-game allocation).
 
-**7.H — Play markers + Replay Play**
+**7.H — Play markers + Replay Play (✅ shipped)**
 
-The replay model has only had time-bounded rewind so far ("Rewind 10s" stacks 10-second offsets). 7.H adds a play-bounded mode: the operator marks play boundaries during the game with a **"Next Play"** button, and a new **"Replay Play"** transport button seeks to the start of the currently-open play.
+The replay model previously had only time-bounded rewind ("Rewind 10s" stacks 10-second offsets). 7.H added a play-bounded mode: the operator marks play boundaries during the game with the **"Next Play"** button, and the new **"Replay Play"** transport button seeks to the start of the currently-open play.
 
-Implementation lands in four sub-slices:
+Shipped in four sub-slices:
 
-- **7.H.1 — `plays` SQLite table + `PlayManager`.** New table per the §6.7 schema; `UNIQUE(session_id, game_subdir, play_number)`. New `PlayManager` orchestration object owned by `ApplicationCoordinator`. Hooks: `toggle_long_session_recording` Start opens Play #1; `toggle_long_session_recording` Stop closes the current play; the Next Play button advances the boundary. Crash recovery (via the §11.4 recovery scan) auto-closes any open play whose `end_session_time_ns` is NULL using the latest finalized segment's end and sets `auto_closed_on_crash = TRUE`.
-- **7.H.2 — operator UI.** Reuse the existing "Next clip" button slot (currently bound to `advance_short_segments`, a slice 4.D no-op stub). Rebind it to a new `mark_next_play` coordinator method. Re-label to "Next Play". Disable when not RECORDING.
-- **7.H.3 — overlay current-play badge.** `UiState.current_play_number: int | None`, populated by `PlaybackController._update_state_timestamps_locked` from `PlayManager.current_play()`. Render `Play #N` on the playback overlay (alongside LIVE/REPLAY/PAUSED) and on the operator status bar.
-- **7.H.4 — "Replay Play" transport.** New `PlaybackController.replay_current_play()` method. Reads the currently-open play's `start_session_time_ns`, calls into the existing session-time replay path (Phase 5.C), pauses/resumes per the operator's choice. New transport button on the operator panel. Disabled when not RECORDING. No-op when no play is open (defensive — Play #1 should always be open when recording is active).
+- **7.H.1 ✅ — `plays` SQLite table + `PlayManager`.** Table per the §6.7 schema; `UNIQUE(session_id, game_subdir, play_number)`. `PlayManager` (`app/core/play_manager.py`) owns the in-memory currently-open-play pointer and persists boundary transitions. Hooks: `toggle_long_session_recording` Start opens the next play (Play #1 for a fresh game, `max(existing) + 1` on Phase 7.D resume continuation); Stop closes the current play; `coordinator.mark_next_play()` advances the boundary. Crash recovery via `_setup_resume_continuation` calls `auto_close_open_plays_for_session` to close any NULL-end plays at the latest finalized segment's end, flagging `auto_closed_on_crash = TRUE`.
+- **7.H.2 ✅ — operator UI.** "Next clip" button (formerly bound to the no-op `advance_short_segments` stub) renamed to "Next Play" and rebound to `coordinator.mark_next_play`. New `ControlsWidget.set_recording_state(bool)` toggles enabled state. The `advance_short_segments` stub was removed.
+- **7.H.3 ✅ — overlay current-play badge.** `UiState.current_play_number` and `PlaybackOverlayInfo.current_play_number` populated by `PlaybackController._update_state_timestamps_locked` from `PlayManager.current_play_number()`. The playback overlay renders `Play #N` directly under the mode badge; the operator status bar gained a "Play" row.
+- **7.H.4 ✅ — "Replay Play" transport.** `PlaybackController.replay_current_play()` seeks playback to the currently-open play's `start_session_time_ns` (clamped defensively to the per-game replay scope's earliest), transitions the replay state machine through `SEEKING → REPLAYING`, and resumes at 1.0x. New "Replay Play" button on the operator controls panel; same recording-state gating as Next Play.
 
 Tests:
 
@@ -2399,9 +2399,9 @@ Exit criteria:
 
 ### Slices
 
-Phase 8 lands in three slices.
+Phase 8 ✅ shipped in four slices.
 
-**8.A — CLI scaffold + session validation**
+**8.A ✅ — CLI scaffold + session validation**
 
 - New module: `app/tools/post_session_processor.py`. Standalone entry point: `python -m app.tools.post_session_processor <session_path>`.
 - Reads `<session_path>/session.json`, validates `state == "finalized"`. Refuses every other state (`created`, `recording`, `stopped`, `dirty`, `archived`) with an explicit error message naming what's wrong.
@@ -2412,7 +2412,7 @@ Phase 8 lands in three slices.
 
 **Out of scope for 8.A:** any encoder logic. 8.A is plumbing.
 
-**8.B — Long-form MP4 export**
+**8.B ✅ — Long-form MP4 export**
 
 - For each `(game_subdir, feed_id)` in the 8.A plan:
   - Resolve the ordered list of `state="complete"` segments belonging to that game folder + feed.
@@ -2422,9 +2422,9 @@ Phase 8 lands in three slices.
 - Per-artifact progress is logged so a long export shows incremental status.
 - Tests: synthesized MKV fixtures (single 1-frame segments) → verify MP4 output exists, has expected duration via `gst-discoverer-1.0` or ffprobe; verify source files are unmodified.
 
-**Out of scope for 8.B:** GPU-accelerated encoding (NVENC, etc.). Software x264 is fine for a manual post-process; speed matters less than reliability.
+**Out of scope for 8.B:** GPU-accelerated encoding (NVENC, etc.). Software x264 is fine for a manual post-process; speed matters less than reliability. As shipped, 8.B uses an ffmpeg subprocess (`-f concat -safe 0 -i list.txt -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k`) — the GStreamer pipeline alternative was deferred since ffmpeg is universally available on MSYS2 UCRT64 via `pacman -S mingw-w64-ucrt-x86_64-ffmpeg`.
 
-**8.C — `ExportArtifact` metadata table**
+**8.C ✅ — `ExportArtifact` metadata table**
 
 - New SQLite table in `metadata.db`:
 
@@ -2451,17 +2451,17 @@ Phase 8 lands in three slices.
 - Re-running the processor against the same session is **idempotent**: 8.B skips artifacts whose `(session_id, kind, game_subdir, feed_id)` already has a `success` row. `--force` re-runs.
 - Tests: schema round-trip (insert / query); idempotent re-run skips successes but retries failures.
 
-**8.D — `plays.json` sidecar per game**
+**8.D ✅ — `plays.json` sidecar per game**
 
-- Depends on Phase 7.H (which lands the `plays` SQLite table). Without that table 8.D has nothing to read; with it, 8.D is a small "iterate plays for game N, render JSON" pass alongside the long-form MP4 emit in 8.B.
-- For each `game_subdir` whose long-form MP4(s) succeeded in 8.B (or unconditionally — implementation detail), query `plays` for that game, render `<session_path>/processed/<game_subdir>/plays.json`:
+- Depended on Phase 7.H landing the `plays` SQLite table; both shipped together.
+- For each `game_subdir` in the long-form export plan (independent of MP4 encode success — the sidecar is useful forensically even on partial-failure runs), `app/tools/plays_json_export.py` queries `db.plays_for_game(...)`, renders `<session_path>/processed/<game_subdir>/plays.json`:
 
   ```json
   {
     "session_id": "session_NNN",
     "game_subdir": "game_NNN",
-    "game_start_session_time_ns": 0,
-    "game_duration_seconds": 217.4,
+    "play_count": 2,
+    "game_duration_seconds": 7.7,
     "plays": [
       { "play_number": 1, "start_seconds": 0.0, "length_seconds": 4.5 },
       { "play_number": 2, "start_seconds": 4.5, "length_seconds": 3.2 }
@@ -2469,18 +2469,20 @@ Phase 8 lands in three slices.
   }
   ```
 
-- `start_seconds` is **game-relative** (seconds since the game's first segment, not since the session). Editors and scoring tools consume this directly to seek inside the matching `<feed>.mp4`. `length_seconds` is `(end_session_time_ns - start_session_time_ns) / 1e9` for the closed plays. The currently-open play is excluded from the JSON of an active game; for a finalized game, every play is closed (the operator's "Stop game recording" closes the last one).
-- One JSON per game (not per feed) because plays are operator-scoped.
-- Tests: shape lock-in against a synthetic `plays` fixture; multi-game session writes one JSON per game; an empty `plays` table writes a JSON with `"plays": []`; auto-closed-on-crash plays are included normally (the JSON doesn't expose the `auto_closed_on_crash` flag).
+- `start_seconds` is **game-relative** (zero is the first play's start). `length_seconds` is the play's duration. Open plays (`end_session_time_ns is None`) are excluded with a warning — by the time the post-processor runs the session must be finalized, so every play should be closed; an open play is a sign of a recovery edge case.
+- One JSON per game (not per feed) because plays are operator-scoped. `auto_closed_on_crash` is not surfaced in the JSON — consumers don't need to know.
+- Tests in `tests/test_plays_json_export.py` lock the shape, the empty-plays case, the open-play exclusion, and idempotent rewrite behavior.
 
 **Out of scope for 8.D:** per-play sub-clip MP4s. The decision (per §6.7) is that the JSON sidecar plus the long-form MP4 covers the consumer use case; downstream tooling handles slicing if needed.
 
 ### Phase 8 sequencing notes
 
-- **8.A first.** The validation gate is what keeps the processor from corrupting an active session.
-- **8.C before 8.B.** 8.B writes to 8.C's table; landing the schema first means 8.B is testable end-to-end.
-- **8.D depends on 7.H.** The `plays` table is built in Phase 7.H; without it the sidecar has nothing to render. 8.A/8.B/8.C ship without 8.D — the long-form MP4s are still useful on their own, the sidecar joins later.
-- **Encoder availability is the only deployment risk.** x264enc is in `gst-plugins-ugly` (license restriction); some UCRT64 distributions don't ship it. The fallback is an ffmpeg subprocess. Detect at startup and surface clearly which path is being used.
+Historical (all shipped):
+
+- **8.A landed first.** The validation gate kept the processor from corrupting an active session before the encoder was wired.
+- **8.C landed alongside / just before 8.B.** 8.B writes to 8.C's `export_artifacts` table; the schema needed to exist for 8.B to be testable end-to-end.
+- **8.D landed after 7.H.1.** The `plays` SQLite table that the sidecar reads only existed once 7.H.1 shipped, so 8.D was deferred until then.
+- **Encoder shipped is ffmpeg subprocess**, not GStreamer. The deployment dependency is `pacman -S mingw-w64-ucrt-x86_64-ffmpeg` on MSYS2 UCRT64 (or any equivalent ffmpeg install on PATH). `--ffmpeg-path` overrides the binary location.
 
 ---
 
