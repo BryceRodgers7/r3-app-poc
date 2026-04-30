@@ -314,20 +314,6 @@ class ApplicationCoordinator:
         self.program_controller.refresh_recording_state()
         self.operator_controller.signals.status_message.emit("Game recording started.")
 
-    def advance_short_segments(self) -> None:
-        """Phase 7.H.2 will rebind the operator's "Next clip" button to
-        `mark_next_play` and rename to "Next Play". Until that slice
-        ships, this remains a no-op stub that emits a status hint.
-        """
-        if not self._recording_manager.is_any_recording():
-            self.operator_controller.signals.status_message.emit(
-                "Start game recording before marking a play boundary."
-            )
-            return
-        self.operator_controller.signals.status_message.emit(
-            "(stub — Phase 7.H.2 will wire this button to mark_next_play)"
-        )
-
     def mark_next_play(self) -> None:
         """Close the currently-open play and open the next one (Phase 7.H.1).
 

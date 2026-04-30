@@ -15,7 +15,9 @@ class ControlsWidget(QWidget):
     half_speed_requested = Signal()
     quarter_speed_requested = Signal()
     long_recording_toggle_requested = Signal()
-    short_segment_advance_requested = Signal()
+    # Phase 7.H.2: was `short_segment_advance_requested` (a slice 4.D
+    # no-op stub). Now wired to `coordinator.mark_next_play`.
+    next_play_requested = Signal()
 
     def __init__(self, button_height: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -25,7 +27,8 @@ class ControlsWidget(QWidget):
         self.quarter_speed_button = QPushButton("Slow 1/4x", self)
         self.live_button = QPushButton("Jump to Live", self)
         self.long_recording_button = QPushButton("Start game recording", self)
-        self.next_clip_button = QPushButton("Next clip", self)
+        # Phase 7.H.2: rebound from "Next clip" → "Next Play".
+        self.next_play_button = QPushButton("Next Play", self)
 
         for button in (
             self.pause_button,
@@ -34,7 +37,7 @@ class ControlsWidget(QWidget):
             self.quarter_speed_button,
             self.live_button,
             self.long_recording_button,
-            self.next_clip_button,
+            self.next_play_button,
         ):
             button.setMinimumHeight(button_height)
             button.setStyleSheet("font-size: 20px; font-weight: 600; padding: 12px 18px;")
@@ -48,7 +51,7 @@ class ControlsWidget(QWidget):
         layout.addWidget(self.quarter_speed_button)
         layout.addWidget(self.live_button)
         layout.addWidget(self.long_recording_button)
-        layout.addWidget(self.next_clip_button)
+        layout.addWidget(self.next_play_button)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
         self.rewind_button.clicked.connect(self.rewind_requested.emit)
@@ -56,6 +59,16 @@ class ControlsWidget(QWidget):
         self.quarter_speed_button.clicked.connect(self.quarter_speed_requested.emit)
         self.live_button.clicked.connect(self.live_requested.emit)
         self.long_recording_button.clicked.connect(self.long_recording_toggle_requested.emit)
-        self.next_clip_button.clicked.connect(self.short_segment_advance_requested.emit)
+        self.next_play_button.clicked.connect(self.next_play_requested.emit)
 
-        self.next_clip_button.setEnabled(False)
+        self.next_play_button.setEnabled(False)
+
+    def set_recording_state(self, is_recording: bool) -> None:
+        """Enable/disable the Next Play button to track the recording state.
+
+        Phase 7.H.2: every moment of a recording belongs to a play, so
+        marking a play boundary only makes sense while recording is
+        active. Outside of recording (between games or before any
+        game) there is no current play to advance.
+        """
+        self.next_play_button.setEnabled(is_recording)

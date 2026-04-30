@@ -79,7 +79,12 @@
       "Bash(python -m unittest discover -s tests -p test_recording_settings.py)",
       "Bash(python -m unittest discover -s tests -p test_audio_dynamic_wiring.py -v)",
       "Bash(python -m unittest discover -s tests -p test_resume_continuation.py)",
-      "Bash(python -m unittest discover -s tests -p test_play_manager.py)"
+      "Bash(python -m unittest discover -s tests -p test_play_manager.py)",
+      "Bash(python -m unittest discover -s tests -p test_next_play_button.py)",
+      "Bash(python -m unittest discover -s tests -p test_next_play_button.py -v)",
+      "Bash(timeout 30 python -m unittest tests.test_next_play_button.CoordinatorMarkNextPlayWiringTests)",
+      "Bash(timeout 30 python -c ' *)",
+      "Bash(timeout 15 python -c ' *)"
     ]
   }
 }

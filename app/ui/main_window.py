@@ -130,8 +130,8 @@ class MainWindow(QMainWindow):
                 self.controls_widget.long_recording_toggle_requested.connect(
                     self._application_coordinator.toggle_long_session_recording
                 )
-                self.controls_widget.short_segment_advance_requested.connect(
-                    self._application_coordinator.advance_short_segments
+                self.controls_widget.next_play_requested.connect(
+                    self._application_coordinator.mark_next_play
                 )
         self._controller.signals.state_changed.connect(self._render_state)
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
@@ -143,6 +143,12 @@ class MainWindow(QMainWindow):
                 self._application_coordinator.get_app_state().value,
                 self._application_coordinator._recording_manager.recording_state.state.value,
             )
+        # Phase 7.H.2: Next Play button is only meaningful while
+        # recording — outside RECORDING there's no current play to
+        # advance. `controls_widget` is None on the program-live-only
+        # MainWindow so guard the call.
+        if self.controls_widget is not None:
+            self.controls_widget.set_recording_state(state.is_recording)
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,
             PlaybackMode.PAUSED,
@@ -159,7 +165,8 @@ class MainWindow(QMainWindow):
             self.video_panel.set_global_placeholder(placeholder_text)
 
         if self.controls_widget is not None:
-            self.controls_widget.next_clip_button.setEnabled(state.is_recording)
+            # Next Play button enable/disable is handled by the
+            # `set_recording_state` call earlier in this method.
             self.controls_widget.long_recording_button.setText(
                 "Stop game recording" if state.is_recording else "Start game recording"
             )
