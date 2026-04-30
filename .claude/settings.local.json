@@ -86,7 +86,8 @@
       "Bash(timeout 30 python -c ' *)",
       "Bash(timeout 15 python -c ' *)",
       "Bash(python -m unittest discover -s tests -p test_playback_overlay_visibility.py)",
-      "Bash(python -m unittest discover -s tests -p test_play_badge.py)"
+      "Bash(python -m unittest discover -s tests -p test_play_badge.py)",
+      "Bash(python -m unittest discover -s tests -p test_replay_current_play.py)"
     ]
   }
 }

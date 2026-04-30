@@ -217,6 +217,54 @@ class PlaybackController:
         self._render_at_session_time_ns(target_session_time_ns)
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
+    def replay_current_play(self) -> None:
+        """Phase 7.H.4: seek to the start of the currently-open play.
+
+        Operator's "Replay Play" button. The currently-open play's
+        `start_session_time_ns` is the seek target — playback resumes
+        at 1.0x from there. To go further back, the operator stacks
+        Rewind 10s clicks.
+
+        No-op when:
+          - this is the live-only program output
+          - replay isn't available (recording not active)
+          - no PlayManager is attached (older test paths)
+          - no play is currently open (defensive — Play #1 should
+            always be open when recording is active)
+        """
+        if self._live_only:
+            self._emit_state("This output is locked to live.")
+            return
+        if not self._replay_actions_allowed():
+            self._emit_state("Replay unavailable: start game recording first.")
+            return
+        if self._play_manager is None:
+            return
+        current = self._play_manager.current_play()
+        if current is None:
+            self._emit_state("No play is currently open.")
+            return
+        target_session_time_ns = current.start_session_time_ns
+        # Defensive clamp to the per-game replay scope's earliest, in
+        # case the play marker drifted slightly before the first
+        # finalized segment of the game (Phase 5.C / §8.6.1 handles
+        # the freeze-frame fallback if we end up before any coverage).
+        earliest, _ = self._replay_store.available_session_time_range()
+        if earliest is not None and target_session_time_ns < earliest:
+            target_session_time_ns = earliest
+        with self._lock:
+            assert self.replay_state is not None
+            self.replay_state.transition_to(ReplayState.SEEKING)
+            self.replay_state.transition_to(ReplayState.REPLAYING)
+            self._playback_session_time_ns = target_session_time_ns
+            self._playback_rate = 1.0
+            self._state.current_playback_mode = PlaybackMode.REPLAY
+            self._state.error_message = None
+            self._start_replay_clock_locked(target_session_time_ns)
+            self._update_state_timestamps_locked()
+        self._render_at_session_time_ns(target_session_time_ns)
+        self._emit_state(f"Replaying Play #{current.play_number}")
+
     def jump_to_live(self) -> None:
         """Return the viewed output to the live edge."""
         with self._lock:

@@ -126,6 +126,9 @@ class MainWindow(QMainWindow):
                 lambda: self._controller.set_playback_rate(0.25)
             )
             self.controls_widget.live_requested.connect(self._controller.jump_to_live)
+            self.controls_widget.replay_current_play_requested.connect(
+                self._controller.replay_current_play
+            )
             if self._application_coordinator is not None:
                 self.controls_widget.long_recording_toggle_requested.connect(
                     self._application_coordinator.toggle_long_session_recording
