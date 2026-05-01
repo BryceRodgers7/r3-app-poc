@@ -41,8 +41,7 @@ Examples (Windows / Git Bash):
 
 ```
 # Default — print plan, encode each (game, feed) to <session>/processed/<game>/<feed>.mp4
-python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118 \
-    --ffmpeg-path C:/msys64/ucrt64/bin/ffmpeg.exe
+python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118 --ffmpeg-path C:/msys64/ucrt64/bin/ffmpeg.exe
 
 # Plan only, no encoding
 python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118 --dry-run
