@@ -98,7 +98,10 @@
       "Bash(python -m unittest discover -s tests -k \"rebuild_unlinks_audio\")",
       "Read(//c/SportsReplay/sessions/session_147/recording/**)",
       "Bash(python -m unittest discover -s tests -k \"name_collision\")",
-      "Bash(python -m unittest discover -s tests -k \"AudioRecordBranchName\" -v)"
+      "Bash(python -m unittest discover -s tests -k \"AudioRecordBranchName\" -v)",
+      "Bash(python -m unittest discover -s tests -k \"avoid_negative\")",
+      "Bash(/c/msys64/ucrt64/bin/ffprobe.exe *)",
+      "Bash(python -m unittest discover -s tests -k \"AudioMuxBranchFlush\")"
     ]
   }
 }

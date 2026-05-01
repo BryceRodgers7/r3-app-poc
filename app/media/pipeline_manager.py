@@ -436,6 +436,36 @@ class PipelineManager:
                     "splitmuxsink NULL transition failed on disable for feed_id=%s",
                     self._recording_feed_id,
                 )
+
+        # 6. Flush the audio mux-branch so no opus packet survives the
+        # gap between games.
+        #
+        # When the audio_record_mux_valve closed in step 3, opusenc was
+        # likely mid-window. It produced ONE final packet from the
+        # partially-encoded data — and that packet then got stranded
+        # between encoder.src and the (now-NULL/removed) old
+        # splitmuxsink's audio_%u pad. When the next game's rebuild
+        # re-links encoder.src to the new splitmuxsink, that stranded
+        # packet flows through FIRST, carrying the previous game's PTS
+        # (~24s when game 2 starts at ~39s, in a typical case).
+        #
+        # In the post-processed MP4 with `-avoid_negative_ts make_zero`,
+        # ffmpeg's per-stream timestamp shift is computed from the
+        # smallest PTS (the stale audio packet) — pushing video by the
+        # gap-between-games (~15s) past the audio's t=0. The user sees
+        # the new game's MP4 timeline starting with ~15s of audio
+        # before any video appears.
+        #
+        # FLUSH_START / FLUSH_STOP events propagate downstream from the
+        # mux_queue's sink pad through valve / convert / resample /
+        # encoder, dropping any pending buffer and clearing the
+        # encoder's internal window state. They pass through the valve
+        # regardless of `drop` setting (events bypass the drop filter).
+        # After flushing, the mux-branch holds no stale state; the next
+        # game's first audio packet has the new game's PTS, aligned
+        # with the new game's first video frame.
+        self._flush_audio_mux_branch_locked()
+
         self._recording_was_disabled = True
         LOGGER.info(
             "Recording stopped for feed_id=%s",
@@ -1948,6 +1978,57 @@ class PipelineManager:
             LOGGER.exception(
                 "Phase 9.C: late-build of audio_record branch failed; "
                 "this game will record video-only"
+            )
+
+    def _flush_audio_mux_branch_locked(self) -> None:
+        """Drop any pending buffers and encoder window state in the
+        audio_record_mux chain.
+
+        Called from `disable_file_recording` after the audio valve
+        closes, so the next game starts with a clean chain. Events are
+        sent on the head queue's SINK pad — they propagate downstream
+        through valve / audioconvert / audioresample / opusenc, dropping
+        pending data at every stage. Flush events pass through valves
+        regardless of `drop` setting, so this works even though the
+        valve was just closed.
+
+        No-op when:
+        - The audio mux chain was never built (video-only source, or
+          `[recording] audio_enabled = false`).
+        - The pipeline isn't constructed yet (defensive — shouldn't
+          happen at disable time).
+        """
+        if (
+            self._audio_record_encoder is None
+            or self._pipeline is None
+            or self._Gst is None
+        ):
+            return
+        Gst = self._Gst
+        head_queue = self._pipeline.get_by_name("audio_record_mux_queue")
+        if head_queue is None:
+            LOGGER.warning(
+                "flush_audio_mux: audio_record_mux_queue not found; "
+                "stale opus packets may carry into the next game"
+            )
+            return
+        sink_pad = head_queue.get_static_pad("sink")
+        if sink_pad is None:
+            return
+        try:
+            sink_pad.send_event(Gst.Event.new_flush_start())
+            # `reset_time=False` keeps the running clock; we don't want
+            # the pipeline's running-time to reset just because we
+            # flushed an internal branch.
+            sink_pad.send_event(Gst.Event.new_flush_stop(False))
+            LOGGER.info(
+                "audio_record_mux chain flushed for feed_id=%s",
+                self._recording_feed_id,
+            )
+        except Exception:
+            LOGGER.exception(
+                "audio_record_mux flush raised for feed_id=%s",
+                self._recording_feed_id,
             )
 
     def _link_audio_encoder_to_splitmuxsink_locked(

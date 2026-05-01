@@ -119,6 +119,23 @@ class FfmpegArgsTests(unittest.TestCase):
         idx = args.index("-i")
         self.assertEqual(args[idx + 1], str(concat_path))
 
+    def test_args_include_avoid_negative_ts_make_zero(self) -> None:
+        # Bug regression (post-session-147 follow-up): MP4 outputs for
+        # games beyond the first within a single app run must start at
+        # timestamp 0. Each `recording/<game_NNN>/` subtree's segment
+        # files inherit PTS from the GStreamer pipeline's running
+        # clock, which keeps ticking across Stop/Start cycles. Without
+        # `-avoid_negative_ts make_zero` the encoded MP4 starts at
+        # whatever PTS game N's first segment has (e.g. 0:42 if game 1
+        # ran for 42 seconds), and players show the timeline offset.
+        args = self.exporter._build_ffmpeg_args(
+            Path("/tmp/concat.txt"),
+            Path("/tmp/out.mp4"),
+        )
+        self.assertIn("-avoid_negative_ts", args)
+        idx = args.index("-avoid_negative_ts")
+        self.assertEqual(args[idx + 1], "make_zero")
+
 
 class ConcatListFormatTests(unittest.TestCase):
     def test_simple_path(self) -> None:

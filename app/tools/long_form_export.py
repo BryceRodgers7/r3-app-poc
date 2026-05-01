@@ -227,6 +227,18 @@ class LongFormExporter:
 
         Factored out so tests can assert the args structure without
         actually running ffmpeg.
+
+        `-avoid_negative_ts make_zero` is load-bearing for games beyond
+        the first within a single app run. Each `recording/<game_NNN>/`
+        subtree's segment files inherit PTS from the GStreamer
+        pipeline's running clock, which keeps ticking across Stop/Start
+        cycles (the clock is per-pipeline, not per-game). Without this
+        flag, the encoded MP4 for game 2+ starts at whatever PTS the
+        first segment of that game has — e.g. `0:42` if game 1 ran for
+        42 seconds — and players show the timeline starting at that
+        offset rather than 0. `make_zero` instructs the muxer to shift
+        the smallest input timestamp to zero, which is exactly the
+        per-file normalization we want here.
         """
         return [
             str(self._ffmpeg_path),
@@ -237,6 +249,7 @@ class LongFormExporter:
             "-i", str(concat_path),
             *_DEFAULT_VIDEO_CODEC_ARGS,
             *_DEFAULT_AUDIO_CODEC_ARGS,
+            "-avoid_negative_ts", "make_zero",
             "-y",  # overwrite existing output (8.C will skip via DB instead)
             str(output_path),
         ]

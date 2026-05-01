@@ -246,6 +246,124 @@ class RebuildAudioUnlinkContractTests(unittest.TestCase):
         self.assertEqual(link_helper_calls, [new_sink])
 
 
+class _StubFlushPad:
+    """Tracks `send_event` calls so the flush helper test can verify
+    the right event sequence was sent."""
+
+    def __init__(self) -> None:
+        self.events_sent: list[object] = []
+
+    def send_event(self, event: object) -> bool:
+        self.events_sent.append(event)
+        return True
+
+
+class _StubQueue:
+    def __init__(self, name: str = "audio_record_mux_queue") -> None:
+        self.name = name
+        self.sink_pad = _StubFlushPad()
+
+    def get_static_pad(self, name: str) -> _StubFlushPad:
+        assert name == "sink"
+        return self.sink_pad
+
+
+class _StubPipelineWithGetByName:
+    """`get_by_name` returns a registered element. Used by the flush
+    helper test that needs `_pipeline.get_by_name("audio_record_mux_queue")`."""
+
+    def __init__(self) -> None:
+        self._by_name: dict[str, object] = {}
+
+    def add(self, element: object) -> bool:
+        return True
+
+    def remove(self, element: object) -> bool:
+        return True
+
+    def get_by_name(self, name: str) -> object:
+        return self._by_name.get(name)
+
+    def register(self, name: str, element: object) -> None:
+        self._by_name[name] = element
+
+
+class _StubGstWithFlushEvents:
+    class PadLinkReturn:
+        OK = _PAD_LINK_OK
+
+    class Event:
+        @staticmethod
+        def new_flush_start() -> object:
+            return ("flush_start",)
+
+        @staticmethod
+        def new_flush_stop(reset_time: bool) -> object:
+            return ("flush_stop", reset_time)
+
+
+class AudioMuxBranchFlushTests(unittest.TestCase):
+    """Bug regression test (post-session-148-game-2 audio misalignment):
+
+    `disable_file_recording` MUST flush the audio_record_mux chain
+    after closing the valve, so no opus packet survives the gap
+    between games. Without the flush, opusenc's window-encoding
+    buffer can leave one stranded packet between encoder.src and
+    the (now-NULL) old splitmuxsink. On rebuild, that packet flows
+    through the new splitmuxsink first, carrying the previous game's
+    PTS — which surfaces in the post-processed MP4 as audio playing
+    for ~15s before any video appears.
+
+    Contract: when called with an audio chain in place, the flush
+    helper sends `FLUSH_START` then `FLUSH_STOP` (with
+    `reset_time=False`) on the audio_record_mux_queue's sink pad.
+    """
+
+    def test_flush_helper_sends_flush_start_then_stop_on_head_queue(self) -> None:
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGstWithFlushEvents
+        pm._pipeline = _StubPipelineWithGetByName()
+        pm._audio_record_encoder = _StubEncoder()
+        pm._recording_feed_id = "ndi_1"
+
+        head_queue = _StubQueue()
+        pm._pipeline.register("audio_record_mux_queue", head_queue)
+
+        pm._flush_audio_mux_branch_locked()
+
+        # Two events sent: flush-start, then flush-stop(reset_time=False).
+        self.assertEqual(len(head_queue.sink_pad.events_sent), 2)
+        self.assertEqual(
+            head_queue.sink_pad.events_sent[0],
+            ("flush_start",),
+        )
+        self.assertEqual(
+            head_queue.sink_pad.events_sent[1],
+            ("flush_stop", False),
+        )
+
+    def test_flush_helper_no_op_when_audio_chain_was_never_wired(self) -> None:
+        # `recording_audio_enabled=False` path or video-only source —
+        # `_audio_record_encoder` stays None, helper must NOT touch the
+        # pipeline.
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGstWithFlushEvents
+        pm._pipeline = _StubPipelineWithGetByName()
+        pm._audio_record_encoder = None
+        pm._recording_feed_id = "ndi_1"
+
+        head_queue = _StubQueue()
+        pm._pipeline.register("audio_record_mux_queue", head_queue)
+
+        pm._flush_audio_mux_branch_locked()
+
+        self.assertEqual(head_queue.sink_pad.events_sent, [])
+
+
 class AudioRecordBranchNameCollisionTests(unittest.TestCase):
     """Bug regression test (session_147):
 
