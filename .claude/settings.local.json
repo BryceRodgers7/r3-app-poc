@@ -88,7 +88,17 @@
       "Bash(python -m unittest discover -s tests -p test_playback_overlay_visibility.py)",
       "Bash(python -m unittest discover -s tests -p test_play_badge.py)",
       "Bash(python -m unittest discover -s tests -p test_replay_current_play.py)",
-      "Bash(python -m unittest discover -s tests -p test_plays_json_export.py)"
+      "Bash(python -m unittest discover -s tests -p test_plays_json_export.py)",
+      "Bash(python -m unittest tests.test_audio_relink_on_rebuild -v)",
+      "Bash(python -m unittest tests/test_audio_relink_on_rebuild.py -v)",
+      "Bash(python tests/test_audio_relink_on_rebuild.py)",
+      "Bash(python -c \"import tests.test_audio_relink_on_rebuild\")",
+      "Bash(git stash *)",
+      "Bash(python -m unittest tests.test_audio_relink_on_rebuild.RebuildAudioUnlinkContractTests)",
+      "Bash(python -m unittest discover -s tests -k \"rebuild_unlinks_audio\")",
+      "Read(//c/SportsReplay/sessions/session_147/recording/**)",
+      "Bash(python -m unittest discover -s tests -k \"name_collision\")",
+      "Bash(python -m unittest discover -s tests -k \"AudioRecordBranchName\" -v)"
     ]
   }
 }

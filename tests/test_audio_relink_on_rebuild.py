@@ -73,10 +73,22 @@ class _StubSplitmuxsink:
         self.name = name
         self.audio_pad = _StubPad(f"{name}.audio_0")
         self.request_pad_calls: list[str] = []
+        self._release_calls: list[_StubPad] = []
+        self.sync_state_calls: int = 0
 
     def request_pad_simple(self, template: str) -> _StubPad:
         self.request_pad_calls.append(template)
         return self.audio_pad
+
+    def release_request_pad(self, pad: _StubPad) -> None:
+        self._release_calls.append(pad)
+
+    def sync_state_with_parent(self) -> bool:
+        self.sync_state_calls += 1
+        return True
+
+    def set_state(self, _state: object) -> object:
+        return _state
 
 
 def _build_pm_with_audio() -> tuple[PipelineManager, _StubEncoder]:
@@ -133,6 +145,158 @@ class LinkAudioEncoderHelperTests(unittest.TestCase):
         new_sink = _StubSplitmuxsink()
         pm._link_audio_encoder_to_splitmuxsink_locked(new_sink)
         self.assertEqual(new_sink.request_pad_calls, [])
+
+
+class _StubPipeline:
+    """Minimal stand-in for `Gst.Pipeline` that records add/remove."""
+
+    def __init__(self) -> None:
+        self.removed: list[object] = []
+        self.added: list[object] = []
+
+    def remove(self, element: object) -> bool:
+        self.removed.append(element)
+        return True
+
+    def add(self, element: object) -> bool:
+        self.added.append(element)
+        return True
+
+
+class _StubJpegenc:
+    """Minimal jpegenc stub for the rebuild flow."""
+
+    def __init__(self) -> None:
+        self.unlink_calls: list[object] = []
+        self.link_calls: list[object] = []
+
+    def unlink(self, other: object) -> None:
+        self.unlink_calls.append(other)
+
+    def link(self, other: object) -> bool:
+        self.link_calls.append(other)
+        return True
+
+
+class RebuildAudioUnlinkContractTests(unittest.TestCase):
+    """Bug regression test (session_145):
+
+    `_rebuild_splitmuxsink_locked` MUST explicitly unlink the audio
+    encoder's src pad from the OLD splitmuxsink's audio request pad
+    BEFORE the old element is removed from the pipeline. Without
+    this, the encoder src pad stays internally linked to the
+    orphaned old audio pad past `pipeline.remove(old)` (gst doesn't
+    auto-unlink across bin removal), `get_peer()` later returns
+    `None` (despite the linkage still existing), the defensive
+    unlink in `_link_audio_encoder_to_splitmuxsink_locked` is
+    skipped, and the new audio link returns `WAS_LINKED` — which
+    aborts the rebuild before the video link runs, leaving game N+1
+    with zero segment files.
+    """
+
+    def test_rebuild_unlinks_audio_encoder_before_pipeline_remove(self) -> None:
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGst
+        pm._pipeline = _StubPipeline()
+        pm._record_branch_jpegenc = _StubJpegenc()
+        pm._record_branch_name = "record"
+        pm._recording_feed_id = "ndi_1"
+
+        # Set up the audio chain as it would exist after game 1's
+        # initial wiring: encoder.src linked to old_sink.audio_pad.
+        encoder = _StubEncoder()
+        pm._audio_record_encoder = encoder
+
+        old_sink = _StubSplitmuxsink(name="old_splitmuxsink")
+        old_audio_pad = old_sink.audio_pad
+        old_audio_pad._peer = encoder.src_pad
+        encoder.src_pad._peer = old_audio_pad
+        pm._splitmuxsink = old_sink
+
+        # Stubbed factories so the rebuild doesn't reach real GStreamer.
+        new_sink = _StubSplitmuxsink(name="new_splitmuxsink")
+        pm._build_splitmuxsink_element = lambda _branch: new_sink
+        pm._ensure_audio_record_branch_built_locked = lambda: None
+        link_helper_calls: list[object] = []
+        def fake_link(target_sink: object) -> None:
+            link_helper_calls.append(target_sink)
+        pm._link_audio_encoder_to_splitmuxsink_locked = fake_link
+
+        # Run the rebuild.
+        pm._rebuild_splitmuxsink_locked()
+
+        # Contract: encoder.src was unlinked from the old audio pad
+        # BEFORE pipeline.remove was called.
+        self.assertIn(
+            old_audio_pad, encoder.src_pad.unlink_calls,
+            "rebuild must explicitly unlink encoder.src from old audio pad",
+        )
+        # And the old request pad was released back to the old element
+        # (avoids leaking request pads).
+        self.assertIn(
+            old_audio_pad, old_sink._release_calls,
+            "rebuild must release the old audio request pad",
+        )
+        # pipeline.remove fired against the old sink.
+        self.assertEqual(pm._pipeline.removed, [old_sink])
+        # The audio re-link helper was still called for the new sink,
+        # so the encoder will be linked to the fresh audio pad.
+        self.assertEqual(link_helper_calls, [new_sink])
+
+
+class AudioRecordBranchNameCollisionTests(unittest.TestCase):
+    """Bug regression test (session_147):
+
+    `_add_audio_record_branch_to_splitmuxsink` MUST use element names
+    distinct from the audio drain appsink branch built unconditionally
+    by `_add_audio_appsink_branch("record", ...)` at pipeline-init.
+
+    The drain owns these names (see `_add_audio_appsink_branch`):
+      `audio_record_queue` / `audio_record_valve` / `audio_record_sink`
+
+    If the mux-branch reuses any of those, `pipeline.add(...)` silently
+    fails for the colliding element (GStreamer rejects duplicate names
+    in a bin), the new element is orphaned, and `queue.link(valve)`
+    fails (or silently succeeds while orphaned, then the orphan-encoder
+    raises WRONG_HIERARCHY when the link helper tries to bind it to
+    the pipelined splitmuxsink). Either path: zero segments for game 2+.
+    """
+
+    def test_mux_branch_element_names_do_not_collide_with_drain(self) -> None:
+        # Read the actual element-name string literals from the source
+        # file so this test catches a future rename that re-introduces
+        # the collision.
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parent.parent
+            / "app"
+            / "media"
+            / "pipeline_manager.py"
+        ).read_text(encoding="utf-8")
+
+        drain_names = {
+            '"audio_record_queue"',
+            '"audio_record_valve"',
+            '"audio_record_sink"',
+        }
+        # Find the body of _add_audio_record_branch_to_splitmuxsink and
+        # confirm none of the drain names appear as element-name args
+        # to `_make_element` calls inside it.
+        start = source.index("def _add_audio_record_branch_to_splitmuxsink")
+        # Next def at the same indent level marks end of body.
+        end = source.index("\n    def ", start + 1)
+        mux_body = source[start:end]
+        for name in drain_names:
+            self.assertNotIn(
+                name,
+                mux_body,
+                f"_add_audio_record_branch_to_splitmuxsink must not "
+                f"reuse drain element name {name} — see session_147 "
+                f"bug investigation",
+            )
 
 
 if __name__ == "__main__":

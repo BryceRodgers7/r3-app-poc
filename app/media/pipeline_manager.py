@@ -1269,6 +1269,47 @@ class PipelineManager:
             jpegenc.unlink(old)
         except Exception:
             LOGGER.exception("rebuild_splitmuxsink: unlink jpegenc → old failed")
+        # Explicitly unlink the audio encoder's src pad from the OLD
+        # splitmuxsink's audio_%u request pad BEFORE we remove `old` from
+        # the pipeline.
+        #
+        # Without this, the encoder src pad stays internally linked to
+        # the orphaned old audio_%u pad past `pipeline.remove(old)`. The
+        # `_link_audio_encoder_to_splitmuxsink_locked` helper later in
+        # rebuild relies on `encoder_src_pad.get_peer()` to detect a
+        # stale linkage and unlink defensively — but that call returns
+        # `None` once the peer's parent element has been removed from a
+        # bin (despite the linkage still existing internally). Defensive
+        # unlink is skipped, then `link(new_audio_pad)` returns
+        # `PadLinkReturn.WAS_LINKED` and the rebuild raises. End result:
+        # video chain never gets linked to new sink either, no buffers
+        # reach splitmuxsink, no segment files written for game N+1.
+        # Releasing the request pad after the unlink also avoids leaking
+        # request pads on the orphaned old element.
+        if self._audio_record_encoder is not None:
+            encoder_src_pad = self._audio_record_encoder.get_static_pad("src")
+            if encoder_src_pad is not None:
+                peer = encoder_src_pad.get_peer()
+                if peer is not None:
+                    try:
+                        encoder_src_pad.unlink(peer)
+                        LOGGER.info(
+                            "rebuild_splitmuxsink: unlinked encoder.src ↔ "
+                            "old splitmuxsink audio request pad"
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "rebuild_splitmuxsink: unlink encoder.src ↔ old "
+                            "audio pad failed"
+                        )
+                    try:
+                        old.release_request_pad(peer)
+                    except Exception:
+                        LOGGER.debug(
+                            "rebuild_splitmuxsink: release_request_pad on old "
+                            "raised",
+                            exc_info=True,
+                        )
         try:
             old.set_state(self._Gst.State.NULL)
         except Exception:
@@ -1755,11 +1796,22 @@ class PipelineManager:
         Gst = self._Gst
         assert Gst is not None
 
-        queue = self._make_element("queue", "audio_record_queue")
-        valve = self._make_element("valve", "audio_record_valve")
-        convert = self._make_element("audioconvert", "audio_record_convert")
-        resample = self._make_element("audioresample", "audio_record_resample")
-        encoder = self._make_element("opusenc", "audio_record_opusenc")
+        # Element names use the `audio_record_mux_` prefix to avoid
+        # colliding with the drain appsink branch built unconditionally at
+        # pipeline-init by `_add_audio_appsink_branch("record", ...)`. The
+        # drain owns `audio_record_queue` / `audio_record_valve` /
+        # `audio_record_sink`. Reusing those names here would cause
+        # `pipeline.add(...)` to silently fail (GStreamer rejects duplicate
+        # element names in a bin), leaving the new elements orphaned and
+        # the link chain broken — which is exactly what Phase 9.C
+        # accidentally introduced. The `_mux_` infix marks "this is the
+        # branch that goes INTO splitmuxsink", to distinguish it from the
+        # drain.
+        queue = self._make_element("queue", "audio_record_mux_queue")
+        valve = self._make_element("valve", "audio_record_mux_valve")
+        convert = self._make_element("audioconvert", "audio_record_mux_convert")
+        resample = self._make_element("audioresample", "audio_record_mux_resample")
+        encoder = self._make_element("opusenc", "audio_record_mux_opusenc")
 
         valve.set_property("drop", True)
         encoder.set_property("bitrate", self._audio_bitrate)
@@ -1794,12 +1846,25 @@ class PipelineManager:
         # encoder→splitmuxsink link via the shared helper. The helper
         # is also called from `_rebuild_splitmuxsink_locked` so the
         # audio chain gets re-attached to each fresh splitmuxsink.
+        #
+        # If the link helper raises, clear the stored encoder reference
+        # so the next call to `_ensure_audio_record_branch_built_locked`
+        # treats the chain as "not built" rather than "built but with
+        # an orphaned encoder we can no longer link." Without this
+        # cleanup, a partial-build leaves `_audio_record_encoder`
+        # pointing at an orphan element, and every subsequent rebuild
+        # raises `WRONG_HIERARCHY` from the link helper.
         self._audio_record_encoder = encoder
-        self._link_audio_encoder_to_splitmuxsink_locked(self._splitmuxsink)
+        try:
+            self._link_audio_encoder_to_splitmuxsink_locked(self._splitmuxsink)
+        except Exception:
+            self._audio_record_encoder = None
+            raise
 
         tee_src_pad = self._request_audio_tee_pad()
         queue_sink_pad = queue.get_static_pad("sink")
         if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+            self._audio_record_encoder = None
             raise RuntimeError(
                 "Failed to link audio tee output to the audio_record branch."
             )
@@ -1925,9 +1990,14 @@ class PipelineManager:
         peer = encoder_src_pad.get_peer()
         if peer is not None:
             encoder_src_pad.unlink(peer)
-        if encoder_src_pad.link(audio_sink_pad) != Gst.PadLinkReturn.OK:
+        link_result = encoder_src_pad.link(audio_sink_pad)
+        if link_result != Gst.PadLinkReturn.OK:
             raise RuntimeError(
-                "Failed to link opusenc.src to splitmuxsink.audio_%u"
+                f"Failed to link opusenc.src to splitmuxsink.audio_%u "
+                f"(PadLinkReturn={link_result!r}, e.g. WAS_LINKED means "
+                f"the encoder src pad is still peer-linked to a stale "
+                f"old splitmuxsink audio pad — see "
+                f"_rebuild_splitmuxsink_locked for the explicit-unlink fix)."
             )
 
     def _add_audio_appsink_branch(self, branch_name: str, sample_handler: Callable[[Any], Any]) -> None:
