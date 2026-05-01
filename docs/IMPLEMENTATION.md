@@ -545,7 +545,19 @@ in this exact order:
    `_finalize_pending_segment_locked` — writes the row to SQLite +
    `SegmentIndex`.
 6. `splitmuxsink.set_state(NULL)` to fully tear down.
-7. Set `_recording_was_disabled = True`.
+7. **`_flush_audio_mux_branch_locked()`** — sends `FLUSH_START` then
+   `FLUSH_STOP(reset_time=False)` on the audio mux-branch's head
+   queue's sink pad. Without this, opusenc's final partially-encoded
+   packet (produced ~20–40 ms after the audio valve closed) gets
+   stranded between `encoder.src` and the now-NULL old splitmuxsink's
+   `audio_%u` pad. On the next game's rebuild the stranded packet
+   would flow through the new splitmuxsink first, carrying the
+   previous game's PTS into the new segment file. Flush events bypass
+   the valve's `drop` filter and propagate through valve / convert /
+   resample / encoder, dropping pending data at every stage. See
+   [GSTREAMER_INVARIANTS.md §10](GSTREAMER_INVARIANTS.md). No-op for
+   video-only sources (`_audio_record_encoder is None`).
+8. Set `_recording_was_disabled = True`.
 
 **Known artifact:** the rotation triggered by `split-now` opens an
 empty/short "dud" segment file that we drop from the DB. The file
@@ -561,20 +573,33 @@ game's last file. `_rebuild_splitmuxsink_locked` builds a fresh
 element from scratch, in this exact order:
 
 1. Unlink `jpegenc → old splitmuxsink`.
-2. `old.set_state(NULL)`; remove from pipeline.
-3. Build a fresh splitmuxsink with the same config; add to pipeline.
-4. Point `self._splitmuxsink` at the new element. *(critical — the
+2. **Explicitly unlink the audio encoder's src pad from the old
+   splitmuxsink's audio request pad, then call
+   `old.release_request_pad(peer)`.** Mirrors the video unlink in
+   step 1 — without it the encoder's src pad stays internally linked
+   to the orphaned old audio pad past `pipeline.remove(old)` (gst
+   doesn't auto-unlink across bin removal). Subsequent
+   `encoder_src_pad.get_peer()` returns `None` (gst pad-tree quirk
+   for orphaned-element peers), the defensive unlink in
+   `_link_audio_encoder_to_splitmuxsink_locked` is skipped, and the
+   new audio link returns `PadLinkReturn.WAS_LINKED`. That aborts
+   the rebuild before step 7 (jpegenc → new sink) runs and the next
+   game records zero segments. No-op for video-only feeds (encoder
+   is `None`).
+3. `old.set_state(NULL)`; remove from pipeline.
+4. Build a fresh splitmuxsink with the same config; add to pipeline.
+5. Point `self._splitmuxsink` at the new element. *(critical — the
    helpers below operate on whatever this attribute references.)*
-5. Call `_ensure_audio_record_branch_built_locked` (Phase 9.C —
+6. Call `_ensure_audio_record_branch_built_locked` (Phase 9.C —
    late-build the audio chain if audio appeared between games and
    the chain wasn't built yet).
-6. Call `_link_audio_encoder_to_splitmuxsink_locked` (Phase 7.G —
+7. Call `_link_audio_encoder_to_splitmuxsink_locked` (Phase 7.G —
    re-link the existing audio encoder's src pad to the new
    splitmuxsink's `audio_%u` pad).
-7. `jpegenc.link(new_sink)`.
-8. `new_sink.sync_state_with_parent()`.
+8. `jpegenc.link(new_sink)`.
+9. `new_sink.sync_state_with_parent()`.
 
-**Order matters.** Reversing steps 5 / 6 with step 7 silently
+**Order matters.** Reversing steps 6 / 7 with step 8 silently
 produces video-only segments because of the audio-pad-request order
 rule: see [GSTREAMER_INVARIANTS.md §3](GSTREAMER_INVARIANTS.md). On
 top of that, `_link_audio_encoder_to_splitmuxsink_locked` itself does
@@ -604,7 +629,9 @@ The audio chain is built in two parts:
 
 - **Eagerly at pipeline construction** (`_build_audio_path_locked`):
   audio tee, source-side audio chain, live audio sink (wasapisink),
-  no-op record-side appsink (drains the tee).
+  no-op record-side appsink (drains the tee). Drain elements are
+  named `audio_record_queue` / `audio_record_valve` /
+  `audio_record_sink`.
 - **Lazily on demand** (`_ensure_audio_record_branch_built_locked`):
   the record-into-splitmuxsink chain (`audioconvert → audioresample
   → opusenc → splitmuxsink.audio_%u`). Built only when:
@@ -615,11 +642,36 @@ The audio chain is built in two parts:
     on the tee, AND
   - the splitmuxsink exists.
 
+  Mux-branch elements use the **`audio_record_mux_*` prefix** —
+  `audio_record_mux_queue` / `audio_record_mux_valve` /
+  `audio_record_mux_convert` / `audio_record_mux_resample` /
+  `audio_record_mux_opusenc` — to avoid colliding with the drain's
+  `audio_record_*` element names. See
+  [GSTREAMER_INVARIANTS.md §9](GSTREAMER_INVARIANTS.md) for what
+  silently breaks when the names collide.
+
 The audio-presence probe sits on the tee's **sink pad** so it sees
 buffers regardless of whether the audio_record branch is wired yet. The
 opusenc src probe (Phase 7.E) is separate and lives on the encoder's
 permanent src pad (see [GSTREAMER_INVARIANTS.md §4](GSTREAMER_INVARIANTS.md)
 for why it's not on the splitmuxsink request pad).
+
+**Encoder-reference cleanup on partial-build failure.**
+`_add_audio_record_branch_to_splitmuxsink` sets
+`self._audio_record_encoder = encoder` BEFORE the encoder→splitmuxsink
+link runs (the link helper depends on the encoder reference). If the
+link helper raises, the partial build leaves an *orphan* encoder that
+isn't actually parented to any pipeline yet. The construction code
+wraps the link call in a `try`/`except` that resets
+`_audio_record_encoder = None` on failure, so the next call to
+`_ensure_audio_record_branch_built_locked` (e.g. on the next
+Stop/Start cycle) treats the chain as "not yet built" and retries
+cleanly. Without this cleanup, every subsequent rebuild would try to
+relink the orphan encoder, raising `PadLinkReturn.WRONG_HIERARCHY`
+and aborting the rebuild — leaving the next game with zero segments.
+The same `_audio_record_encoder = None` cleanup also fires in the
+later tee-link failure path. See
+[GSTREAMER_INVARIANTS.md §9](GSTREAMER_INVARIANTS.md).
 
 Edge cases:
 
@@ -632,6 +684,13 @@ Edge cases:
 - **Source loses audio mid-game** — Game 1 stays with audio (chain in
   place but no buffers). The `audio_missing` health event fires after
   a 5s grace period.
+- **Source never broadcasts audio** — `audio_missing` fires once at
+  ~5s into the pipeline run; recording proceeds video-only for every
+  game in the session. The most likely root cause when this fires is
+  that the NDI sender app isn't including an audio stream — verify
+  with NewTek's "NDI Studio Monitor" that the same `ndi_name` carries
+  audio. The `ndi_receiver` log line `NDI demux pad-added: pad='audio'`
+  is the canary: if it never appears, the source has no audio.
 
 ---
 

@@ -176,6 +176,80 @@ domain to capture `pts_to_session_offset_ns`.
 
 ---
 
+## 9. Element names must not collide between coexisting tee branches
+
+**Rule.** When two branches off the same tee are built at different
+times (e.g. one eagerly at pipeline construction, one lazily on
+demand), their element names must be distinct. The drain branch on
+the audio tee owns `audio_record_queue` / `audio_record_valve` /
+`audio_record_sink`; the mux-branch (Phase 9.C late-build) uses an
+`audio_record_mux_*` prefix to avoid collision.
+
+**Why.** GStreamer rejects duplicate element names within a bin.
+`pipeline.add(element)` returns `False` (silently — no exception)
+when a sibling with the same name already exists. Subsequent
+`element.link()` calls on the unparented element return `False`
+because both pads have no parent bin in common. The link chain
+fails, the build raises a `RuntimeError("Failed to link the
+audio_record branch head.")`, the exception is caught upstream by
+`_ensure_audio_record_branch_built_locked`, and the audio chain
+never gets wired. The recording proceeds video-only and the failure
+appears in `app.log` only as the caught traceback — no crash, no
+operator-visible warning beyond the `audio_missing` health event,
+which fires for any video-only run regardless of cause.
+
+Even worse: a partial-build can store an *orphan* encoder reference
+(`self._audio_record_encoder = encoder` set before the link to
+splitmuxsink raises). Subsequent rebuild attempts then call
+`_link_audio_encoder_to_splitmuxsink_locked` against the orphan,
+which raises `PadLinkReturn.WRONG_HIERARCHY` and aborts the entire
+splitmuxsink rebuild — leaving the next game's recording with zero
+segments. The `_add_audio_record_branch_to_splitmuxsink` helper now
+clears `_audio_record_encoder = None` on any link-helper failure to
+break the orphan chain.
+
+**Code:** `pipeline_manager.py:1799-1817` (mux-branch element
+construction), `1979-1999` (drain element construction). Regression
+test in `tests/test_audio_relink_on_rebuild.py::AudioRecordBranchNameCollisionTests`
+greps the source to assert no name reuse between the two helpers.
+
+---
+
+## 10. Flush the audio mux-branch on Stop
+
+**Rule.** `disable_file_recording` must call
+`_flush_audio_mux_branch_locked()` after the audio valve closes.
+The helper sends `FLUSH_START` then `FLUSH_STOP(reset_time=False)`
+on the head queue's sink pad, which propagates downstream through
+valve / audioconvert / audioresample / opusenc, dropping pending
+buffers and resetting the encoder's window state.
+
+**Why.** When the audio valve closes during Stop, opusenc is
+typically mid-encoding-window and produces ONE final packet from
+its partially-encoded data ~20–40 ms later. That packet flows from
+`encoder.src` toward splitmuxsink, but splitmuxsink is being torn
+down (`split-now` rotation, then `set_state(NULL)`). The packet
+gets stranded between `encoder.src` and the now-orphaned old
+splitmuxsink's `audio_%u` pad. When the next game's
+`_rebuild_splitmuxsink_locked` re-links `encoder.src` to a fresh
+splitmuxsink, that stranded packet is the *first* thing to flow
+through — carrying the previous game's PTS into the new game's
+first segment.
+
+In the post-processed MP4, ffmpeg's `-avoid_negative_ts make_zero`
+shift is computed from the smallest input timestamp (the stale
+audio packet) — pushing video by the gap-between-games (~15 seconds
+in a typical case) past audio's t=0. The user sees the new game's
+MP4 start with ~15 seconds of audio before any video appears.
+Flush events bypass the valve's `drop` filter, so this works even
+though the valve is closed at the time the flush is sent.
+
+**Code:** `pipeline_manager.py:_flush_audio_mux_branch_locked` and
+its call from `disable_file_recording` step 6. Regression tests in
+`tests/test_audio_relink_on_rebuild.py::AudioMuxBranchFlushTests`.
+
+---
+
 ## When to add a new invariant here
 
 If you introduce a GStreamer rule whose violation causes a non-obvious
