@@ -2663,6 +2663,103 @@ Exit criteria:
 - Operator receives visible warnings.
 - App can recover usable session data after crash.
 
+### State of the world entering Phase 10
+
+A scan of the §11.2 failure table against current code:
+
+| Failure scenario | Today |
+|---|---|
+| Feed disconnect | Live-bus `ERROR` drives `FeedState → DISCONNECTED` (`pipeline_manager.py`); telemetry zero-fps streak does the same as a fallback. ✅ |
+| Feed reconnect | `RECONNECTING` is a defined state but has no producer that *re-attempts* the source build. Hop into `RECONNECTING → LIVE` only fires if data spontaneously starts flowing again. **Gap.** |
+| Disk full | `disk_low` health event fires below threshold (`telemetry.py`). No pre-flight at Start, no `ENOSPC`-on-bus handler, no enforcement. **Gap.** |
+| Slow disk | Record-queue saturation already drives `FeedState → DEGRADED` and `RecordingState → RECORDING_ERROR` (slice 3.B). No operator-facing visual; no sustained-write-rate vs disk budget check at runtime. **Partial.** |
+| Corrupt segment | Quarantined at startup (`session_recovery.validate_session_segments`). Mid-session quarantine path doesn't exist. **Partial.** |
+| Startup recovery | Phase 7.D shipped (`IMPLEMENTATION.md` §7). ✅ — Phase 10 inherits it; the exit-criterion bullet "App can recover usable session data after crash" is already met. |
+| Graceful shutdown | `aboutToQuit → coordinator.shutdown()` is wired (`main.py`). No drain of the in-progress segment, no `SHUTTING_DOWN` gate on transport actions. **Gap.** |
+| Health event UI | `DiagnosticsWidget` shows category counts only. The §11.3 list of operator-visible warnings has no foreground surface. **Gap.** |
+
+Phase 10 closes the **Gap** rows and upgrades the **Partial** rows to operator-visible signals. Slice 10.A lands first because every later slice raises a health event that needs to be foregrounded.
+
+### Slices
+
+**10.A — Operator alert banner (✅ shipped)**
+
+The §11.3 operator-visible warnings list (feed disconnected / recording degraded / replay unavailable / disk nearly full / disk too slow / dropped frames high / encoder failure / session not safely recording) was previously buried in `health_events.jsonl` and reduced to a category-count line in the diagnostics widget. 10.A adds a foregrounded `AlertBanner` widget at the top of the operator window:
+
+- **`HealthEventLog.open_events()`** — additive accessor that returns the full `HealthEvent` payloads for currently-open `(feed_id, category)` pairs, alongside the existing `has_open_event` / `clear_open_event` markers. The original `_last_categories` dict is preserved so existing readers (e.g. `test_telemetry.py`) keep working — a parallel `_open_events` dict mirrors the markers with full payloads.
+- **`AlertBanner` widget (`app/ui/alert_banner.py`)** — polls `default_log().open_events()` on a 1s `QTimer` (matching `DiagnosticsWidget` cadence), filters to a §11.3 allowlist, picks the highest-severity event (ERROR > WARNING > INFO; most-recent id tie-break), and renders it as a colored bar (amber for WARNING, red for ERROR). When more than one operator-visible event is open at once, an inline `+N more` badge surfaces the overflow.
+- **Allowlist mapping** — `feed_lost → "Feed disconnected"`, `feed_degraded → "Recording degraded"`, `replay_degraded → "Replay unavailable"`, `disk_low → "Disk nearly full"`, `recording_branch_saturated → "Disk too slow — recording degraded"`, `recording_error → "Encoder failure"`, `session_dirty → "Session not safely recording"`. Diagnostic-only categories (`audio_missing`, `invalid_transition`, `feed_recovered`, `recording_started`, `recording_stopped`, `disk_recovered`, `session_finalized`) are deliberately excluded — they stay in the diagnostics widget and JSONL log.
+- **Wiring** — banner is inserted at the top of `MainWindow`'s central layout only when `show_controls=True`. The program window (`show_controls=False`, on-air pane) stays uncluttered.
+- **Tests** — `tests/test_alert_banner.py`: empty log → hidden; single WARNING → visible + label; ERROR outranks concurrent WARNING; `+N more` populates correctly; recovery clears the banner; diagnostic-only categories are excluded from both the primary slot and the count.
+
+**Out of scope for 10.A:** click-to-dismiss (the recovery event is the dismissal); per-feed routing of feed-specific banners to a per-feed widget; operator-visible "dropped frames high" (no producer category exists yet — would need a new telemetry rule that emits one).
+
+**10.B — Per-feed reconnect supervisor**
+
+Today, after `FeedState → DISCONNECTED` the live ingest pipeline is dead until the operator restarts the app. The state machine permits `DISCONNECTED → RECONNECTING → LIVE`, but the only producer of the `RECONNECTING` hop is `_promote_feed_state_on_arrival` in `feed_runtime.py:111`, which fires only after a buffer arrives — and a buffer can't arrive because nothing is rebuilding the source. 10.B closes the loop:
+
+- **`ReconnectSupervisor`** — one per feed, owned by `FeedRuntime`. On entering `DISCONNECTED`, schedules a rebuild of the source-side ingest pipeline on backoff (1s, 2s, 4s, 8s, capped at 30s). Each attempt drives `DISCONNECTED → RECONNECTING` *before* the rebuild call (so the banner from 10.A picks up the in-flight reconnect attempt) and back to `DISCONNECTED → RECONNECTING` cycles between attempts.
+- **Permanent-fail floor** — after `MAX_RECONNECT_ATTEMPTS` (default 10, ≈ ~5 minutes of backoff total), transitions `RECONNECTING → FAILED` and emits a new `feed_failed_permanent` health event. The operator must Stop/Start the session to retry; this avoids a silent retry loop on a genuinely-broken cable / NDI sender.
+- **Successful rebuild** — once a buffer lands, the existing `_promote_feed_state_on_arrival` already drives `RECONNECTING → LIVE` and emits `feed_recovered`. No new code path needed on the success side.
+- **Recording branch isolation** — the live-side reconnect does **not** tear down `splitmuxsink`. Per §2.5, the recording branch is independent; whatever buffers are in flight at disconnect time finalize into the current segment, and the next segment starts with whatever frames arrive after reconnect. The replay layer's gap-during-replay behavior (§15.5) covers the discontinuity.
+- **Tests** — `ReconnectSupervisor` unit tests against a fake source factory: backoff schedule produces the expected attempt times; cap at `MAX_RECONNECT_ATTEMPTS` transitions to `FAILED`; a successful rebuild during the schedule cancels remaining attempts; `feed_failed_permanent` health event fires exactly once on cap.
+
+**Out of scope for 10.B:** mid-game seamless splice — when the source returns, post-reconnect frames carry a new PTS origin and the segment timeline has a gap. We don't backfill, and the per-game folder model means a Stop/Start is the natural seam if the operator wants a clean restart.
+
+**10.C — Disk-full enforcement**
+
+`disk_low` warns; nothing actually stops a recording when the filesystem is genuinely full or when the next `splitmuxsink` mux-start would `ENOSPC`. 10.C makes the response explicit:
+
+- **Pre-flight at Start** — `toggle_long_session_recording` Start checks `shutil.disk_usage(recording_root).free` against an estimate of N seconds of recording (default 60s, configurable as `disk_full_grace_seconds` under `[recording]`), using the Phase 7.A budget coefficients. If the free space wouldn't cover the grace window, refuse to Start, emit a `disk_full_blocked` health event, and let the 10.A banner surface it. The Start button stays in `Start game recording` mode.
+- **Live `ENOSPC` interpretation** — `pipeline_manager._poll_bus_for_messages` recognises `Gst.ResourceError.NO_SPACE_LEFT` (and the underlying `errno == ENOSPC` from `filesink`) as a disk-full condition. Drive `RecordingState → RECORDING_ERROR` (not `FeedState → DISCONNECTED` — the source is fine; the disk is the problem); preview keeps running, the operator gets a `disk_full_during_record` health event.
+- **Two-tier disk-low** — the existing `disk_low` threshold (10% free by default) gets a second tier `disk_critical` at 5% / 5GB. `disk_low` stays WARNING (banner amber); `disk_critical` raises to ERROR (banner red). Recovery clears both when free space returns above the higher threshold, with hysteresis to avoid flapping.
+- **Tests** — pre-flight refusal with a fake disk-usage probe; ENOSPC bus message correctly classified (separate from generic `ResourceError`); recovery from disk-critical clears both health events.
+
+**Out of scope for 10.C:** auto-cleanup of old sessions to free space (retention policy is §6.8, deferred). 10.C only refuses cleanly; doesn't try to make room.
+
+**10.D — Slow-disk runtime surface**
+
+Slice 3.B already drives `FeedState → DEGRADED` and `RecordingState → RECORDING_ERROR` on sustained record-queue saturation. 10.D closes the operator-visibility loop and grounds the signal in the Phase 7.A budget:
+
+- **`disk_slow` health event** — fires when `DiskSampler.write_mb_s_estimate` exceeds `disk_budget_mb_s` for ≥ 3 consecutive samples (Phase 7.A's budget exists; this is its runtime use). Maps to `recording_branch_saturated` for the existing 10.A banner allowlist, but with a distinct category so disk-budget overruns are distinguishable from queue-saturation events at the JSONL level.
+- **DiagnosticsWidget readout** — adds `disk write: 178/200 MB/s ⚠` next to the existing budget line; surfaces `record_queue_saturation` as a percentage so the operator sees "queue 82%" alongside the binary `DEGRADED`.
+- **TelemetryHub exposure** — `FeedMetricsSnapshot` gains `record_queue_saturation_pct: float` (computed from existing `queue_depth_recording / queue_max_recording`). No new sampling — the data is there, just not surfaced.
+- **Tests** — `disk_slow` emission threshold matrix; recovery clears when write rate drops below budget; saturation percentage formatted correctly.
+
+**Out of scope for 10.D:** dynamic re-encode at lower bitrate. Operator's option is to reduce feed count or accept the degradation.
+
+**10.E — Mid-session corrupt-segment quarantine**
+
+Today, `SegmentValidator` runs only on startup recovery (`session_recovery.validate_session_segments`). If a segment finalizes mid-game with a corrupt header — rare but possible after a hard disk hiccup that survived the recording branch — the next replay request hands the corrupt file to `cv2 / GStreamer` and the playback path crashes. 10.E makes the runtime path tolerant:
+
+- **Background finalization validator** — after `_finalize_pending_segment_locked` writes the `complete` row, schedule a low-priority validation on a worker thread. The validator is already implemented (`session_recovery._default_segment_validator`); 10.E reuses it.
+- **Quarantine action** — on invalid: same action as the recovery path. Move file to `<session>/quarantine/`, update the DB row to `state="quarantined"` with the new path, evict from the `SegmentIndex`, emit a new `segment_quarantined_runtime` health event (WARNING, banner-visible). Replay continues from surviving segments; `nearest_frame_location` already handles missing segments per §15.5.
+- **Rate limit** — at most one validation in flight per feed, queued FIFO. If a feed produces a new segment before the previous validation finishes, the new one waits. This prevents a slow disk hiccup from queuing up dozens of concurrent validations and competing with the recording branch for I/O.
+- **Tests** — synthesized corrupt segment is quarantined and excluded from `SegmentIndex`; validation queue serialises per feed; replay traversing a quarantined segment skips it cleanly (lock in via the existing replay-safety harness).
+
+**Out of scope for 10.E:** validating *every* segment on a long session (validating only the just-finalized one is enough; the older tail was validated when finalized and isn't being modified); cross-feed coordination of quarantine (each feed is independent per §2.5).
+
+**10.F — Graceful shutdown drain**
+
+`aboutToQuit → coordinator.shutdown()` is wired, but the current `shutdown()` is synchronous: it stops feed runtimes immediately, leaving `splitmuxsink` to write whatever it can during process teardown. The active segment's tail gets truncated and lands in startup-recovery's `dirty` state on next launch — a needless dirty session for what was meant to be a clean exit. 10.F fixes the close path:
+
+- **`AppState.SHUTTING_DOWN` becomes the gate** — `coordinator.shutdown()` first sets `_shutting_down = True` (already exists) and the derived `AppState` resolves to `SHUTTING_DOWN`. `toggle_long_session_recording`, `mark_next_play`, and the `PlaybackController` transport methods check this state and short-circuit, so a click on a hot-shutdown UI is a no-op rather than racing the teardown.
+- **Per-feed split-now drain** — for each feed currently in `RecordingState.RECORDING`, send the `splitmuxsink` `split-now` action signal and wait (with a per-feed budget, default 2000 ms) for the matching `format-location-full` callback to fire. This finalizes the in-flight segment cleanly so its DB row writes through and the file matches the row.
+- **Then existing teardown** — `runtime.stop()`, `session_manager.close()` (already drives `RECORDING/STOPPED → FINALIZED`), `default_health_log().close()`. Order is unchanged from today; only the drain is inserted before `runtime.stop()`.
+- **Hard-kill remains untouched** — a SIGKILL or power loss during shutdown still falls through to the §11.4 dirty-session recovery path on next launch. 10.F only improves the case where the OS asked the app to quit cleanly.
+- **Tests** — fake `splitmuxsink` with a controllable split-now callback verifies the drain waits for finalization within budget; per-feed budget timeout falls back to the legacy synchronous teardown (no shutdown deadlock); transport actions during `SHUTTING_DOWN` are no-ops.
+
+**Out of scope for 10.F:** auto-invocation of the post-session processor (Phase 8 is operator-driven, not auto); recovery from a hard-kill *during* shutdown — that is exactly the §11.4 dirty-session path and is already covered.
+
+### Phase 10 sequencing notes
+
+- **10.A first.** Every later slice raises a health event; without the foreground banner the new emissions are invisible to the operator.
+- **10.B and 10.C are independent** and both address §11.1 scenarios. Recommend 10.B before 10.C — disconnect/reconnect is the more frequent real-world failure (NDI drops, network blip) and the higher-value resilience win.
+- **10.D depends on the Phase 7.A disk budget** (already shipped) and on 10.A's banner. Lands after 10.C so the operator has both disk-full and disk-slow signals in place at once.
+- **10.E is independent** of 10.A–10.D for behavior, but only useful in operator-visible terms after 10.A is in place — the `segment_quarantined_runtime` event needs the banner to be noticed in real time.
+- **10.F should land last** among the in-scope slices. It changes the shutdown ordering, and it's the easiest slice to mask bugs in earlier slices (a wedged shutdown can hide a partial reconnect failure).
+- **Startup recovery is already shipped** via Phase 7.D — explicitly call this out so a future reader doesn't try to plan a "10.G — startup recovery" slice. The Phase 10 exit criterion "App can recover usable session data after crash" is already met by the existing recovery dialog + Phase 7.D continuation logic.
+
 ---
 
 ## Phase 11 – Hardware Acceleration and Performance Tuning
