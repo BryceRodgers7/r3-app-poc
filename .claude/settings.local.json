@@ -109,7 +109,10 @@
       "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import tests.test_alert_banner\")",
       "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import tests\")",
       "Bash(python -m unittest discover -s tests -p \"test_alert_banner.py\" -v)",
-      "Bash(python -c \"from app.ui.main_window import MainWindow; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
+      "Bash(python -c \"from app.ui.main_window import MainWindow; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
+      "Bash(python -m unittest discover -s tests -p \"test_reconnect_supervisor.py\" -v)",
+      "Bash(python -m unittest discover -s tests -p \"test_reconnect_supervisor.py\")",
+      "Bash(python -c \"from app.media.feed_runtime import FeedRuntime; from app.core.reconnect_supervisor import ReconnectSupervisor; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
     ]
   }
 }

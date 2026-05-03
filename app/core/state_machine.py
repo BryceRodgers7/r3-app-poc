@@ -16,10 +16,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from enum import Enum
+import logging
 import threading
 from typing import Generic, TypeVar
 
 from app.core.health_events import HealthSeverity, record_health_event
+
+LOGGER = logging.getLogger(__name__)
 
 E = TypeVar("E", bound=Enum)
 
@@ -41,6 +44,11 @@ class StateMachine(Generic[E]):
         }
         self._name = name
         self._on_enter = on_enter
+        # Phase 10.B: cross-cutting observers (e.g. ReconnectSupervisor)
+        # that need to react to transitions without owning the
+        # `on_enter` slot. Listeners fire after `on_enter`, outside the
+        # state-machine lock.
+        self._listeners: list[Callable[[E, E], None]] = []
         self._lock = threading.Lock()
 
     @property
@@ -85,7 +93,32 @@ class StateMachine(Generic[E]):
             self._current = target
         if self._on_enter is not None:
             self._on_enter(old, target)
+        for listener in list(self._listeners):
+            try:
+                listener(old, target)
+            except Exception:
+                LOGGER.exception(
+                    "%s listener raised on transition %s -> %s",
+                    self._name,
+                    old.name,
+                    target.name,
+                )
         return True
+
+    def add_listener(self, listener: Callable[[E, E], None]) -> None:
+        """Register a `(old, new)` callback fired after every successful
+        transition. Listeners run outside the machine lock; exceptions
+        are logged but do not block other listeners."""
+        with self._lock:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener: Callable[[E, E], None]) -> None:
+        """Detach a previously-registered listener. No-op if absent."""
+        with self._lock:
+            try:
+                self._listeners.remove(listener)
+            except ValueError:
+                pass
 
     def force(self, target: E) -> None:
         """Set state without transition validation. For initialization only."""

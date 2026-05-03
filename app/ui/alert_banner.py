@@ -29,6 +29,7 @@ from app.core.health_events import (
 
 _OPERATOR_VISIBLE_CATEGORIES: dict[str, str] = {
     "feed_lost": "Feed disconnected",
+    "feed_failed_permanent": "Feed unavailable — reconnect attempts exhausted",
     "feed_degraded": "Recording degraded",
     "replay_degraded": "Replay unavailable",
     "disk_low": "Disk nearly full",

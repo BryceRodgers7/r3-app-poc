@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 
 from app.core.feed_state import FeedState, make_feed_state_machine
 from app.core.models import FeedDefinition, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
+from app.core.reconnect_supervisor import ReconnectSupervisor, Scheduler
 from app.core.state_machine import StateMachine
 from app.media.pipeline_manager import PipelineManager
 from app.media.source_interface import SourceInterface
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FeedRuntime:
@@ -20,6 +24,8 @@ class FeedRuntime:
         source: SourceInterface,
         pipeline_manager: PipelineManager,
         feed_state: StateMachine[FeedState] | None = None,
+        *,
+        reconnect_scheduler: Scheduler | None = None,
     ) -> None:
         self.feed = feed
         self.source = source
@@ -32,11 +38,25 @@ class FeedRuntime:
         self._latest_live_frame: MediaFrame | None = None
         self._latest_live_overlay = FrameOverlayInfo(feed_id=feed.feed_id, source_name=feed.display_name)
         self._started = False
+        self._reconnect_scheduler = reconnect_scheduler
+        self._reconnect_supervisor: ReconnectSupervisor | None = None
 
     def start(self, session_paths: SessionPaths) -> bool:
         """Start the feed ingest pipeline and persistence services."""
         self.pipeline_manager.set_frame_callback(self._on_live_frame)
         self.pipeline_manager.set_live_sample_callback(self._on_live_overlay)
+        # Phase 10.B: install the reconnect supervisor before any state
+        # transitions so that an immediate DISCONNECTED (e.g. source
+        # factory failure on the first connect_source call) triggers
+        # the backoff schedule.
+        self._reconnect_supervisor = ReconnectSupervisor(
+            feed_id=self.feed.feed_id,
+            display_name=self.feed.display_name,
+            feed_state=self.feed_state,
+            rebuild_callable=self.rebuild,
+            scheduler=self._reconnect_scheduler,
+        )
+        self._reconnect_supervisor.attach()
         self.feed_state.transition_to(FeedState.CONNECTING)
         connected = self.pipeline_manager.connect_source()
         self.pipeline_manager.start_preview()
@@ -50,8 +70,38 @@ class FeedRuntime:
     def stop(self) -> None:
         """Stop the feed runtime."""
         self._started = False
+        if self._reconnect_supervisor is not None:
+            # Detach before driving DISABLED so the supervisor doesn't
+            # observe a transient transition during teardown.
+            self._reconnect_supervisor.shutdown()
+            self._reconnect_supervisor = None
         self.feed_state.transition_to(FeedState.DISABLED)
         self.pipeline_manager.stop_all()
+
+    def rebuild(self) -> bool:
+        """Tear down and rebuild the source-side ingest pipeline (Phase 10.B).
+
+        Called by `ReconnectSupervisor` on each scheduled attempt.
+        Returns whether `connect_source` succeeded — the actual proof
+        of recovery is a buffer arriving downstream, which drives
+        `RECONNECTING → LIVE` via `_promote_feed_state_on_arrival` on
+        the bus / appsrc thread.
+        """
+        LOGGER.info("rebuild feed=%s starting", self.feed.feed_id)
+        try:
+            self.pipeline_manager.stop_all()
+        except Exception:
+            LOGGER.exception(
+                "rebuild feed=%s stop_all raised; continuing", self.feed.feed_id
+            )
+        connected = self.pipeline_manager.connect_source()
+        if not connected:
+            LOGGER.warning(
+                "rebuild feed=%s connect_source returned False", self.feed.feed_id
+            )
+            return False
+        self.pipeline_manager.start_preview()
+        return True
 
     def is_started(self) -> bool:
         """Return whether the runtime has been started."""
