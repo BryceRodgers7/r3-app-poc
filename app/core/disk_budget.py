@@ -16,9 +16,12 @@ write rates.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable
+from pathlib import Path
+import shutil
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
     from app.config.settings import AppSettings
@@ -131,3 +134,58 @@ def assess_disk_budget(
         feed_count=len(feeds_list),
         verdict=verdict,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PreflightResult:
+    """Outcome of a Phase 10.C disk-space pre-flight at Start."""
+
+    sufficient: bool
+    free_bytes: int
+    required_bytes: int
+    grace_seconds: float
+    estimated_mb_s: float
+
+
+def evaluate_disk_preflight(
+    recording_dir: Path,
+    enabled_feeds: "Iterable[FeedDefinition]",
+    settings: "AppSettings",
+    *,
+    disk_usage_fn: Callable[[Any], Any] = shutil.disk_usage,
+) -> PreflightResult:
+    """Phase 10.C pre-flight: refuse Start when free space < grace window.
+
+    The probe target is the recording directory's parent volume — even
+    if the directory itself doesn't exist yet, `disk_usage` walks up
+    until it hits an existing path, which is what we want.
+    """
+    feeds_list = list(enabled_feeds)
+    estimated_mb_s = estimate_total_mb_s(feeds_list, settings)
+    grace_seconds = max(0.0, float(settings.disk_full_grace_seconds))
+    required_bytes = int(estimated_mb_s * grace_seconds * 1024.0 * 1024.0)
+    probe_target = _existing_ancestor(Path(recording_dir))
+    try:
+        usage = disk_usage_fn(probe_target)
+        free_bytes = int(usage.free)
+        sufficient = free_bytes >= required_bytes
+    except (OSError, FileNotFoundError):
+        # Probe failed (e.g. removable volume detached). Refuse Start
+        # — the operator should pick a valid recording_dir.
+        free_bytes = 0
+        sufficient = False
+    return PreflightResult(
+        sufficient=sufficient,
+        free_bytes=free_bytes,
+        required_bytes=required_bytes,
+        grace_seconds=grace_seconds,
+        estimated_mb_s=estimated_mb_s,
+    )
+
+
+def _existing_ancestor(path: Path) -> Path:
+    """Return `path` if it exists, else the nearest existing ancestor."""
+    p = path
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return p

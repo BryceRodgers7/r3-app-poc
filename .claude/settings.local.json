@@ -112,7 +112,10 @@
       "Bash(python -c \"from app.ui.main_window import MainWindow; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
       "Bash(python -m unittest discover -s tests -p \"test_reconnect_supervisor.py\" -v)",
       "Bash(python -m unittest discover -s tests -p \"test_reconnect_supervisor.py\")",
-      "Bash(python -c \"from app.media.feed_runtime import FeedRuntime; from app.core.reconnect_supervisor import ReconnectSupervisor; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
+      "Bash(python -c \"from app.media.feed_runtime import FeedRuntime; from app.core.reconnect_supervisor import ReconnectSupervisor; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
+      "Bash(python -m unittest discover -s tests -p \"test_disk_full_handling.py\" -v)",
+      "Bash(python -m unittest discover -s tests -p \"test_disk_full_handling.py\")",
+      "Bash(python -c \"from app.core.application_coordinator import ApplicationCoordinator; from app.core.disk_budget import evaluate_disk_preflight, PreflightResult; from app.media.pipeline_manager import _is_enospc_error; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
     ]
   }
 }

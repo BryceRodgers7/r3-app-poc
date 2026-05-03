@@ -96,6 +96,12 @@ class AppSettings:
     # spinning rust or shared volumes. Per-deployment override under
     # `[recording] disk_budget_mb_s = ...`.
     disk_budget_mb_s: float = 200.0
+    # Phase 10.C: pre-flight grace window. At Start, the coordinator
+    # estimates `feeds × per-feed-MB/s × disk_full_grace_seconds` worth
+    # of bytes and refuses to begin recording if the recording volume
+    # has less than that free. 60s is enough headroom that a short
+    # backup running in parallel won't tip the rig into ENOSPC.
+    disk_full_grace_seconds: float = 60.0
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -171,6 +177,10 @@ class AppSettings:
             settings.recording_audio_enabled = bool(recording_config["audio_enabled"])
         if "disk_budget_mb_s" in recording_config:
             settings.disk_budget_mb_s = float(recording_config["disk_budget_mb_s"])
+        if "disk_full_grace_seconds" in recording_config:
+            settings.disk_full_grace_seconds = float(
+                recording_config["disk_full_grace_seconds"]
+            )
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])

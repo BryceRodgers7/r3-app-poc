@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
+from collections.abc import Callable
+from typing import Any
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +35,7 @@ from app.core.disk_budget import (
     BudgetVerdict,
     DiskBudgetAssessment,
     assess_disk_budget,
+    evaluate_disk_preflight,
 )
 from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
@@ -76,6 +80,7 @@ class ApplicationCoordinator:
         session_clock: SessionClock | None = None,
         disk_budget: DiskBudgetAssessment | None = None,
         play_manager: PlayManager | None = None,
+        disk_usage_fn: Callable[[Any], Any] | None = None,
     ) -> None:
         self._settings = settings
         self._session_manager = session_manager
@@ -89,6 +94,11 @@ class ApplicationCoordinator:
         # event emitted from `initialize()`. None when the coordinator
         # was constructed without budget validation (older test paths).
         self.disk_budget = disk_budget
+        # Phase 10.C: injection seam for the pre-flight disk-space
+        # probe. Tests pass a fake; production uses `shutil.disk_usage`.
+        self._disk_usage_fn: Callable[[Any], Any] = (
+            disk_usage_fn if disk_usage_fn is not None else shutil.disk_usage
+        )
         # Slice 4.B: shared per-app in-memory segment index. Each feed's
         # PipelineManager writes finalized segments here as they close.
         self.segment_index = segment_index if segment_index is not None else SegmentIndex()
@@ -231,6 +241,12 @@ class ApplicationCoordinator:
             self.program_controller.refresh_recording_state()
             self.operator_controller.signals.status_message.emit("Game recording stopped.")
             return
+        # Phase 10.C: pre-flight disk-space check before any state moves.
+        # Refuses Start when free space wouldn't cover one grace window
+        # of recording, emits a `disk_full_blocked` health event so the
+        # 10.A banner surfaces it, and leaves the Start button intact.
+        if not self._check_disk_preflight(session_paths.recording_dir):
+            return
         recording_sm.transition_to(RecordingState.STARTING_RECORDING)
         # Phase 7.D: if the operator picked Resume on launch and this
         # is the first Start press of the run, continue the crashed
@@ -312,6 +328,9 @@ class ApplicationCoordinator:
                     start_session_time_ns=play_start_ns,
                 )
         recording_sm.transition_to(RecordingState.RECORDING)
+        # Phase 10.C: a successful Start clears any prior preflight
+        # block so the banner dismisses (operator freed up space).
+        self._clear_disk_full_blocked_marker()
         # Drive the session manifest forward on every Start press, not
         # just the first. After Stop, the session is in STOPPED; the
         # second game's Start needs to flip it back to RECORDING so
@@ -401,6 +420,55 @@ class ApplicationCoordinator:
         self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
+
+    def _check_disk_preflight(self, recording_dir: Path) -> bool:
+        """Phase 10.C: refuse Start when free space < grace window.
+
+        Returns True when sufficient (Start may proceed). On
+        insufficient: records a `disk_full_blocked` health event,
+        emits a status message, and returns False so the caller bails
+        without driving any state transitions.
+        """
+        feed_defs = [runtime.feed for runtime in self._feed_runtimes.values()]
+        result = evaluate_disk_preflight(
+            recording_dir,
+            feed_defs,
+            self._settings,
+            disk_usage_fn=self._disk_usage_fn,
+        )
+        if result.sufficient:
+            return True
+        free_mb = result.free_bytes / (1024.0 * 1024.0)
+        required_mb = result.required_bytes / (1024.0 * 1024.0)
+        message = (
+            f"Disk too full to start recording: {free_mb:.0f} MB free, "
+            f"{required_mb:.0f} MB required for {result.grace_seconds:.0f}s "
+            f"grace window."
+        )
+        log = default_health_log()
+        if not log.has_open_event(category="disk_full_blocked", feed_id=None):
+            log.record(
+                severity=HealthSeverity.ERROR,
+                category="disk_full_blocked",
+                message=message,
+                metadata={
+                    "free_bytes": result.free_bytes,
+                    "required_bytes": result.required_bytes,
+                    "grace_seconds": result.grace_seconds,
+                    "estimated_mb_s": round(result.estimated_mb_s, 3),
+                },
+            )
+        self.operator_controller.signals.status_message.emit(
+            "Cannot start recording: insufficient free disk space."
+        )
+        LOGGER.warning("disk preflight refused Start: %s", message)
+        return False
+
+    def _clear_disk_full_blocked_marker(self) -> None:
+        """Drop the `disk_full_blocked` open marker on a successful Start."""
+        log = default_health_log()
+        if log.has_open_event(category="disk_full_blocked", feed_id=None):
+            log.clear_open_event(category="disk_full_blocked", feed_id=None)
 
     def _emit_disk_budget_health_event(self) -> None:
         """Surface a Phase 7.A disk-budget WARN / OVER verdict as a health event.
@@ -618,6 +686,9 @@ def build_default_application_coordinator(
         pipeline_manager.set_feed_metrics(feed_metrics)
         feed_state = make_feed_state_machine(feed.feed_id, feed.display_name)
         pipeline_manager.set_feed_state(feed_state)
+        # Phase 10.C: pipeline_manager drives RecordingState →
+        # RECORDING_ERROR on ENOSPC bus errors.
+        pipeline_manager.set_recording_state(recording_manager.recording_state)
         telemetry_hub.register_feed_state(feed.feed_id, feed_state)
         # Slice 3.B: hub samples queue depths from this pipeline once
         # per log tick; the bound-method captures the pipeline_manager.

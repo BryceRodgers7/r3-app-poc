@@ -27,6 +27,13 @@ LOGGER = logging.getLogger(__name__)
 
 FEED_LOST_ZERO_SAMPLES = 3
 DISK_LOW_FRACTION = 0.05
+# Phase 10.C: ERROR-tier disk threshold. Below this fraction, the
+# pre-flight grace window won't keep recording alive much longer —
+# surface as `disk_critical` so the 10.A banner goes red.
+DISK_CRITICAL_FRACTION = 0.02
+# Hard floor in bytes: even a 10TB disk is in trouble below 1GB free,
+# regardless of percentage.
+DISK_CRITICAL_MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
 DROPPED_BUFFERS_DEGRADED_THRESHOLD = 1.0  # buffers/sec sustained → DEGRADED
 
 
@@ -807,11 +814,31 @@ class TelemetryHub:
         self._evaluate_disk_health(snap)
 
     def _evaluate_disk_health(self, snap: DiskSnapshot) -> None:
-        """Emit a health event when free disk space drops below the threshold."""
+        """Emit a health event when free disk space drops below the threshold.
+
+        Two tiers (Phase 10.C):
+
+        - `disk_low` (WARNING) — free fraction < `DISK_LOW_FRACTION`.
+        - `disk_critical` (ERROR) — free fraction < `DISK_CRITICAL_FRACTION`
+          OR free bytes < `DISK_CRITICAL_MIN_FREE_BYTES`. The byte
+          floor catches very large disks where 5% is still many GB
+          but 0.5% might be < 1GB — recording will hit ENOSPC soon
+          regardless of percentage.
+
+        Critical implies low (the lower threshold is strictly more
+        free space than the critical threshold), so the disk_low
+        marker is also held open while critical is open.
+        """
         if snap.total_bytes <= 0:
             return
         fraction_free = snap.free_bytes / snap.total_bytes
-        if fraction_free < DISK_LOW_FRACTION:
+        is_low = fraction_free < DISK_LOW_FRACTION
+        is_critical = (
+            fraction_free < DISK_CRITICAL_FRACTION
+            or snap.free_bytes < DISK_CRITICAL_MIN_FREE_BYTES
+        )
+
+        if is_low:
             if not self._health_log.has_open_event(category="disk_low", feed_id=None):
                 self._health_log.record(
                     severity=HealthSeverity.WARNING,
@@ -833,3 +860,28 @@ class TelemetryHub:
                 metadata={"path": snap.path},
             )
             self._health_log.clear_open_event(category="disk_low", feed_id=None)
+
+        if is_critical:
+            if not self._health_log.has_open_event(
+                category="disk_critical", feed_id=None
+            ):
+                free_gb = snap.free_bytes / (1024.0 ** 3)
+                self._health_log.record(
+                    severity=HealthSeverity.ERROR,
+                    category="disk_critical",
+                    message=(
+                        f"Disk space critically low: {fraction_free * 100:.1f}% "
+                        f"({free_gb:.2f} GB free) on {snap.path}."
+                    ),
+                    metadata={
+                        "path": snap.path,
+                        "free_bytes": snap.free_bytes,
+                        "total_bytes": snap.total_bytes,
+                    },
+                )
+        elif self._health_log.has_open_event(
+            category="disk_critical", feed_id=None
+        ):
+            self._health_log.clear_open_event(
+                category="disk_critical", feed_id=None
+            )

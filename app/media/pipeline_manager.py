@@ -19,7 +19,12 @@ import numpy as np
 from datetime import datetime, timezone
 
 from app.core.feed_state import FeedState
-from app.core.health_events import HealthSeverity, record_health_event
+from app.core.recording_state import RecordingState
+from app.core.health_events import (
+    HealthSeverity,
+    default_log as default_health_log,
+    record_health_event,
+)
 from app.core.models import (
     AudioFormat,
     FrameOverlayInfo,
@@ -41,6 +46,26 @@ from app.storage.metadata_db import MetadataDb
 from app.storage.segment_index import SegmentIndex
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_enospc_error(error: Any, debug: str, Gst: Any) -> bool:
+    """Recognise ENOSPC on the GStreamer bus (Phase 10.C).
+
+    Tries the GLib quark/code path first (works when the error
+    propagates as `Gst.ResourceError.NO_SPACE_LEFT`), then falls back
+    to a substring scan on the human-readable message + debug. The
+    fallback covers oddly-wrapped errors and environments where the
+    GLib bindings differ.
+    """
+    try:
+        resource_quark = Gst.ResourceError.quark()
+        no_space_code = Gst.ResourceError.NO_SPACE_LEFT
+        if hasattr(error, "matches") and error.matches(resource_quark, no_space_code):
+            return True
+    except Exception:
+        pass
+    text = (str(error) + " " + (debug or "")).lower()
+    return "no space left" in text or "enospc" in text
 
 
 def unrouted_segments_dir() -> Path:
@@ -115,6 +140,11 @@ class PipelineManager:
         self._frame_callback: Callable[[MediaFrame], None] | None = None
         self._feed_metrics: FeedMetrics | None = None
         self._feed_state: StateMachine[FeedState] | None = None
+        # Phase 10.C: when ENOSPC fires on the bus, drive the global
+        # recording state machine to RECORDING_ERROR rather than
+        # `FeedState → DISCONNECTED` (the source is fine; the disk is
+        # the problem). None when not attached (e.g. test fixtures).
+        self._recording_state: StateMachine[RecordingState] | None = None
 
         self._Gst: Any | None = None
         self._GstVideo: Any | None = None
@@ -544,6 +574,16 @@ class PipelineManager:
     def set_feed_state(self, state_machine: StateMachine[FeedState] | None) -> None:
         """Attach the per-feed state machine driven by bus events."""
         self._feed_state = state_machine
+
+    def set_recording_state(
+        self, state_machine: StateMachine[RecordingState] | None
+    ) -> None:
+        """Attach the global recording state machine (Phase 10.C).
+
+        Used to drive `RECORDING → RECORDING_ERROR` on ENOSPC bus
+        errors so the disk-full case is distinguishable from a feed
+        disconnect."""
+        self._recording_state = state_machine
 
     def set_metadata_db(self, db: MetadataDb | None) -> None:
         """Attach the SQLite metadata-db that segment rows are written to (slice 4.B)."""
@@ -2344,7 +2384,35 @@ class PipelineManager:
                 summary=summary,
                 details=details,
             )
-            if self._feed_state is not None and pipeline_role == "live":
+            # Phase 10.C: classify ENOSPC (filesink ran out of disk)
+            # separately from a generic source loss. Disk full is a
+            # recording-state condition, not a source-state condition,
+            # and the operator response is different (free space and
+            # restart, not "the camera is broken").
+            is_enospc = _is_enospc_error(error, details, Gst)
+            if is_enospc:
+                if not default_health_log().has_open_event(
+                    category="disk_full_during_record", feed_id=feed_id
+                ):
+                    default_health_log().record(
+                        severity=HealthSeverity.ERROR,
+                        category="disk_full_during_record",
+                        message=(
+                            f"feed={feed_id}: ENOSPC while writing recording — "
+                            f"{summary}"
+                        ),
+                        feed_id=feed_id,
+                        metadata={"summary": summary, "details": details},
+                    )
+                if (
+                    self._recording_state is not None
+                    and self._recording_state.state
+                    in {RecordingState.RECORDING, RecordingState.STARTING_RECORDING}
+                ):
+                    self._recording_state.transition_to(
+                        RecordingState.RECORDING_ERROR
+                    )
+            elif self._feed_state is not None and pipeline_role == "live":
                 # ERROR on the live ingest pipeline means we lost the source.
                 self._feed_state.transition_to(FeedState.DISCONNECTED)
             if fatal:
