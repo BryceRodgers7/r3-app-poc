@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
+import threading
 
 from app.core.feed_state import FeedState, make_feed_state_machine
 from app.core.models import FeedDefinition, FrameOverlayInfo, IngestTelemetry, MediaFrame, SessionPaths
@@ -102,6 +103,29 @@ class FeedRuntime:
             return False
         self.pipeline_manager.start_preview()
         return True
+
+    def request_encoder_software_fallback(self) -> None:
+        """Phase 11.A: rebuild the pipeline pinned to software encoding.
+
+        Invoked by `PipelineManager` from the bus-error path when the
+        recording-branch encoder fails caps negotiation. The
+        `force_software_encoder()` flag is already set by the caller;
+        we just need to schedule the rebuild on a thread that *isn't*
+        the bus thread (the rebuild tears the bus down).
+
+        Spec (architecture §11.A): does NOT route through
+        `FeedState.DISCONNECTED` because the source is healthy — the
+        ReconnectSupervisor's source-side backoff would be the wrong
+        recovery posture for an encoder-side fault.
+        """
+        LOGGER.info(
+            "encoder fallback rebuild scheduled for feed=%s", self.feed.feed_id
+        )
+        threading.Thread(
+            target=self.rebuild,
+            name=f"encoder-fallback-{self.feed.feed_id}",
+            daemon=True,
+        ).start()
 
     def is_started(self) -> bool:
         """Return whether the runtime has been started."""

@@ -10,6 +10,7 @@ from typing import Any
 CONFIG_FILENAME = "app_settings.toml"
 
 _VALID_SOURCE_KINDS = {"ndi", "synthetic"}
+_VALID_HWACCEL_VALUES = {"auto", "none", "nvidia", "intel", "amd"}
 
 
 def _validate_source_kind(kind: str, *, where: str) -> None:
@@ -25,6 +26,16 @@ def _validate_source_kind(kind: str, *, where: str) -> None:
     raise RuntimeError(
         f"{where}: unsupported kind={kind!r}. Valid values are "
         f"{sorted(_VALID_SOURCE_KINDS)}."
+    )
+
+
+def _validate_hwaccel(value: str, *, where: str) -> None:
+    """Reject unknown `[media] hardware_acceleration` values."""
+    if value in _VALID_HWACCEL_VALUES:
+        return
+    raise RuntimeError(
+        f"{where}: hardware_acceleration={value!r} is not supported. "
+        f"Valid values are {sorted(_VALID_HWACCEL_VALUES)}."
     )
 
 
@@ -69,6 +80,14 @@ class AppSettings:
     audio_sample_rate: int = 48_000
     audio_channels: int = 2
     audio_bitrate: int = 128_000
+    # [media] block — Phase 11.A. Picks the recording-branch encoder
+    # (`app/media/encoder_factory.py`). "auto" probes for the best
+    # available hwaccel encoder and falls back to software when none is
+    # found; "none" pins the pipeline to software regardless of what's
+    # installed. Vendor values (`nvidia`, `intel`, `amd`) bias the
+    # probe toward that vendor's elements but still fall back to
+    # software when unavailable. See architecture §7.4.
+    media_hardware_acceleration: str = "auto"
     # [recording] block — Phase 4. Native segmented recording via
     # `splitmuxsink`. MJPEG-in-MKV is the 4.A target codec/container; both
     # are intra-frame seekable per §15.7 and use elements that ship in
@@ -159,6 +178,15 @@ class AppSettings:
             settings.audio_channels = int(app_config["audio_channels"])
         if "audio_bitrate" in app_config:
             settings.audio_bitrate = int(app_config["audio_bitrate"])
+
+        media_config = cls._as_dict(data.get("media"))
+        if "hardware_acceleration" in media_config:
+            raw_hwaccel = (
+                str(media_config["hardware_acceleration"]).strip().lower()
+                or "auto"
+            )
+            _validate_hwaccel(raw_hwaccel, where="[media]")
+            settings.media_hardware_acceleration = raw_hwaccel
 
         recording_config = cls._as_dict(data.get("recording"))
         if "enabled" in recording_config:

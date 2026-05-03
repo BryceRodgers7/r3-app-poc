@@ -112,6 +112,11 @@ class FeedMetricsSnapshot:
     dropped_per_sec: float = 0.0
     python_frames_per_sec: float = 0.0
     pipeline_mode: str = "python_push"
+    # Phase 11.A: name of the GStreamer element actually wired into the
+    # recording branch (e.g. "jpegenc" or "qsvjpegenc"). Surfaces in the
+    # diagnostics widget so the operator can tell whether the hwaccel
+    # path is engaged.
+    recording_encoder: str = "jpegenc"
     queue_depth_preview: int = 0
     queue_depth_recording: int = 0
     queue_max_preview: int = 0
@@ -161,6 +166,7 @@ class FeedMetrics:
         "feed_id",
         "display_name",
         "pipeline_mode",
+        "recording_encoder",
         "_source",
         "_preview",
         "_recording",
@@ -184,6 +190,10 @@ class FeedMetrics:
         self.feed_id = feed_id
         self.display_name = display_name
         self.pipeline_mode = pipeline_mode
+        # Phase 11.A: starts as the software default; pipeline_manager
+        # overwrites via `set_recording_encoder` once the encoder
+        # factory has picked an element at pipeline-build time.
+        self.recording_encoder = "jpegenc"
         self._source = RateCounter(window_seconds, clock=clock)
         self._preview = RateCounter(window_seconds, clock=clock)
         self._recording = RateCounter(window_seconds, clock=clock)
@@ -211,6 +221,10 @@ class FeedMetrics:
 
     def set_pipeline_mode(self, mode: str) -> None:
         self.pipeline_mode = mode
+
+    def set_recording_encoder(self, element_name: str) -> None:
+        """Phase 11.A: record which encoder element the factory picked."""
+        self.recording_encoder = str(element_name)
 
     def set_queue_depths(
         self,
@@ -242,6 +256,7 @@ class FeedMetrics:
             dropped_per_sec=self._dropped.rate(),
             python_frames_per_sec=self._python_frames.rate(),
             pipeline_mode=self.pipeline_mode,
+            recording_encoder=self.recording_encoder,
             queue_depth_preview=self._queue_depth_preview,
             queue_depth_recording=self._queue_depth_recording,
             queue_max_preview=self._queue_max_preview,

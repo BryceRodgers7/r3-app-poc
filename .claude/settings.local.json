@@ -124,7 +124,20 @@
       "Bash(python -c \"from app.core.segment_validator_worker import SegmentValidatorWorker; from app.media.pipeline_manager import PipelineManager; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
       "Bash(python -m unittest discover -s tests -p \"test_shutdown_drain.py\")",
       "Bash(python -m unittest discover -s tests -p \"test_replay_current_play.py\")",
-      "Bash(python -c \"from app.core.application_coordinator import ApplicationCoordinator; from app.core.playback_controller import PlaybackController; print\\('imports ok'\\)\")"
+      "Bash(python -c \"from app.core.application_coordinator import ApplicationCoordinator; from app.core.playback_controller import PlaybackController; print\\('imports ok'\\)\")",
+      "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe libav *)",
+      "Read(//c/msys64/usr/bin/**)",
+      "Bash(C:/msys64/usr/bin/pacman.exe -Si mingw-w64-ucrt-x86_64-gst-libav)",
+      "Bash(C:/msys64/usr/bin/pacman.exe -S --noconfirm --needed mingw-w64-ucrt-x86_64-gst-libav)",
+      "Bash(Get-ChildItem -Path \"C:\\\\git\\\\r3-app\\\\tests\" -Filter \"*.py\")",
+      "Bash(Select-Object -ExpandProperty Name)",
+      "Bash(python -m unittest tests.test_encoder_factory tests.test_app_settings tests.test_recording_settings tests.test_audio_relink_on_rebuild tests.test_session_clock)",
+      "Bash(python -m unittest discover -s tests -p 'test_encoder_factory.py')",
+      "Bash(python -m unittest discover -s tests -p 'test_app_settings.py')",
+      "Bash(python -m unittest discover -s tests -p 'test_recording_settings.py')",
+      "Bash(python -m unittest discover -s tests -p 'test_audio_relink_on_rebuild.py')",
+      "Bash(python -m unittest discover -s tests -p 'test_session_clock.py')",
+      "Bash(python *)"
     ]
   }
 }

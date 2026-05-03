@@ -90,7 +90,7 @@ class SessionClockRebaseTests(unittest.TestCase):
 
 
 class PipelineManagerSessionTimeCaptureTests(unittest.TestCase):
-    """Drive `_on_jpegenc_buffer_probe` + `_finalize_pending_segment_locked`
+    """Drive `_on_record_encoder_buffer_probe` + `_finalize_pending_segment_locked`
     through a stub `PipelineManager` to confirm that session-time fields
     end up on the `Segment` row."""
 

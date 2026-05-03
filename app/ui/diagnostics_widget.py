@@ -128,6 +128,7 @@ class DiagnosticsWidget(QFrame):
                 )
                 lines.append(
                     f"{s.feed_id:<12} {fs_text:<13} {mode_text:<22} "
+                    f"enc {s.recording_encoder:<13} "
                     f"src {s.source_fps:5.1f}  prv {s.preview_fps:5.1f}  "
                     f"rec {s.recording_fps:5.1f}  drop {s.dropped_per_sec:4.1f}/s  "
                     f"qprv {s.queue_depth_preview}/{s.queue_max_preview} "

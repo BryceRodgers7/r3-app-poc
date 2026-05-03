@@ -28,6 +28,17 @@ enable_embedded_audio = true
 live_audio_monitor_enabled = true
 audio_bitrate = 128000
 
+[media]
+# Phase 11.A: encoder selection for the recording branch.
+#   "auto"   — probe and use the best hwaccel encoder available, fall back to software
+#   "none"   — pin to software encoding regardless of what's installed
+#   "intel"  — prefer Intel QuickSync (`qsvjpegenc` for MJPEG)
+#   "nvidia" — prefer NVIDIA NVENC (no MJPEG element on Windows; falls back to software)
+#   "amd"    — prefer AMD AMF (no MJPEG element on Windows; falls back to software)
+# Unrequested fallbacks emit a `hwaccel_fallback` INFO health event so
+# the diagnostics widget shows what actually got picked.
+hardware_acceleration = "auto"
+
 [recording]
 enabled = true
 segment_duration_seconds = 4.0

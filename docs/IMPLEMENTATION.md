@@ -346,7 +346,7 @@ Per app, at runtime:
   Qt timer callbacks (`_on_replay_timer_tick`, `_on_overlay_timer_tick`),
   health-event emission from those.
 - **GStreamer streaming thread (per pipeline)** — buffer probes
-  (`_on_jpegenc_buffer_probe`, `_on_native_preview_buffer_probe`,
+  (`_on_record_encoder_buffer_probe`, `_on_native_preview_buffer_probe`,
   `_on_record_branch_buffer_probe`, audio-presence probe), appsink
   `new-sample` signal handlers, splitmuxsink's `format-location`
   callback, `prepare-window-handle` sync bus messages.
@@ -402,7 +402,7 @@ high-frequency.
 `format-location` callback (and inside `disable_file_recording`) reads
 the in-memory `_pending_segment` dict and writes a `Segment` row
 synchronously. The dict is updated only by the same callback chain
-plus `_on_jpegenc_buffer_probe` (also streaming-thread), so no lock
+plus `_on_record_encoder_buffer_probe` (also streaming-thread), so no lock
 is needed on the dict itself; the SQLite write goes through
 `MetadataDb._write_lock`.
 

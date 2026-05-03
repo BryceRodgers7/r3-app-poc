@@ -200,7 +200,7 @@ class RebuildAudioUnlinkContractTests(unittest.TestCase):
         pm = PipelineManager.__new__(PipelineManager)
         pm._Gst = _StubGst
         pm._pipeline = _StubPipeline()
-        pm._record_branch_jpegenc = _StubJpegenc()
+        pm._record_branch_encoder = _StubJpegenc()
         pm._record_branch_name = "record"
         pm._recording_feed_id = "ndi_1"
 

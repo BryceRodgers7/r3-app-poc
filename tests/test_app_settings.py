@@ -115,6 +115,47 @@ kind = "auto"
         self.assertEqual(feed.source_kind, "ndi")
         self.assertEqual(feed.ndi_name, "Program NDI")
 
+    def test_media_hardware_acceleration_defaults_to_auto(self) -> None:
+        # No [media] table in TOML — default kicks in.
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[app]
+target_fps = 30.0
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.media_hardware_acceleration, "auto")
+
+    def test_media_hardware_acceleration_round_trip(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[media]
+hardware_acceleration = "intel"
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.media_hardware_acceleration, "intel")
+
+    def test_media_hardware_acceleration_rejects_unknown_value(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[media]
+hardware_acceleration = "vulkan"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("hardware_acceleration", str(ctx.exception))
+
     def test_load_reads_feeds_array_for_multi_feed(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "app_settings.toml"

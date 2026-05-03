@@ -770,6 +770,7 @@ def build_default_application_coordinator(
             recording_audio_enabled=settings.recording_audio_enabled,
             audio_bitrate=settings.audio_bitrate,
             force_python_push_preview=settings.force_python_push_preview,
+            media_hardware_acceleration=settings.media_hardware_acceleration,
         )
         feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
         feed_metrics.set_pipeline_mode(source.pipeline_mode.value)
@@ -816,6 +817,13 @@ def build_default_application_coordinator(
             source=source,
             pipeline_manager=pipeline_manager,
             feed_state=feed_state,
+        )
+        # Phase 11.A: pipeline_manager calls back into the runtime when
+        # the bus catches an encoder negotiation failure, so the
+        # rebuild runs on a fresh thread (not the bus thread) and
+        # bypasses the source-side reconnect supervisor.
+        pipeline_manager.set_encoder_fallback_handler(
+            runtime.request_encoder_software_fallback
         )
         feed_runtimes[feed.feed_id] = runtime
 

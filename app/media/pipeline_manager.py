@@ -38,6 +38,7 @@ from app.core.models import (
 from app.core.session_clock import SessionClock
 from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
+from app.media.encoder_factory import EncoderSelection, select_encoder
 from app.media.frame_overlay import render_frame_overlay
 from app.media.gst_bus_log import log_bus_message
 from app.media.source_interface import PipelineMode
@@ -67,6 +68,31 @@ def _is_enospc_error(error: Any, debug: str, Gst: Any) -> bool:
         pass
     text = (str(error) + " " + (debug or "")).lower()
     return "no space left" in text or "enospc" in text
+
+
+def _is_negotiation_error(error: Any, debug: str, Gst: Any) -> bool:
+    """Recognise a caps-negotiation failure on the GStreamer bus (Phase 11.A).
+
+    Negotiation failures surface as `GstCoreError.NEGOTIATION` from the
+    encoder element when the upstream caps don't match what the encoder
+    accepts (typical for hwaccel encoders with strict format/colorspace
+    requirements). The fallback also covers oddly-wrapped errors via a
+    substring scan of the human-readable text — same pattern as
+    `_is_enospc_error`.
+    """
+    try:
+        core_quark = Gst.CoreError.quark()
+        negotiation_code = Gst.CoreError.NEGOTIATION
+        if hasattr(error, "matches") and error.matches(core_quark, negotiation_code):
+            return True
+    except Exception:
+        pass
+    text = (str(error) + " " + (debug or "")).lower()
+    return (
+        "not-negotiated" in text
+        or "could not negotiate" in text
+        or "internal data stream error" in text and "encoder" in text
+    )
 
 
 def unrouted_segments_dir() -> Path:
@@ -123,6 +149,7 @@ class PipelineManager:
         recording_audio_enabled: bool = True,
         audio_bitrate: int = 128_000,
         force_python_push_preview: bool = False,
+        media_hardware_acceleration: str = "auto",
     ) -> None:
         self._source = source
         self._preview_output = preview_output
@@ -136,6 +163,19 @@ class PipelineManager:
         # Slice 3.A.3 escape hatch — when True, force the appsink/QImage
         # path even on NATIVE-mode sources.
         self._force_python_push_preview = force_python_push_preview
+        # Phase 11.A: hwaccel preference threaded down from AppSettings.
+        # `_force_software_encoder` flips sticky-True if the bus-error
+        # path catches an encoder negotiation failure — subsequent
+        # rebuilds within this process pin to software.
+        self._media_hardware_acceleration = media_hardware_acceleration
+        self._force_software_encoder: bool = False
+        self._record_branch_encoder_selection: EncoderSelection | None = None
+        # Phase 11.A: handler invoked when the bus catches an encoder
+        # negotiation failure. Wired by ApplicationCoordinator to the
+        # owning FeedRuntime — bypasses the DISCONNECTED →
+        # ReconnectSupervisor path (the source is fine, only the
+        # encoder needs replacement).
+        self._encoder_fallback_handler: Callable[[], None] | None = None
         self._preview_running = False
         self._recording_running = False
         self._frame_callback: Callable[[MediaFrame], None] | None = None
@@ -230,7 +270,7 @@ class PipelineManager:
         # src pad links into splitmuxsink, and the branch name
         # determines the element's GST name. Captured during
         # `_add_record_branch_via_splitmuxsink`.
-        self._record_branch_jpegenc: Any | None = None
+        self._record_branch_encoder: Any | None = None
         self._record_branch_name: str | None = None
         # Phase 7.G bug-fix: the audio_record opusenc, captured during
         # `_add_audio_record_branch_to_splitmuxsink`. The rebuild path
@@ -608,6 +648,32 @@ class PipelineManager:
         errors so the disk-full case is distinguishable from a feed
         disconnect."""
         self._recording_state = state_machine
+
+    def set_encoder_fallback_handler(
+        self, handler: Callable[[], None] | None
+    ) -> None:
+        """Phase 11.A: register the encoder-fallback callback.
+
+        Invoked from the bus-error path when caps negotiation fails on
+        the recording-branch encoder. The handler must pin the next
+        pipeline build to software (`force_software_encoder()`) and
+        schedule a rebuild — *without* going through `FeedState
+        .DISCONNECTED`, since the source is healthy and the
+        ReconnectSupervisor's backoff isn't appropriate for an
+        encoder-side fault.
+        """
+        self._encoder_fallback_handler = handler
+
+    def force_software_encoder(self) -> None:
+        """Phase 11.A: pin subsequent pipeline builds to software.
+
+        Sticky-True for the rest of the process. A hwaccel element
+        that has failed caps negotiation once is unlikely to succeed
+        on retry within the same driver/runtime state; flipping this
+        flag avoids a thrash loop between hwaccel retry and
+        software fallback.
+        """
+        self._force_software_encoder = True
 
     def set_segment_validator_worker(
         self,
@@ -1246,13 +1312,13 @@ class PipelineManager:
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
         self._configure_record_queue(queue, branch_name)
-        # Force the input to jpegenc to be BT.601 I420. JPEG has no
+        # Force the input to the encoder to be BT.601 I420. JPEG has no
         # standardized colorimetry tag; players decode assuming BT.601.
-        # If we let the BT.709 source flow straight to jpegenc, players
-        # will use the wrong matrix to convert YUV→RGB and colors will
-        # shift visibly. Pinning caps here pushes videoconvert to do the
-        # 709→601 conversion before encoding, so the JPEG content
-        # actually matches what decoders expect.
+        # If we let the BT.709 source flow straight to the encoder,
+        # players will use the wrong matrix to convert YUV→RGB and
+        # colors will shift visibly. Pinning caps here pushes
+        # videoconvert to do the 709→601 conversion before encoding, so
+        # the JPEG content actually matches what decoders expect.
         encode_caps = self._make_element("capsfilter", f"{branch_name}_encode_caps")
         encode_caps.set_property(
             "caps",
@@ -1260,20 +1326,35 @@ class PipelineManager:
                 "video/x-raw,format=I420,colorimetry=bt601"
             ),
         )
-        jpegenc = self._make_element("jpegenc", f"{branch_name}_jpegenc")
+        # Phase 11.A: pick the encoder element via the factory.
+        # Sticky-software fallback when a prior pipeline build saw the
+        # hwaccel element fail caps negotiation; otherwise probes
+        # `Gst.ElementFactory.find()` per the requested hwaccel.
+        encoder_selection = select_encoder(
+            hwaccel=self._media_hardware_acceleration,
+            codec=self._recording_codec,
+            gst_module=Gst,
+            force_software=self._force_software_encoder,
+        )
+        encoder = self._make_element(
+            encoder_selection.element_name,
+            f"{branch_name}_{encoder_selection.element_name}",
+        )
+        for prop_name, prop_value in encoder_selection.factory_args.items():
+            encoder.set_property(prop_name, prop_value)
         splitmuxsink = self._build_splitmuxsink_element(branch_name)
 
         valve.set_property("drop", True)
 
-        for element in (queue, valve, convert, encode_caps, jpegenc, splitmuxsink):
+        for element in (queue, valve, convert, encode_caps, encoder, splitmuxsink):
             self._pipeline.add(element)
 
         if not (
             queue.link(valve)
             and valve.link(convert)
             and convert.link(encode_caps)
-            and encode_caps.link(jpegenc)
-            and jpegenc.link(splitmuxsink)
+            and encode_caps.link(encoder)
+            and encoder.link(splitmuxsink)
         ):
             raise RuntimeError(f"Failed to link the {branch_name} branch.")
 
@@ -1294,26 +1375,64 @@ class PipelineManager:
                 None,
             )
 
-        # Slice 4.B: probe jpegenc's src so we capture per-segment first/last
-        # PTS and frame counts of the *encoded* stream (matches what
-        # splitmuxsink actually writes to disk).
-        jpegenc_src_pad = jpegenc.get_static_pad("src")
-        if jpegenc_src_pad is not None:
-            jpegenc_src_pad.add_probe(
+        # Slice 4.B: probe the encoder's src so we capture per-segment
+        # first/last PTS and frame counts of the *encoded* stream
+        # (matches what splitmuxsink actually writes to disk).
+        encoder_src_pad = encoder.get_static_pad("src")
+        if encoder_src_pad is not None:
+            encoder_src_pad.add_probe(
                 Gst.PadProbeType.BUFFER,
-                self._on_jpegenc_buffer_probe,
+                self._on_record_encoder_buffer_probe,
                 None,
             )
 
-        for element in (queue, valve, convert, encode_caps, jpegenc, splitmuxsink):
+        for element in (queue, valve, convert, encode_caps, encoder, splitmuxsink):
             element.sync_state_with_parent()
 
         self._branch_valves[branch_name] = valve
         self._splitmuxsink = splitmuxsink
         # Capture refs needed to rebuild the splitmuxsink on the next
         # disable/enable cycle.
-        self._record_branch_jpegenc = jpegenc
+        self._record_branch_encoder = encoder
+        self._record_branch_encoder_selection = encoder_selection
         self._record_branch_name = branch_name
+
+        # Surface the choice: INFO log + diagnostics field. `hwaccel_fallback`
+        # health event fires only when an unrequested fallback happened
+        # (operator asked for hwaccel and got software). When the operator
+        # explicitly set `hardware_acceleration = "none"`, software is
+        # the requested behavior and no event fires.
+        feed_id_for_log = self._source.get_feed_id()
+        LOGGER.info(
+            "recording encoder feed=%s codec=%s element=%s reason=%s",
+            feed_id_for_log,
+            self._recording_codec,
+            encoder_selection.element_name,
+            encoder_selection.reason,
+        )
+        if self._feed_metrics is not None:
+            self._feed_metrics.set_recording_encoder(encoder_selection.element_name)
+        if (
+            encoder_selection.is_software_fallback
+            and encoder_selection.requested_hwaccel != "none"
+            and not self._force_software_encoder
+        ):
+            record_health_event(
+                severity=HealthSeverity.INFO,
+                category="hwaccel_fallback",
+                message=(
+                    f"feed={feed_id_for_log}: requested hardware_acceleration="
+                    f"{encoder_selection.requested_hwaccel} but using "
+                    f"{encoder_selection.element_name} — {encoder_selection.reason}"
+                ),
+                feed_id=feed_id_for_log,
+                metadata={
+                    "requested_hwaccel": encoder_selection.requested_hwaccel,
+                    "codec": self._recording_codec,
+                    "fallback_element": encoder_selection.element_name,
+                    "reason": encoder_selection.reason,
+                },
+            )
 
     def _build_splitmuxsink_element(self, branch_name: str) -> Any:
         """Create + configure a `splitmuxsink` element.
@@ -1356,7 +1475,7 @@ class PipelineManager:
         """
         if (
             self._splitmuxsink is None
-            or self._record_branch_jpegenc is None
+            or self._record_branch_encoder is None
             or self._record_branch_name is None
             or self._pipeline is None
             or self._Gst is None
@@ -1365,14 +1484,14 @@ class PipelineManager:
                 "rebuild_splitmuxsink: prerequisites missing; skipping rebuild "
                 "(splitmuxsink=%s jpegenc=%s branch=%s pipeline=%s Gst=%s)",
                 self._splitmuxsink is not None,
-                self._record_branch_jpegenc is not None,
+                self._record_branch_encoder is not None,
                 self._record_branch_name is not None,
                 self._pipeline is not None,
                 self._Gst is not None,
             )
             return
         old = self._splitmuxsink
-        jpegenc = self._record_branch_jpegenc
+        jpegenc = self._record_branch_encoder
         branch_name = self._record_branch_name
         LOGGER.info(
             "rebuild_splitmuxsink: starting for feed_id=%s",
@@ -1576,7 +1695,7 @@ class PipelineManager:
             "last_pts_ns": None,
             "frame_count": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            # Slice 5.A — captured by `_on_jpegenc_buffer_probe` on
+            # Slice 5.A — captured by `_on_record_encoder_buffer_probe` on
             # first buffer; None means "no session_clock attached or
             # first buffer never arrived". Stays None for sessions
             # initialized in tests via `__new__` without a clock.
@@ -1584,7 +1703,7 @@ class PipelineManager:
         }
         return str(path)
 
-    def _on_jpegenc_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
+    def _on_record_encoder_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
         """Track per-segment first/last PTS and frame count (slice 4.B + 5.A).
 
         Runs on the streaming thread once per encoded JPEG buffer. Reads
@@ -2481,6 +2600,54 @@ class PipelineManager:
                 ):
                     self._recording_state.transition_to(
                         RecordingState.RECORDING_ERROR
+                    )
+            elif (
+                pipeline_role == "live"
+                and self._record_branch_encoder_selection is not None
+                and not self._record_branch_encoder_selection.is_software_fallback
+                and not self._force_software_encoder
+                and _is_negotiation_error(error, details, Gst)
+            ):
+                # Phase 11.A: encoder-side caps negotiation failure.
+                # The source is healthy; only the encoder needs
+                # replacement. Flip the sticky software flag, fire the
+                # fallback handler (which schedules the rebuild on a
+                # fresh thread — see FeedRuntime), and skip the
+                # DISCONNECTED transition so the ReconnectSupervisor
+                # doesn't enter its source-side backoff.
+                failed_selection = self._record_branch_encoder_selection
+                record_health_event(
+                    severity=HealthSeverity.WARNING,
+                    category="hwaccel_negotiation_failed",
+                    message=(
+                        f"feed={feed_id}: {failed_selection.element_name} "
+                        f"failed caps negotiation — falling back to software "
+                        f"encoder. {summary}"
+                    ),
+                    feed_id=feed_id,
+                    metadata={
+                        "failed_element": failed_selection.element_name,
+                        "requested_hwaccel": failed_selection.requested_hwaccel,
+                        "summary": summary,
+                        "details": details,
+                    },
+                )
+                self.force_software_encoder()
+                if self._encoder_fallback_handler is not None:
+                    try:
+                        self._encoder_fallback_handler()
+                    except Exception:
+                        LOGGER.exception(
+                            "encoder fallback handler raised for feed=%s",
+                            feed_id,
+                        )
+                else:
+                    LOGGER.warning(
+                        "encoder negotiation failed for feed=%s but no "
+                        "fallback handler is registered — "
+                        "_force_software_encoder is set, but a manual "
+                        "rebuild is required",
+                        feed_id,
                     )
             elif self._feed_state is not None and pipeline_role == "live":
                 # ERROR on the live ingest pipeline means we lost the source.

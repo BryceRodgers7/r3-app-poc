@@ -66,8 +66,8 @@ class SessionClock:
         cross-segment range queries stay correct across the crash.
 
         Safe only before any buffer has been processed by the new
-        clock. Once `PipelineManager._on_jpegenc_buffer_probe` has
-        captured a `session_time` for a writing segment, rebasing
+        clock. Once `PipelineManager._on_record_encoder_buffer_probe`
+        has captured a `session_time` for a writing segment, rebasing
         would corrupt that segment's metadata.
         """
         self._start_monotonic_ns = self._clock_ns() - anchor_session_time_ns
