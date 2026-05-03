@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 from app.core.feed_state import FeedState
 from app.core.recording_state import RecordingState
+from app.core.segment_validator_worker import SegmentValidatorWorker
 from app.core.health_events import (
     HealthSeverity,
     default_log as default_health_log,
@@ -145,6 +146,13 @@ class PipelineManager:
         # `FeedState → DISCONNECTED` (the source is fine; the disk is
         # the problem). None when not attached (e.g. test fixtures).
         self._recording_state: StateMachine[RecordingState] | None = None
+        # Phase 10.E: per-feed mid-session validator. Costs nothing
+        # until the first finalize submits a task — `submit()` lazily
+        # spins the daemon thread. Tests can swap the validator
+        # function via `set_segment_validator(...)`.
+        self._segment_validator_worker = SegmentValidatorWorker(
+            self._source.get_feed_id()
+        )
 
         self._Gst: Any | None = None
         self._GstVideo: Any | None = None
@@ -536,6 +544,22 @@ class PipelineManager:
 
         self._teardown_pipeline()
         self._source.disconnect_source()
+        # Phase 10.E: drain the validator worker so any finalized
+        # segments still in its queue get checked before the pipeline
+        # is rebuilt or torn down for good. 5s budget is generous —
+        # cv2-based validation of a 4s segment is sub-second.
+        worker = self._segment_validator_worker
+        if worker is not None:
+            try:
+                worker.shutdown(timeout=5.0)
+            except Exception:
+                LOGGER.debug(
+                    "segment_validator_worker shutdown raised", exc_info=True
+                )
+        # Reset for the next start (10.B reconnect path lands here too).
+        self._segment_validator_worker = SegmentValidatorWorker(
+            self._source.get_feed_id()
+        )
 
     def is_source_connected(self) -> bool:
         """Return whether the underlying ingest source is connected."""
@@ -584,6 +608,25 @@ class PipelineManager:
         errors so the disk-full case is distinguishable from a feed
         disconnect."""
         self._recording_state = state_machine
+
+    def set_segment_validator_worker(
+        self,
+        worker: SegmentValidatorWorker | None,
+    ) -> None:
+        """Replace the Phase 10.E mid-session validator worker.
+
+        Pass None to disable mid-session validation entirely (rare —
+        chiefly for tests that exercise the finalize path without
+        wanting a daemon thread spawned)."""
+        old = self._segment_validator_worker
+        self._segment_validator_worker = worker
+        if old is not None and old is not worker:
+            try:
+                old.shutdown(timeout=1.0)
+            except Exception:
+                LOGGER.debug(
+                    "old segment_validator_worker shutdown raised", exc_info=True
+                )
 
     def set_metadata_db(self, db: MetadataDb | None) -> None:
         """Attach the SQLite metadata-db that segment rows are written to (slice 4.B)."""
@@ -1658,6 +1701,33 @@ class PipelineManager:
             segment.size_bytes,
             segment.duration_ns // 1_000_000,
         )
+        # Phase 10.E: queue the segment for background validation. If
+        # the validator finds it corrupt, the worker quarantines the
+        # file, marks the DB row, evicts from the index, and emits a
+        # `segment_quarantined_runtime` health event. Validation runs
+        # on a daemon thread so finalize itself stays cheap. `getattr`
+        # tolerates the older PipelineManager.__new__-bypassing test
+        # stubs that don't initialize the worker attribute.
+        worker = getattr(self, "_segment_validator_worker", None)
+        if (
+            worker is not None
+            and self._recording_session_paths is not None
+            and segment.feed_id
+        ):
+            try:
+                feed_paths = self._recording_session_paths.get_feed_paths(
+                    segment.feed_id
+                )
+                worker.submit(
+                    segment,
+                    quarantine_dir=feed_paths.quarantine_dir,
+                    metadata_db=self._metadata_db,
+                    segment_index=self._segment_index,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "segment-validator submit failed for %s", file_path
+                )
 
     def _on_record_branch_buffer_probe(self, _pad: Any, _info: Any, _user: Any) -> Any:
         """Tick the recording-fps metric when the operator is actively recording."""

@@ -39,6 +39,7 @@ _OPERATOR_VISIBLE_CATEGORIES: dict[str, str] = {
     "disk_slow": "Disk write rate over budget",
     "recording_branch_saturated": "Disk too slow — recording degraded",
     "recording_error": "Encoder failure",
+    "segment_quarantined_runtime": "Corrupt segment quarantined",
     "session_dirty": "Session not safely recording",
 }
 

@@ -117,7 +117,11 @@
       "Bash(python -m unittest discover -s tests -p \"test_disk_full_handling.py\")",
       "Bash(python -c \"from app.core.application_coordinator import ApplicationCoordinator; from app.core.disk_budget import evaluate_disk_preflight, PreflightResult; from app.media.pipeline_manager import _is_enospc_error; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
       "Bash(python -m unittest discover -s tests -p \"test_disk_slow.py\")",
-      "Bash(python -c \"from app.core.telemetry import TelemetryHub, FeedMetricsSnapshot, DISK_SLOW_STREAK_THRESHOLD; from app.ui.diagnostics_widget import DiagnosticsWidget; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
+      "Bash(python -c \"from app.core.telemetry import TelemetryHub, FeedMetricsSnapshot, DISK_SLOW_STREAK_THRESHOLD; from app.ui.diagnostics_widget import DiagnosticsWidget; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
+      "Bash(python -m unittest discover -s tests -p \"test_segment_validator_worker.py\")",
+      "Bash(python -m unittest tests.test_session_clock.PipelineManagerSessionTimeCaptureTests)",
+      "Bash(python -m unittest discover -s tests -p \"test_session_clock.py\" -v)",
+      "Bash(python -c \"from app.core.segment_validator_worker import SegmentValidatorWorker; from app.media.pipeline_manager import PipelineManager; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
     ]
   }
 }
