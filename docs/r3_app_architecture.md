@@ -2817,6 +2817,82 @@ Exit criteria:
 - ProRes / DNxHR ships as a config-selectable codec (or the §5.2 ranking is
   rewritten to reflect MJPEG-as-final).
 
+### State of the world entering Phase 11
+
+| Task | Today |
+|---|---|
+| Hardware acceleration selection | Pipeline hardcoded to `jpegenc` (software MJPEG). No `hardware_acceleration` TOML key, no element-availability probe, no startup log of selected encoder. **Gap.** |
+| Software fallback | Implicit — `jpegenc` is software, so the only path today *is* the fallback. There is no auto-selection logic that would need to fall back. **N/A until 11.A.** |
+| ProRes / DNxHR codec support | Spec ranks both above MJPEG (§5.2) but neither is wired. `_CODEC_RATIO_VS_RAW_RGB` only has an `"mjpeg"` entry; container loader accepts only `mkv`. **Gap.** |
+| Queue sizes tunable | `leaky=2 / 200 ms / 4 buffers` is hardcoded in `pipeline_manager.py`. No per-deployment override. **Hardcoded.** |
+| Segment duration tunable | `recording_segment_duration_seconds: 4.0` is a TOML setting; no validation against codec/keyframe alignment. **Tunable, untuned.** |
+| Encoder settings tunable | `jpegenc` runs at default quality (≈ 85). No exposed bitrate / quality / GOP setting. **Hardcoded.** |
+| Acceptance harness | No automated multi-feed run-and-measure. Validation is manual via `python main.py`. **Gap.** |
+| Performance profiles | No profile artifact format; telemetry samples are emitted to stdout / JSONL but not aggregated into a comparable run-over-run record. **Gap.** |
+
+Phase 11 closes these by way of four slices:
+
+### Slices
+
+**11.A — Encoder factory + hwaccel detection**
+
+The hardcoded `jpegenc` element in `_build_pipeline` becomes one branch of an explicit factory. The factory probes element availability at GStreamer init, picks an encoder based on `[media] hardware_acceleration`, and falls back to software when the hwaccel element is missing or fails to negotiate caps.
+
+- **`[media] hardware_acceleration`** — new TOML key matching §7.4: `"auto" | "none" | "nvidia" | "intel" | "amd"`. Default `"auto"`. Persisted on `AppSettings`.
+- **`app/media/encoder_factory.py`** — new module with `select_encoder(settings, codec, gst)` returning a `(element_name, factory_args)` pair. Probes `Gst.ElementFactory.find()` for `nvh264enc` / `qsvh264enc` (gated by codec) / `vaapi*enc` etc., plus the platform-specific NVENC/QuickSync MJPEG and ProRes encoders. Returns the software fallback (`jpegenc` for MJPEG, `proresenc` for ProRes, etc.) when hwaccel is disabled or unavailable.
+- **Startup logging** — one INFO line per feed at pipeline-build time: `feed=cam_a encoder=jpegenc (software, hwaccel=auto: nvh264enc not found)`. Operator can see at a glance which path each feed is on. Also surfaced as a `pipeline_mode`-style field on `FeedMetricsSnapshot` so the diagnostics widget shows it next to the existing `native / py-push` indicator.
+- **Software fallback events** — when `hardware_acceleration != "none"` and the requested element is unavailable, emit a `hwaccel_fallback` health event (INFO severity, NOT operator-visible — diagnostic only). The diagnostics widget surfaces a count.
+- **Negotiation failure handling** — when the hwaccel element is found but caps negotiation fails at PLAYING transition (driver bug, missing runtime), the bus error path tears down and reconstructs the pipeline with the software fallback. Distinct `hwaccel_negotiation_failed` health event (WARNING). The 10.B reconnect supervisor doesn't trigger because the source itself is fine — this is an encoder-side fault.
+- **Tests** — element-availability probe with stub `Gst.ElementFactory`; selection matrix against `(hwaccel, codec, available_elements)`; software fallback when probe returns None; settings round-trip from TOML.
+
+**Out of scope for 11.A:** AMD VCN encoder paths (rare on Windows recording rigs); decoder hwaccel for replay (replay is intra-frame on the recording-side codec, so decode hwaccel is moot for MJPEG/ProRes/DNxHR); per-feed hwaccel override (single setting governs every feed).
+
+**11.B — ProRes / DNxHR codec support**
+
+Closes the §5.2 deferral. MJPEG stays the default until field testing proves a hwaccel path is reliable; ProRes and DNxHR become selectable for deployments with `gst-plugins-bad` available.
+
+- **Element-availability gate** — `AppSettings.load` rejects `[recording] codec = "prores" | "dnxhr"` at startup if `proresenc` / `avenc_dnxhd` aren't found. Error message names the missing element so the operator knows to install `gst-plugins-bad`.
+- **Splitmuxsink branch** — `_build_pipeline` switches on `recording_codec` to pick `jpegenc` (existing), `proresenc`, or `avenc_dnxhd`. Keep the encoder-factory seam from 11.A as the dispatch point.
+- **Disk-budget coefficients** — extend `_CODEC_RATIO_VS_RAW_RGB` in `app/core/disk_budget.py` with calibrated entries. ProRes 422 LT ≈ 0.20–0.25 vs raw RGB at 1080p; DNxHR LB ≈ 0.18; HQ ≈ 0.45. Phase 7.A's pre-flight reads the right coefficient automatically.
+- **Container expansion** — `[recording] container` accepts `mov` for the ProRes / DNxHR pairing. Codec/container compatibility validated at load time: `mjpeg → mkv`, `prores → mov | mkv`, `dnxhr → mov | mkv`. `qtmux` replaces `matroskamux` when the container is `.mov`. Segment naming (`segment_NNNNN.{ext}`) and the on-disk-recovery regex pick up the new extension.
+- **Settings table & defaults updated** — §13.1 codec/container documentation reflects the new accepted values; §19's "long-term target" row remains ProRes/DNxHR/MOV.
+- **Tests** — codec/container compatibility matrix; element-availability gate refuses bad combos; disk-budget coefficient lookups for the new codecs; segment finalization writes `.mov` files with the right ext.
+
+**Out of scope for 11.B:** ProRes 4444 / 4444 XQ (bandwidth out of line with the in-session replay use case); DNxHD (legacy form, superseded by DNxHR); FFV1 / UTVideo — flagged in §5.2 as "optional/testing only" and not part of the operator-facing matrix.
+
+**11.C — Pipeline tuning matrix**
+
+Today's queue policy and encoder settings are baked into `pipeline_manager.py` constants. 11.C exposes them as `[media]` / `[recording]` tunables with documented defaults, and validates the chosen values against codec/segment-duration constraints.
+
+- **`[media] queue_policy`** — new sub-table with `preview = { leaky = 2, max_buffers = 4, max_size_time_ms = 200 }` and `recording = { ... }`. Defaults match today's hardcoded values so an unspecified config is byte-identical to today's behavior.
+- **`[recording] encoder_settings`** — codec-specific keys: `mjpeg.quality` (1–100, default 85), `prores.profile` ("proxy" | "lt" | "standard" | "hq", default "lt"), `dnxhr.profile` ("lb" | "sq" | "hq", default "lb"). The encoder-factory from 11.A applies them at element construction.
+- **Segment-duration / keyframe consistency check** — at startup, refuse a `recording_segment_duration_seconds` shorter than the chosen codec's GOP. MJPEG (intra-frame) doesn't constrain it; ProRes / DNxHR (also intra-frame) don't either, but the validator is the seam where future GOP-bearing codecs would slot in.
+- **Smoke benchmarks** — synthetic-feed harness exercises the pipeline at each tuning combination. Doesn't validate output quality; just confirms no crash, no queue saturation > 75%, no segment-finalization gap > segment_duration. Used as a regression gate for 11.C and 11.D.
+- **Tests** — settings round-trip; default values match shipped behavior; out-of-range values rejected at load time; pipeline construction with each combination of queue policy + encoder settings.
+
+**Out of scope for 11.C:** dynamic re-tuning at runtime (settings are immutable per app run, per Phase 7.A); per-feed encoder settings (single setting per codec, applied to every feed).
+
+**11.D — Acceptance harness + performance profiles**
+
+The §16.3 performance acceptance tests need a runnable home. 11.D adds a benchmark driver that runs the app against synthesized loads, captures CPU / GPU / disk telemetry to a profile artifact, and compares against documented budgets.
+
+- **`tools/perf_acceptance.py`** — invokable from the repo root. Configurable feed count (1, 2, 4, 8) at configurable resolution / fps. Drives `python main.py` against synthetic feeds for a fixed duration (default 5 minutes), captures per-feed telemetry snapshots and `DiskSampler` write rates to JSONL.
+- **Profile artifact format** — `<base_data_dir>/perf_profiles/<hostname>/<utc_iso>_<feed_count>x<resolution>.json`. Schema: per-feed FPS p50/p95/min, queue saturation max, disk write rate p95, dropped-buffer count, all health events fired. Newest 50 retained per host; older purged.
+- **Pass / fail rules** — codified in the harness against §16.3 budgets: source FPS within 1% of target, recording FPS within 1% of source, no `recording_branch_saturated` events, no `disk_full*` events, queue saturation peak ≤ 75%. Exit code reflects pass/fail for CI use.
+- **Diagnostics widget link** — adds a "Recent profile: passed/failed (link)" row when a profile exists for the current host. Helps the operator verify "did this rig pass acceptance?" without opening a terminal.
+- **Stretch-target runs** — the harness produces both a smoke-test mode (1-feed, 30s, fail-fast) and a full validation mode (per-target multi-feed). The README gets a "Performance acceptance" section pointing at the harness.
+- **Tests** — profile-artifact serialization round-trip; pass/fail rule evaluation against synthesized snapshots; retention policy keeps the right number of artifacts.
+
+**Out of scope for 11.D:** on-rig CI runners (the harness produces artifacts; orchestration is the operator's responsibility); cross-rig comparison tooling (single-rig regression detection only); replay-side acceptance (covered by §16.2 functional tests already).
+
+### Phase 11 sequencing notes
+
+- **11.A first.** Both 11.B (codec wiring) and 11.C (encoder settings) reach into the encoder construction site; landing the factory seam first means each later slice extends rather than replaces it.
+- **11.B and 11.C are mostly independent** but a deployment running ProRes wants ProRes-profile tunability — recommend 11.B before 11.C so 11.C's `encoder_settings` table covers the codecs the operator actually has access to.
+- **11.D is last.** Its pass/fail rules need to be exercised against the encoder selection landed by 11.A–11.C. Running 11.D early would lock in a baseline against the MJPEG-only path, which the §5.2 ranking flags as the fallback, not the target.
+- **Field-testing dependency.** The §5.2 ranking ("ProRes / DNxHR preferred over MJPEG") was a desk decision; 11.D's profile artifacts are how the ranking gets validated or rewritten. If 11.D's runs show MJPEG-software outperforming ProRes-hwaccel on the chosen rig, the §5.2 ranking flips and §19's "long-term target" row gets updated to match.
+- **No Phase 10 dependency.** Phase 10 is operator-experience hardening; Phase 11 is performance scaling. They can interleave if priority demands it, though doing Phase 10 first means Phase 11's failure modes get the foreground banner treatment automatically.
+
 ---
 
 # 19. Recommended Implementation Defaults
