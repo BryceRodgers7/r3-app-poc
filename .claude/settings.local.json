@@ -121,7 +121,10 @@
       "Bash(python -m unittest discover -s tests -p \"test_segment_validator_worker.py\")",
       "Bash(python -m unittest tests.test_session_clock.PipelineManagerSessionTimeCaptureTests)",
       "Bash(python -m unittest discover -s tests -p \"test_session_clock.py\" -v)",
-      "Bash(python -c \"from app.core.segment_validator_worker import SegmentValidatorWorker; from app.media.pipeline_manager import PipelineManager; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
+      "Bash(python -c \"from app.core.segment_validator_worker import SegmentValidatorWorker; from app.media.pipeline_manager import PipelineManager; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")",
+      "Bash(python -m unittest discover -s tests -p \"test_shutdown_drain.py\")",
+      "Bash(python -m unittest discover -s tests -p \"test_replay_current_play.py\")",
+      "Bash(python -c \"from app.core.application_coordinator import ApplicationCoordinator; from app.core.playback_controller import PlaybackController; print\\('imports ok'\\)\")"
     ]
   }
 }

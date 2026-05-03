@@ -211,6 +211,9 @@ class ApplicationCoordinator:
 
     def toggle_long_session_recording(self) -> None:
         """Start or stop game-length recording on every feed (operator control)."""
+        # Phase 10.F: shutdown is in flight; ignore stray UI clicks.
+        if getattr(self, "_shutting_down", False):
+            return
         session_paths = self._session_manager.get_active_session_paths()
         if session_paths is None:
             self.operator_controller.signals.status_message.emit("No active session; cannot record.")
@@ -360,6 +363,9 @@ class ApplicationCoordinator:
             (older test paths)
           - `session_clock` isn't attached
         """
+        # Phase 10.F: shutdown drain may already be running; ignore.
+        if getattr(self, "_shutting_down", False):
+            return
         if not self._recording_manager.is_any_recording():
             self.operator_controller.signals.status_message.emit(
                 "Start game recording before marking a play boundary."
@@ -619,15 +625,97 @@ class ApplicationCoordinator:
                 self.segment_index.add(segment)
 
     def shutdown(self) -> None:
-        """Stop playback sessions and feed runtimes."""
+        """Stop playback sessions and feed runtimes.
+
+        Phase 10.F: when a game is in flight, drive the same clean stop
+        sequence the operator's Stop press uses (`split-now` ritual via
+        `disable_file_recording` + RecordingState `STOPPING_RECORDING →
+        FINALIZING → NOT_RECORDING`) before tearing the runtimes down.
+        Otherwise the in-flight segment lacks a matroskamux trailer and
+        startup recovery on the next launch flags a needless dirty
+        session.
+
+        Order matters:
+          1. `_shutting_down = True` so any concurrent UI clicks
+             short-circuit (per `PlaybackController` shutdown gate +
+             coordinator action gates below).
+          2. `telemetry_hub.stop()` so saturation rules don't fight us
+             during finalize.
+          3. PlaybackController shutdown (timers down before transport
+             gate triggers).
+          4. Per-feed `disable_file_recording` if recording was active,
+             then drive RecordingState through its terminal arc.
+          5. Existing teardown path (`runtime.stop()`,
+             `session_manager.close()`, `health_log.close()`).
+
+        Per-feed exceptions during the drain are caught and logged
+        (don't deadlock shutdown on a single broken feed); a SIGKILL
+        or power loss falls through to the §11.4 dirty-session
+        recovery path on next launch as before.
+        """
         self._shutting_down = True
         self.telemetry_hub.stop()
         self.operator_controller.shutdown()
         self.program_controller.shutdown()
+        self._drain_active_recording_locked()
         for runtime in self._feed_runtimes.values():
             runtime.stop()
         self._session_manager.close()
         default_health_log().close()
+
+    def _drain_active_recording_locked(self) -> None:
+        """Phase 10.F: clean-stop a recording in flight at shutdown."""
+        if not self._recording_manager.is_any_recording():
+            return
+        recording_sm = self._recording_manager.recording_state
+        try:
+            recording_sm.transition_to(RecordingState.STOPPING_RECORDING)
+        except Exception:
+            LOGGER.exception("shutdown drain: STOPPING_RECORDING transition raised")
+        for runtime in self._feed_runtimes.values():
+            try:
+                runtime.pipeline_manager.disable_file_recording()
+            except Exception:
+                LOGGER.exception(
+                    "shutdown drain: disable_file_recording raised for feed=%s",
+                    runtime.feed.feed_id,
+                )
+        try:
+            recording_sm.transition_to(RecordingState.FINALIZING)
+            recording_sm.transition_to(RecordingState.NOT_RECORDING)
+        except Exception:
+            LOGGER.exception(
+                "shutdown drain: FINALIZING/NOT_RECORDING transitions raised"
+            )
+        # Phase 7.H.1 parity with operator Stop: close any open play
+        # so its end-time is captured before the session manifest closes.
+        if self.play_manager is not None and self.session_clock is not None:
+            try:
+                self.play_manager.stop_game(
+                    self.session_clock.now_session_time_ns()
+                )
+            except Exception:
+                LOGGER.exception("shutdown drain: play_manager.stop_game raised")
+        # Drop the per-game replay scope so any future read-back from
+        # the persisted state doesn't carry a stale anchor.
+        try:
+            self.replay_store.set_current_game_start_session_time(None)
+        except Exception:
+            LOGGER.debug(
+                "shutdown drain: replay_store reset raised", exc_info=True
+            )
+        # If the session manifest is still in RECORDING, drop it to
+        # STOPPED before SessionManager.close() drives FINALIZED. The
+        # state-machine transitions table only allows
+        # STOPPED → FINALIZED and RECORDING → FINALIZED — both are
+        # legal — but driving through STOPPED keeps the manifest's
+        # state arc consistent with the operator's Stop press.
+        session_sm = self._session_manager.get_active_session_state()
+        if session_sm is not None and session_sm.state == SessionState.RECORDING:
+            try:
+                session_sm.transition_to(SessionState.STOPPED)
+            except Exception:
+                LOGGER.exception("shutdown drain: session STOPPED transition raised")
 
 
 def build_default_application_coordinator(

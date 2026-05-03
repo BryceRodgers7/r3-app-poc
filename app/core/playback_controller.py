@@ -93,6 +93,10 @@ class PlaybackController:
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
+        # Phase 10.F: set by `shutdown()` so transport methods that race
+        # the teardown become no-ops instead of touching half-torn-down
+        # decoders / timers.
+        self._shutting_down = False
         self.signals = AppSignals()
         self._state = UiState(current_source_name=default_source_name)
         self._state.current_playback_mode = PlaybackMode.SOURCE_LOST
@@ -157,6 +161,8 @@ class PlaybackController:
 
     def pause_playback(self) -> None:
         """Pause replay at the current playback position."""
+        if getattr(self, "_shutting_down", False):
+            return
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -193,6 +199,8 @@ class PlaybackController:
         `_playback_session_time_ns`. Repeated clicks accumulate —
         click twice for `−20s` from live, three times for `−30s`, etc.
         """
+        if getattr(self, "_shutting_down", False):
+            return
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -232,6 +240,8 @@ class PlaybackController:
           - no play is currently open (defensive — Play #1 should
             always be open when recording is active)
         """
+        if getattr(self, "_shutting_down", False):
+            return
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -267,6 +277,8 @@ class PlaybackController:
 
     def jump_to_live(self) -> None:
         """Return the viewed output to the live edge."""
+        if getattr(self, "_shutting_down", False):
+            return
         with self._lock:
             self._stop_replay_clock_locked()
             if self.replay_state is not None and self.replay_state.state in ACTIVE_REPLAY_STATES:
@@ -309,6 +321,8 @@ class PlaybackController:
         landing in the in-progress segment (which has no replay
         coverage).
         """
+        if getattr(self, "_shutting_down", False):
+            return
         if self._live_only:
             self._emit_state("This output is locked to live.")
             return
@@ -421,7 +435,13 @@ class PlaybackController:
             return self._latest_live_frame
 
     def shutdown(self) -> None:
-        """Stop timers owned by this output session and close per-feed decoders."""
+        """Stop timers owned by this output session and close per-feed decoders.
+
+        Sets `_shutting_down = True` first so any in-flight transport
+        method that wakes up after teardown becomes a no-op (Phase
+        10.F). Decoders and timers are released afterward.
+        """
+        self._shutting_down = True
         self._replay_timer.stop()
         self._overlay_timer.stop()
         for decoder in self._segment_decoders.values():
