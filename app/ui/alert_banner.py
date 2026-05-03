@@ -36,6 +36,7 @@ _OPERATOR_VISIBLE_CATEGORIES: dict[str, str] = {
     "disk_critical": "Disk critically full — recording at risk",
     "disk_full_blocked": "Cannot start recording — disk too full",
     "disk_full_during_record": "Recording stopped — disk full",
+    "disk_slow": "Disk write rate over budget",
     "recording_branch_saturated": "Disk too slow — recording degraded",
     "recording_error": "Encoder failure",
     "session_dirty": "Session not safely recording",

@@ -2672,7 +2672,7 @@ A scan of the §11.2 failure table against current code:
 | Feed disconnect | Live-bus `ERROR` drives `FeedState → DISCONNECTED` (`pipeline_manager.py`); telemetry zero-fps streak does the same as a fallback. ✅ |
 | Feed reconnect | `RECONNECTING` is a defined state but has no producer that *re-attempts* the source build. Hop into `RECONNECTING → LIVE` only fires if data spontaneously starts flowing again. **Gap.** |
 | Disk full | Phase 10.C: pre-flight check at Start (`evaluate_disk_preflight`) refuses when free space < `disk_full_grace_seconds × estimated MB/s`; live ENOSPC on the bus drives `RecordingState → RECORDING_ERROR`; new `disk_critical` (ERROR) tier joins existing `disk_low` (WARNING). ✅ |
-| Slow disk | Record-queue saturation already drives `FeedState → DEGRADED` and `RecordingState → RECORDING_ERROR` (slice 3.B). No operator-facing visual; no sustained-write-rate vs disk budget check at runtime. **Partial.** |
+| Slow disk | Phase 10.D: `disk_slow` (WARNING) fires when `DiskSampler.write_mb_s_estimate ≥ disk_budget_mb_s` for 3 consecutive ticks; banner picks it up. `FeedMetricsSnapshot.record_queue_saturation_pct` exposes queue depth as a percentage; diagnostics widget shows write rate vs budget with ✓/⚠/✗ glyph. ✅ |
 | Corrupt segment | Quarantined at startup (`session_recovery.validate_session_segments`). Mid-session quarantine path doesn't exist. **Partial.** |
 | Startup recovery | Phase 7.D shipped (`IMPLEMENTATION.md` §7). ✅ — Phase 10 inherits it; the exit-criterion bullet "App can recover usable session data after crash" is already met. |
 | Graceful shutdown | `aboutToQuit → coordinator.shutdown()` is wired (`main.py`). No drain of the in-progress segment, no `SHUTTING_DOWN` gate on transport actions. **Gap.** |
@@ -2734,12 +2734,14 @@ After 10.B, a brief NDI flicker on one feed leaves that feed's live preview self
 
 Slice 3.B already drives `FeedState → DEGRADED` and `RecordingState → RECORDING_ERROR` on sustained record-queue saturation. 10.D closes the operator-visibility loop and grounds the signal in the Phase 7.A budget:
 
-- **`disk_slow` health event** — fires when `DiskSampler.write_mb_s_estimate` exceeds `disk_budget_mb_s` for ≥ 3 consecutive samples (Phase 7.A's budget exists; this is its runtime use). Maps to `recording_branch_saturated` for the existing 10.A banner allowlist, but with a distinct category so disk-budget overruns are distinguishable from queue-saturation events at the JSONL level.
-- **DiagnosticsWidget readout** — adds `disk write: 178/200 MB/s ⚠` next to the existing budget line; surfaces `record_queue_saturation` as a percentage so the operator sees "queue 82%" alongside the binary `DEGRADED`.
-- **TelemetryHub exposure** — `FeedMetricsSnapshot` gains `record_queue_saturation_pct: float` (computed from existing `queue_depth_recording / queue_max_recording`). No new sampling — the data is there, just not surfaced.
-- **Tests** — `disk_slow` emission threshold matrix; recovery clears when write rate drops below budget; saturation percentage formatted correctly.
+- **`disk_slow` health event** — fires when `DiskSampler.write_mb_s_estimate ≥ disk_budget_mb_s` for `DISK_SLOW_STREAK_THRESHOLD = 3` consecutive disk-sample ticks (≈15s at the default 5s disk-tick interval), via `_evaluate_disk_throughput` on `TelemetryHub`. WARNING severity; clears as soon as one sample is back at-or-below budget. Distinct from `recording_branch_saturated` so the JSONL log can tell "the disk is too slow" apart from "this feed's recording queue is full" — they often co-occur because slow disk causes saturation, but the JSONL distinction matters for post-game forensics.
+- **`TelemetryHub` constructor** — gains a `disk_budget_mb_s: float | None` kwarg, plumbed from `settings.disk_budget_mb_s` in the coordinator factory. None disables the rule (test fixtures that never set it).
+- **`FeedMetricsSnapshot` properties** — `record_queue_saturation_pct` and `preview_queue_saturation_pct` derive percentages from the existing depth/capacity fields (clamped to [0, 100]). No new sampling — the data is there, just not surfaced.
+- **DiagnosticsWidget** — per-feed line appends `qrec 12/24 (50%)` so the operator sees saturation as a percentage alongside the depth/capacity gauge. Disk line appends a ✓/⚠/✗ glyph next to the write rate (≥ budget → ✗, ≥ 80% → ⚠, else ✓). Health-counts row gets a `disk_slow` count.
+- **AlertBanner allowlist** — `disk_slow` joins with the label "Disk write rate over budget".
+- **Tests** (`tests/test_disk_slow.py`, 20 tests) — emission threshold matrix (under-budget no-emit, single-tick no-emit, three-tick emit, single emission while open); streak resets on under-budget sample; recovery clears event; unavailable snapshot skipped; budget-unset / budget-zero disable the rule; queue-saturation percentage clamps and zero-capacity edge case; banner allowlist; widget glyph thresholds.
 
-**Out of scope for 10.D:** dynamic re-encode at lower bitrate. Operator's option is to reduce feed count or accept the degradation.
+**Out of scope for 10.D:** dynamic re-encode at lower bitrate (operator's option is to reduce feed count or accept the degradation); per-feed disk-rate attribution (the `DiskSampler` reads volume-wide free-space deltas, not per-process — fine for "is the disk too slow?" but doesn't tell you which feed is the heaviest writer).
 
 **10.E — Mid-session corrupt-segment quarantine**
 

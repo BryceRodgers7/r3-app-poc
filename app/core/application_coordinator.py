@@ -648,7 +648,9 @@ def build_default_application_coordinator(
     _log_disk_budget_assessment(disk_budget)
 
     recording_manager = RecordingManager()
-    telemetry_hub = TelemetryHub()
+    # Phase 10.D: hand the budget to the telemetry hub so it can fire
+    # `disk_slow` when the sampled write rate exceeds it for ≥ 3 ticks.
+    telemetry_hub = TelemetryHub(disk_budget_mb_s=settings.disk_budget_mb_s)
     segment_index = SegmentIndex()
     # Slice 5.A: one monotonic session clock for the whole app run. Each
     # PipelineManager uses it to stamp `pts_to_session_offset_ns` on

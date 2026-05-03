@@ -35,6 +35,10 @@ DISK_CRITICAL_FRACTION = 0.02
 # regardless of percentage.
 DISK_CRITICAL_MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
 DROPPED_BUFFERS_DEGRADED_THRESHOLD = 1.0  # buffers/sec sustained → DEGRADED
+# Phase 10.D: number of consecutive disk-sample ticks at-or-above
+# the budget before emitting `disk_slow`. Three samples at the
+# default 5s disk-tick interval ≈ 15 s of sustained overrun.
+DISK_SLOW_STREAK_THRESHOLD = 3
 
 
 class RateCounter:
@@ -112,6 +116,31 @@ class FeedMetricsSnapshot:
     queue_depth_recording: int = 0
     queue_max_preview: int = 0
     queue_max_recording: int = 0
+
+    @property
+    def record_queue_saturation_pct(self) -> float:
+        """Phase 10.D: recording queue depth as a percentage of capacity.
+
+        Returns 0.0 when capacity is unknown (no sampler registered yet),
+        which is also what an idle pipeline reports — cosmetic only,
+        the state-machine producers in `_evaluate_queue_saturation`
+        keep using the raw fields."""
+        if self.queue_max_recording <= 0:
+            return 0.0
+        return min(
+            100.0,
+            (self.queue_depth_recording / self.queue_max_recording) * 100.0,
+        )
+
+    @property
+    def preview_queue_saturation_pct(self) -> float:
+        """Preview-side counterpart, useful for symmetric diagnostics."""
+        if self.queue_max_preview <= 0:
+            return 0.0
+        return min(
+            100.0,
+            (self.queue_depth_preview / self.queue_max_preview) * 100.0,
+        )
 
 
 class FeedMetrics:
@@ -451,6 +480,7 @@ class TelemetryHub:
         log_interval_seconds: float = 1.0,
         disk_interval_seconds: float = 5.0,
         health_log: HealthEventLog | None = None,
+        disk_budget_mb_s: float | None = None,
     ) -> None:
         if log_interval_seconds <= 0:
             raise ValueError("log_interval_seconds must be positive")
@@ -477,6 +507,13 @@ class TelemetryHub:
         self._record_saturated_streak: dict[str, int] = {}
         self._preview_saturated_streak: dict[str, int] = {}
         self._recording_state: StateMachine[Any] | None = None
+        # Phase 10.D: aggregate disk-write budget (MB/s) the
+        # `_evaluate_disk_throughput` rule compares against. None
+        # disables the evaluation (test fixtures that never set it).
+        self._disk_budget_mb_s: float | None = (
+            float(disk_budget_mb_s) if disk_budget_mb_s is not None else None
+        )
+        self._disk_slow_streak = 0
 
     def register(self, feed_id: str, display_name: str) -> FeedMetrics:
         """Create and store a `FeedMetrics` for `feed_id`."""
@@ -812,6 +849,58 @@ class TelemetryHub:
             snap.write_mb_s_estimate,
         )
         self._evaluate_disk_health(snap)
+        self._evaluate_disk_throughput(snap)
+
+    def _evaluate_disk_throughput(self, snap: DiskSnapshot) -> None:
+        """Phase 10.D: emit `disk_slow` when sustained write rate exceeds
+        the configured `disk_budget_mb_s`.
+
+        Streak-based: fires when the over-budget run hits
+        `DISK_SLOW_STREAK_THRESHOLD` consecutive samples (default 3),
+        clears as soon as one sample is back at-or-below budget.
+        Mirrors the pattern in `_evaluate_queue_saturation` so the
+        operator sees a steady state, not flapping events.
+
+        The `recording_branch_saturated` event already covers a
+        wedged splitmuxsink at the queue level — `disk_slow` is
+        separate so the JSONL log distinguishes "the disk is too
+        slow" from "this feed's recording queue is full." They can
+        co-occur (saturation is often *caused* by slow disk).
+        """
+        budget = self._disk_budget_mb_s
+        if budget is None or budget <= 0:
+            return
+        if not snap.available:
+            return
+        over_budget = snap.write_mb_s_estimate >= budget
+        if over_budget:
+            self._disk_slow_streak += 1
+        else:
+            self._disk_slow_streak = 0
+        if self._disk_slow_streak == DISK_SLOW_STREAK_THRESHOLD:
+            if not self._health_log.has_open_event(
+                category="disk_slow", feed_id=None
+            ):
+                self._health_log.record(
+                    severity=HealthSeverity.WARNING,
+                    category="disk_slow",
+                    message=(
+                        f"Disk write rate {snap.write_mb_s_estimate:.1f} MB/s "
+                        f"exceeds budget {budget:.1f} MB/s on {snap.path}."
+                    ),
+                    metadata={
+                        "path": snap.path,
+                        "write_mb_s": round(snap.write_mb_s_estimate, 3),
+                        "budget_mb_s": round(budget, 3),
+                        "streak": self._disk_slow_streak,
+                    },
+                )
+        elif self._disk_slow_streak == 0 and self._health_log.has_open_event(
+            category="disk_slow", feed_id=None
+        ):
+            self._health_log.clear_open_event(
+                category="disk_slow", feed_id=None
+            )
 
     def _evaluate_disk_health(self, snap: DiskSnapshot) -> None:
         """Emit a health event when free disk space drops below the threshold.

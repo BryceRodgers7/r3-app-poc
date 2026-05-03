@@ -130,8 +130,10 @@ class DiagnosticsWidget(QFrame):
                     f"{s.feed_id:<12} {fs_text:<13} {mode_text:<22} "
                     f"src {s.source_fps:5.1f}  prv {s.preview_fps:5.1f}  "
                     f"rec {s.recording_fps:5.1f}  drop {s.dropped_per_sec:4.1f}/s  "
-                    f"qprv {s.queue_depth_preview}/{s.queue_max_preview}  "
-                    f"qrec {s.queue_depth_recording}/{s.queue_max_recording}"
+                    f"qprv {s.queue_depth_preview}/{s.queue_max_preview} "
+                    f"({s.preview_queue_saturation_pct:3.0f}%)  "
+                    f"qrec {s.queue_depth_recording}/{s.queue_max_recording} "
+                    f"({s.record_queue_saturation_pct:3.0f}%)"
                 )
             self._feeds_label.setText("\n".join(lines))
 
@@ -143,9 +145,12 @@ class DiagnosticsWidget(QFrame):
         else:
             free_gb = disk.free_bytes / (1024.0 ** 3)
             total_gb = disk.total_bytes / (1024.0 ** 3)
+            # Phase 10.D: annotate write rate with budget glyph so the
+            # operator sees "is this disk keeping up?" at a glance.
+            budget_glyph = self._disk_write_glyph(disk.write_mb_s_estimate)
             self._disk_label.setText(
                 f"disk: {free_gb:.1f}/{total_gb:.1f} GB free  "
-                f"write {disk.write_mb_s_estimate:.1f} MB/s"
+                f"write {disk.write_mb_s_estimate:.1f} MB/s {budget_glyph}"
             )
 
         self._update_disk_budget_label()
@@ -169,10 +174,27 @@ class DiagnosticsWidget(QFrame):
             f"invalid_transitions: {log.category_count('invalid_transition')}  "
             f"feed_lost: {log.category_count('feed_lost')}  "
             f"disk_low: {log.category_count('disk_low')}  "
+            f"disk_slow: {log.category_count('disk_slow')}  "
             f"recording_branch_saturated: "
             f"{log.category_count('recording_branch_saturated')}  "
             f"audio_missing: {log.category_count('audio_missing')}"
         )
+
+    def _disk_write_glyph(self, write_mb_s: float) -> str:
+        """Phase 10.D: ✓/⚠/✗ vs the configured `disk_budget_mb_s`."""
+        budget = (
+            self._settings.disk_budget_mb_s
+            if self._settings is not None
+            else None
+        )
+        if budget is None or budget <= 0:
+            return ""
+        ratio = write_mb_s / budget
+        if ratio >= 1.0:
+            return "✗"
+        if ratio >= 0.80:
+            return "⚠"
+        return "✓"
 
     def _update_replay_lag_label(self) -> None:
         """Phase 7.B replay-lag readout. A wedged splitmuxsink shows up
