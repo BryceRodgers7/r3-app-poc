@@ -18,6 +18,7 @@ from app.core.app_state import UiState
 from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.output_renderer import MultiFeedOutputRenderer
+from app.ui.alert_banner import AlertBanner
 from app.ui.controls_widget import ControlsWidget
 from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
@@ -102,10 +103,19 @@ class MainWindow(QMainWindow):
                 settings=settings,
             )
 
+        # Phase 10.A: foreground §11.3 health warnings on the operator
+        # window. The program window (`show_controls=False`) is the
+        # on-air pane and stays uncluttered.
+        self.alert_banner: AlertBanner | None = (
+            AlertBanner(parent=self) if show_controls else None
+        )
+
         central_widget = QWidget(self)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(16)
+        if self.alert_banner is not None:
+            layout.addWidget(self.alert_banner)
         layout.addWidget(self.video_panel, stretch=1)
         if self.controls_widget is not None:
             layout.addWidget(self.controls_widget)

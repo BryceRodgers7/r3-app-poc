@@ -66,6 +66,10 @@ class HealthEventLog:
         self._path: Path | None = None
         self._file: Any = None
         self._last_categories: dict[tuple[str | None, str], int] = {}
+        # Parallel to `_last_categories`. The Phase 10.A operator banner
+        # needs the full event payload (severity + message) to render,
+        # not just the id, so the open marker is mirrored here.
+        self._open_events: dict[tuple[str | None, str], HealthEvent] = {}
         self._category_counts: dict[str, int] = {}
 
     def open(self, path: Path, session_id: str) -> None:
@@ -78,6 +82,7 @@ class HealthEventLog:
             self._path = path
             self._session_id = session_id
             self._last_categories.clear()
+            self._open_events.clear()
 
     def close(self) -> None:
         with self._lock:
@@ -114,6 +119,7 @@ class HealthEventLog:
                 except OSError:
                     LOGGER.exception("health event log write failed")
             self._last_categories[(feed_id, category)] = event.id
+            self._open_events[(feed_id, category)] = event
             self._category_counts[category] = self._category_counts.get(category, 0) + 1
         log_level = {
             HealthSeverity.INFO.value: logging.INFO,
@@ -151,6 +157,17 @@ class HealthEventLog:
         allowed if the condition recurs."""
         with self._lock:
             self._last_categories.pop((feed_id, category), None)
+            self._open_events.pop((feed_id, category), None)
+
+    def open_events(self) -> list[HealthEvent]:
+        """Return a snapshot of currently-open events, in id order.
+
+        Phase 10.A consumes this to render the operator alert banner —
+        each `(feed_id, category)` pair has at most one entry (the most
+        recent record for that pair), and the entry is removed when
+        `clear_open_event` fires."""
+        with self._lock:
+            return sorted(self._open_events.values(), key=lambda e: e.id)
 
     def _close_file_locked(self) -> None:
         if self._file is not None:

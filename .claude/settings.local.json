@@ -101,7 +101,15 @@
       "Bash(python -m unittest discover -s tests -k \"AudioRecordBranchName\" -v)",
       "Bash(python -m unittest discover -s tests -k \"avoid_negative\")",
       "Bash(/c/msys64/ucrt64/bin/ffprobe.exe *)",
-      "Bash(python -m unittest discover -s tests -k \"AudioMuxBranchFlush\")"
+      "Bash(python -m unittest discover -s tests -k \"AudioMuxBranchFlush\")",
+      "Bash(python -m unittest tests.test_alert_banner -v)",
+      "Bash(python -c \"import sys; print\\(sys.path\\)\")",
+      "Bash(python -m unittest tests.test_alert_banner)",
+      "Bash(python -c \"import tests.test_alert_banner\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import tests.test_alert_banner\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import tests\")",
+      "Bash(python -m unittest discover -s tests -p \"test_alert_banner.py\" -v)",
+      "Bash(python -c \"from app.ui.main_window import MainWindow; from app.ui.alert_banner import AlertBanner; print\\('imports ok'\\)\")"
     ]
   }
 }
