@@ -306,6 +306,40 @@ class ValidateSessionSegmentsTests(unittest.TestCase):
             (feed_quarantine / "segment_00000.mkv").read_bytes(), b"existing"
         )
 
+    def test_mov_segment_file_is_picked_up(self) -> None:
+        # Phase 11.B: ProRes / DNxHR recordings land as `.mov`. The
+        # recovery scan must accept this extension. Validates the
+        # widened glob + regex and the no-row insert path together.
+        file_path = self._make_segment_file("segment_00000.mov")
+
+        def always_valid(_path: Path) -> SegmentValidationResult:
+            return SegmentValidationResult(
+                is_valid=True, duration_seconds=4.0, frame_count=120
+            )
+
+        report = validate_session_segments(
+            self.session_paths, self.db, validator=always_valid
+        )
+        self.assertEqual(report.files_scanned, 1)
+        recovered = self.db.get_segment_by_path(str(file_path))
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered.state, SEGMENT_STATE_DIRTY)
+
+    def test_mp4_files_are_still_skipped(self) -> None:
+        # Phase 11.B regression guardrail: widening to `.mov` must not
+        # also pull in `.mp4` (post-session deliverables go through a
+        # separate path; the recovery scanner should ignore them).
+        (self.feed_dir / "segment_00000.mp4").write_bytes(b"x")
+
+        def fail_if_called(_path: Path) -> SegmentValidationResult:
+            raise AssertionError("validator should not run on .mp4 files")
+
+        report = validate_session_segments(
+            self.session_paths, self.db, validator=fail_if_called
+        )
+        self.assertEqual(report.files_scanned, 0)
+
     def test_missing_recording_dir_is_no_op(self) -> None:
         # Build a session where recording/ doesn't exist (e.g. crash before any segments).
         empty_session = _build_session_paths(self.tmp / "sessions", "session_002")

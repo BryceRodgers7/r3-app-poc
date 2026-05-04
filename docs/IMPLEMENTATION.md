@@ -877,9 +877,9 @@ for a closed session anyway.
 
 `session_recovery.validate_session_segments` walks
 `recording/` recursively (handles both legacy flat and per-game
-nested layouts via `rglob`), feeds each `segment_*.mkv` through a
-`SegmentValidator` (default uses `cv2.VideoCapture`), and reconciles
-against SQLite:
+nested layouts via `rglob`), feeds each `segment_*.{mkv,mov}` through
+a `SegmentValidator` (default uses `cv2.VideoCapture`), and
+reconciles against SQLite:
 
 - **Valid file + matching `complete` DB row** → no action.
 - **Invalid file + matching DB row** → move to `quarantine/`,
@@ -889,7 +889,7 @@ against SQLite:
 - **Valid file + no DB row** → insert as `dirty` with synthetic PTS
   metadata (see §7.4 below).
 
-Files not matching the `segment_NNNNN.mkv` pattern are skipped
+Files not matching the `segment_NNNNN.(mkv|mov)` pattern are skipped
 (zero-byte files, leftover tooling output, etc.).
 
 ### 7.3 Resume continuation (Phase 7.D)

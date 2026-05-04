@@ -42,6 +42,15 @@ hardware_acceleration = "auto"
 [recording]
 enabled = true
 segment_duration_seconds = 4.0
+# Phase 11.B: codec / container compatibility matrix.
+#   "mjpeg" + "mkv"    — the original Phase-4 path; works everywhere.
+#   "prores" + "mov"   — ProRes 422 LT via avenc_prores_ks (gst-libav).
+#   "prores" + "mkv"   — same encoder, MKV instead of MOV.
+#   "dnxhr"  + "mov"   — DNxHR LB via avenc_dnxhd (gst-libav). Default
+#                        bitrate targets 1080p30; lower resolutions
+#                        will need 11.C's profile selection.
+#   "dnxhr"  + "mkv"   — same encoder, MKV container.
+# `mjpeg + mov` is not in the matrix (qtmux does not pair with jpegenc).
 codec = "mjpeg"
 container = "mkv"
 # Slice 4.F: when true, audio is muxed into segment files alongside

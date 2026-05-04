@@ -449,7 +449,7 @@ Optional/testing only:
 
 4. FFV1 / UTVideo, when disk budget and playback support are validated.
 
-> **Currently shipped:** MJPEG-in-MKV only. `recording_codec` and `recording_container` accept other values in TOML but the pipeline only wires the MJPEG/MKV path. ProRes / DNxHR encoders live in `gst-plugins-bad`, which isn't always present on UCRT64; the disk-budget estimator's codec-coefficient table (`app/core/disk_budget.py`) also has only an MJPEG entry today. Codec selection is queued for Phase 11 because hardware acceleration ties into encoder choice — see Phase 11 task list.
+> **Currently shipped:** MJPEG, ProRes, and DNxHR are all selectable as of Phase 11.B. ProRes uses `avenc_prores_ks` (with `avenc_prores` as a same-codec fallback) and DNxHR uses `avenc_dnxhd` — both ship in `gst-libav` (UCRT64 package `mingw-w64-ucrt-x86_64-gst-libav`). `proresenc` from `gst-plugins-bad` isn't built into UCRT64 but the libav-wrapped encoders produce equivalent ProRes bitstreams. The disk-budget coefficient table has entries for all three codecs (`prores=0.25`, `dnxhr=0.30`); Phase 11.C's profile selection will refine the DNxHR coefficient.
 
 Avoid for replay:
 
@@ -483,7 +483,7 @@ Reason:
 - Active rolling buffers and crash recovery are harder with MP4.
 - MP4 is suitable for post-session exports, not the active recording path.
 
-> **Currently shipped:** MKV only. The splitmuxsink branch and the on-disk segment naming in `app/media/pipeline_manager.py` are wired specifically for matroskamux. Other values for `[recording] container` are accepted by the TOML loader but would fail at pipeline-build time. `.mov` (the natural ProRes / DNxHR container) is queued alongside Phase 11's codec work — see §5.2 and Phase 11's TODO sub-item (d).
+> **Currently shipped:** MKV (matroskamux) and MOV (qtmux), as of Phase 11.B. The splitmuxsink `muxer-factory` switches per `[recording] container` and the segment-name extension matches. Compatibility matrix: `mjpeg+mkv`, `prores+mkv`, `prores+mov`, `dnxhr+mkv`, `dnxhr+mov`. `mjpeg+mov` is rejected at config-load (qtmux + jpegenc isn't a standard pairing).
 
 ## 5.4 Long game recording format
 
@@ -1443,8 +1443,8 @@ touch_button_height = 72
 # Phase 4 splitmuxsink-driven segmented recording.
 enabled                  = true
 segment_duration_seconds = 4.0
-codec                    = "mjpeg"   # only "mjpeg" wired today; see §5.2
-container                = "mkv"     # only "mkv" wired today; see §5.3
+codec                    = "mjpeg"   # mjpeg | prores | dnxhr (Phase 11.B; see §5.2)
+container                = "mkv"     # mkv | mov (Phase 11.B; see §5.3 — mjpeg+mov rejected)
 # Phase 4.F + Phase 9.C. Upper-bound override: false forces video-only
 # regardless of source capability. When true, the runtime detects audio
 # presence per feed and wires the audio_record branch only if buffers flow.

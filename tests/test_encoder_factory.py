@@ -131,10 +131,12 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _select(hwaccel="vulkan", available={"jpegenc"})
 
-    def test_non_mjpeg_codec_raises_not_implemented(self) -> None:
-        # ProRes / DNxHR rows are 11.B's territory.
+    def test_unknown_codec_raises_not_implemented(self) -> None:
+        # h264 / h265 are explicitly off the supported list (§5.2);
+        # we want a NotImplementedError so the operator gets a clear
+        # signal that the codec was rejected by design, not by accident.
         with self.assertRaises(NotImplementedError):
-            _select(hwaccel="auto", available={"jpegenc"}, codec="prores")
+            _select(hwaccel="auto", available={"jpegenc"}, codec="h264")
 
     def test_no_jpegenc_anywhere_is_a_runtime_error(self) -> None:
         # gst-plugins-good is required by everything else in the
@@ -143,6 +145,99 @@ class ValidationTests(unittest.TestCase):
         # _make_element.
         with self.assertRaises(RuntimeError):
             _select(hwaccel="auto", available=set())
+
+
+class ProresSelectionTests(unittest.TestCase):
+    """Phase 11.B — ProRes selection. avenc_prores_ks first, avenc_prores
+    as a same-codec backup, all software-only on Windows."""
+
+    def test_picks_prores_ks_when_both_libav_encoders_available(self) -> None:
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_prores_ks", "avenc_prores"},
+            codec="prores",
+        )
+        self.assertEqual(sel.element_name, "avenc_prores_ks")
+        # ProRes has no hwaccel option on Windows, so software is
+        # the canonical pick — not a "fallback".
+        self.assertFalse(sel.is_software_fallback)
+        self.assertIn("ProRes", sel.reason)
+
+    def test_falls_back_to_avenc_prores_when_ks_missing(self) -> None:
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_prores"},
+            codec="prores",
+        )
+        self.assertEqual(sel.element_name, "avenc_prores")
+        self.assertFalse(sel.is_software_fallback)
+
+    def test_no_libav_raises_with_install_hint(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            _select(hwaccel="auto", available=set(), codec="prores")
+        self.assertIn("gst-libav", str(ctx.exception).lower())
+
+    def test_factory_args_include_prores_lt_profile(self) -> None:
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_prores_ks"},
+            codec="prores",
+        )
+        self.assertEqual(sel.factory_args.get("profile"), 2)
+
+    def test_hwaccel_request_does_not_change_prores_selection(self) -> None:
+        # Operator asks for Intel hwaccel + ProRes; there's no hwaccel
+        # ProRes on Windows. We honor the codec choice and pick the
+        # software encoder, with a reason that explains why.
+        for hwaccel in ("intel", "nvidia", "amd"):
+            with self.subTest(hwaccel=hwaccel):
+                sel = _select(
+                    hwaccel=hwaccel,
+                    available={"avenc_prores_ks"},
+                    codec="prores",
+                )
+                self.assertEqual(sel.element_name, "avenc_prores_ks")
+                self.assertFalse(sel.is_software_fallback)
+
+    def test_force_software_is_a_noop_for_prores(self) -> None:
+        # ProRes encoders are already software; force_software=True
+        # picks the same element with no special reason text.
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_prores_ks"},
+            codec="prores",
+            force_software=True,
+        )
+        self.assertEqual(sel.element_name, "avenc_prores_ks")
+
+
+class DnxhrSelectionTests(unittest.TestCase):
+    """Phase 11.B — DNxHR selection. avenc_dnxhd is the only candidate."""
+
+    def test_picks_avenc_dnxhd_when_available(self) -> None:
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_dnxhd"},
+            codec="dnxhr",
+        )
+        self.assertEqual(sel.element_name, "avenc_dnxhd")
+        self.assertFalse(sel.is_software_fallback)
+        self.assertIn("DNxHR", sel.reason)
+
+    def test_no_libav_raises_with_install_hint(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            _select(hwaccel="auto", available=set(), codec="dnxhr")
+        self.assertIn("gst-libav", str(ctx.exception).lower())
+
+    def test_factory_args_include_dnxhr_default_bitrate(self) -> None:
+        # avenc_dnxhd needs an explicit bitrate; default targets
+        # DNxHR LB at 1080p30.
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_dnxhd"},
+            codec="dnxhr",
+        )
+        self.assertEqual(sel.factory_args.get("bitrate"), 36000000)
 
 
 class ReasonStringTests(unittest.TestCase):
@@ -156,6 +251,22 @@ class ReasonStringTests(unittest.TestCase):
     def test_fallback_reason_names_the_missing_element(self) -> None:
         sel = _select(hwaccel="auto", available={"jpegenc"})
         self.assertIn("qsvjpegenc", sel.reason)
+
+    def test_prores_reason_calls_out_no_hwaccel_option(self) -> None:
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_prores_ks"},
+            codec="prores",
+        )
+        self.assertIn("no hwaccel", sel.reason)
+
+    def test_dnxhr_reason_calls_out_no_hwaccel_option(self) -> None:
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_dnxhd"},
+            codec="dnxhr",
+        )
+        self.assertIn("no hwaccel", sel.reason)
 
 
 if __name__ == "__main__":

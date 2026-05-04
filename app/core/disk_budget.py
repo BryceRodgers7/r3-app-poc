@@ -41,8 +41,15 @@ class BudgetVerdict(str, Enum):
 #
 # MJPEG @ jpegenc default quality 85 on typical broadcast content
 # compresses ~10:1 against raw 24-bit RGB, i.e. coefficient ≈ 0.10.
+#
+# Phase 11.B: ProRes 422 LT sits at the conservative end of the
+# §5.2 range (0.20–0.25); DNxHR is one coefficient until 11.C
+# introduces profile-aware tuning (DNxHR LB ≈ 0.18, HQ ≈ 0.45 —
+# 0.30 is a midpoint estimate that won't underestimate at HQ).
 _CODEC_RATIO_VS_RAW_RGB: dict[str, float] = {
     "mjpeg": 0.10,
+    "prores": 0.25,
+    "dnxhr": 0.30,
 }
 
 _RAW_BYTES_PER_PIXEL = 3.0  # 24-bit RGB

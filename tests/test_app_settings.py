@@ -142,6 +142,78 @@ hardware_acceleration = "intel"
             settings = AppSettings.load(config_path)
         self.assertEqual(settings.media_hardware_acceleration, "intel")
 
+    def test_recording_codec_container_matrix_round_trip(self) -> None:
+        # Phase 11.B: every accepted codec/container pair must round-trip.
+        accepted = [
+            ("mjpeg", "mkv"),
+            ("prores", "mkv"),
+            ("prores", "mov"),
+            ("dnxhr", "mkv"),
+            ("dnxhr", "mov"),
+        ]
+        for codec, container in accepted:
+            with self.subTest(codec=codec, container=container):
+                with TemporaryDirectory() as temp_dir:
+                    config_path = Path(temp_dir) / "app_settings.toml"
+                    config_path.write_text(
+                        f"""
+[recording]
+codec = "{codec}"
+container = "{container}"
+""".strip(),
+                        encoding="utf-8",
+                    )
+                    settings = AppSettings.load(config_path)
+                self.assertEqual(settings.recording_codec, codec)
+                self.assertEqual(settings.recording_container, container)
+
+    def test_recording_rejects_mjpeg_mov_pair(self) -> None:
+        # Phase 11.B: mjpeg+mov isn't in the matrix (qtmux + jpegenc
+        # isn't a standard pairing). The error names the accepted set.
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
+codec = "mjpeg"
+container = "mov"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("mjpeg", str(ctx.exception))
+        self.assertIn("mov", str(ctx.exception))
+
+    def test_recording_rejects_unknown_codec(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
+codec = "h264"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("h264", str(ctx.exception))
+
+    def test_recording_rejects_unknown_container(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
+codec = "prores"
+container = "mp4"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("mp4", str(ctx.exception))
+
     def test_media_hardware_acceleration_rejects_unknown_value(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "app_settings.toml"

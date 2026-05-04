@@ -35,6 +35,7 @@ from app.core.models import (
     Segment,
     SessionPaths,
 )
+from app.config.settings import _VALID_CODEC_CONTAINER_PAIRS
 from app.core.session_clock import SessionClock
 from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
@@ -291,11 +292,22 @@ class PipelineManager:
         self._recording_game_subdir: str | None = None
         self._recording_codec: str = recording_codec.strip().lower() or "mjpeg"
         self._recording_container: str = recording_container.strip().lower() or "mkv"
-        if self._recording_codec != "mjpeg" or self._recording_container != "mkv":
+        # Phase 11.B: validate against the same matrix `AppSettings.load`
+        # uses. Defense in depth — the config loader already gates this,
+        # but PipelineManager is also constructed directly from tests
+        # and ad-hoc tooling that may bypass the loader.
+        if (
+            self._recording_codec,
+            self._recording_container,
+        ) not in _VALID_CODEC_CONTAINER_PAIRS:
+            accepted = ", ".join(
+                f"{c}+{x}" for c, x in sorted(_VALID_CODEC_CONTAINER_PAIRS)
+            )
             raise RuntimeError(
-                f"Phase 4.A only supports recording codec='mjpeg' container='mkv'. "
-                f"Got codec={self._recording_codec!r} container={self._recording_container!r}. "
-                f"ProRes/DNxHR support is deferred."
+                f"Unsupported recording codec/container pair "
+                f"codec={self._recording_codec!r} "
+                f"container={self._recording_container!r}. "
+                f"Accepted: {accepted}."
             )
         # Phase 7.E + 9.C: audio-presence detection.
         #
@@ -1499,6 +1511,48 @@ class PipelineManager:
                 },
             )
 
+    def _recording_muxer_factory(self) -> str:
+        """Phase 11.B: muxer element name for the chosen container.
+
+        `matroskamux` for MKV (existing); `qtmux` for MOV (the natural
+        ProRes / DNxHR pairing). The codec/container pair was already
+        validated against `_VALID_CODEC_CONTAINER_PAIRS` at __init__,
+        so an unexpected value here is a programming error.
+
+        Probes `Gst.ElementFactory.find()` for the muxer at call time
+        and surfaces a clear error if it isn't registered — matroskamux
+        and qtmux both ship in `gst-plugins-good`, so a miss usually
+        means a fundamentally broken GStreamer install.
+        """
+        if self._recording_container == "mkv":
+            muxer = "matroskamux"
+        elif self._recording_container == "mov":
+            muxer = "qtmux"
+        else:
+            raise AssertionError(
+                f"unexpected recording_container={self._recording_container!r} "
+                f"(should have been caught by __init__ validator)"
+            )
+        Gst = self._Gst
+        if Gst is not None and not Gst.ElementFactory.find(muxer):
+            raise RuntimeError(
+                f"GStreamer muxer element {muxer!r} is not registered "
+                f"(needed for recording_container={self._recording_container!r}). "
+                f"Both matroskamux and qtmux ship with gst-plugins-good — "
+                f"check that the GStreamer install is complete."
+            )
+        return muxer
+
+    def _segment_extension(self) -> str:
+        """Phase 11.B: file extension matching the muxer's container."""
+        if self._recording_container == "mkv":
+            return "mkv"
+        if self._recording_container == "mov":
+            return "mov"
+        raise AssertionError(
+            f"unexpected recording_container={self._recording_container!r}"
+        )
+
     def _build_splitmuxsink_element(self, branch_name: str) -> Any:
         """Create + configure a `splitmuxsink` element.
 
@@ -1511,7 +1565,7 @@ class PipelineManager:
         sink = self._make_element("splitmuxsink", f"{branch_name}_splitmuxsink")
         max_size_time_ns = int(self._recording_segment_duration_seconds * Gst.SECOND)
         sink.set_property("max-size-time", max_size_time_ns)
-        sink.set_property("muxer-factory", "matroskamux")
+        sink.set_property("muxer-factory", self._recording_muxer_factory())
         # `async-finalize=True` finalizes closed segments on a worker thread
         # so the streaming thread never blocks on disk flush.
         self._set_property_if_supported(sink, "async-finalize", True)
@@ -1714,7 +1768,10 @@ class PipelineManager:
         if self._recording_session_paths is None or self._recording_feed_id is None:
             fallback_dir = unrouted_segments_dir()
             fallback_dir.mkdir(parents=True, exist_ok=True)
-            tmp = (fallback_dir / f"_unrouted_segment_{fragment_id:05d}.mkv").resolve()
+            tmp = (
+                fallback_dir
+                / f"_unrouted_segment_{fragment_id:05d}.{self._segment_extension()}"
+            ).resolve()
             LOGGER.warning(
                 "splitmuxsink requested format-location without an active "
                 "recording session; writing to %s",
@@ -1740,7 +1797,7 @@ class PipelineManager:
         base_dir.mkdir(parents=True, exist_ok=True)
         index = self._recording_segment_counter
         self._recording_segment_counter += 1
-        path = base_dir / f"segment_{index:05d}.mkv"
+        path = base_dir / f"segment_{index:05d}.{self._segment_extension()}"
         LOGGER.info(
             "splitmuxsink opening segment index=%d (gst fragment_id=%d) "
             "feed_id=%s path=%s",

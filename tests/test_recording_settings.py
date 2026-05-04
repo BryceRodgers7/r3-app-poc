@@ -152,6 +152,30 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         path = PipelineManager._on_splitmuxsink_format_location(pm, None, 2)
         self.assertTrue(path.endswith("_unrouted_segment_00002.mkv"))
 
+    def test_mov_container_uses_mov_segment_extension(self) -> None:
+        # Phase 11.B: container=mov produces `.mov` segment paths.
+        from app.media.pipeline_manager import PipelineManager
+        with TemporaryDirectory() as tmp:
+            session = self._session_paths(Path(tmp))
+            pm = self._build_pm_stub(codec="prores", container="mov")
+            pm._recording_session_paths = session
+            pm._recording_feed_id = "ndi_main"
+            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
+            self.assertTrue(
+                path.endswith("recording/ndi_main/segment_00000.mov")
+                or path.endswith("recording\\ndi_main\\segment_00000.mov"),
+                f"unexpected path={path!r}",
+            )
+
+    def test_mov_container_unrouted_fallback_uses_mov_extension(self) -> None:
+        # Phase 11.B: same extension switch applies to the no-session
+        # fallback path (defensive — splitmuxsink's format-location can
+        # fire during startup before the session pointers are set).
+        from app.media.pipeline_manager import PipelineManager
+        pm = self._build_pm_stub(codec="prores", container="mov")
+        path = PipelineManager._on_splitmuxsink_format_location(pm, None, 5)
+        self.assertTrue(path.endswith("_unrouted_segment_00005.mov"))
+
     def test_splitmuxsink_finalizes_on_disable_and_rebuilds_on_reenable(self) -> None:
         """Bug fix: splitmuxsink only writes the MKV trailer on the
         current segment file when it transitions PLAYING → NULL.

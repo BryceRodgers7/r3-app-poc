@@ -55,8 +55,10 @@ from app.storage.segment_index import SegmentIndex
 LOGGER = logging.getLogger(__name__)
 
 # A segment file's basic shape after the splitmuxsink's format-location
-# callback names it. Used to filter the recording dir during validation.
-_SEGMENT_FILENAME_RE = re.compile(r"^segment_(\d{5})\.mkv$")
+# callback names it. Phase 11.B added `.mov` for ProRes / DNxHR
+# recordings; the recovery scan accepts either extension since the
+# session may contain segments produced by a prior config.
+_SEGMENT_FILENAME_RE = re.compile(r"^segment_(\d{5})\.(mkv|mov)$")
 
 # Per-game subdirectory pattern under `<session>/recording/`. Each
 # press of "Start game recording" creates one. Three-digit padding
@@ -200,7 +202,9 @@ def validate_session_segments(
     report = SegmentRecoveryReport(session_id=session_paths.session_id)
     if not session_paths.recording_dir.exists():
         return report
-    for file_path in sorted(session_paths.recording_dir.rglob("segment_*.mkv")):
+    # Phase 11.B: widen the glob to catch both `.mkv` and `.mov`; the
+    # filename regex below filters to the two valid extensions.
+    for file_path in sorted(session_paths.recording_dir.rglob("segment_*")):
         if not file_path.is_file():
             continue
         if not _SEGMENT_FILENAME_RE.match(file_path.name):

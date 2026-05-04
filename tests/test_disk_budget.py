@@ -50,6 +50,24 @@ class EstimatePerFeedTests(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             estimate_per_feed_mb_s(1280, 720, 30.0, "h264")
 
+    def test_1080p30_prores_uses_phase_11b_coefficient(self) -> None:
+        # Phase 11.B: prores coefficient = 0.25 (ProRes 422 LT, conservative).
+        # 1920 * 1080 * 30 * 3 * 0.25 = 46,656,000 bytes/s
+        mb_s = estimate_per_feed_mb_s(1920, 1080, 30.0, "prores")
+        self.assertAlmostEqual(mb_s, 46_656_000.0 / (1024 * 1024), places=3)
+
+    def test_1080p30_dnxhr_uses_phase_11b_coefficient(self) -> None:
+        # Phase 11.B: dnxhr coefficient = 0.30 (midpoint between LB and HQ).
+        # 1920 * 1080 * 30 * 3 * 0.30 = 55,987,200 bytes/s
+        mb_s = estimate_per_feed_mb_s(1920, 1080, 30.0, "dnxhr")
+        self.assertAlmostEqual(mb_s, 55_987_200.0 / (1024 * 1024), places=3)
+
+    def test_prores_coefficient_higher_than_mjpeg(self) -> None:
+        # Sanity check on the table — ProRes is heavier than MJPEG.
+        prores_mb_s = estimate_per_feed_mb_s(1280, 720, 30.0, "prores")
+        mjpeg_mb_s = estimate_per_feed_mb_s(1280, 720, 30.0, "mjpeg")
+        self.assertGreater(prores_mb_s, mjpeg_mb_s)
+
 
 class EstimateTotalTests(unittest.TestCase):
     def _settings(self) -> AppSettings:

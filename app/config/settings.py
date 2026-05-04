@@ -11,6 +11,19 @@ CONFIG_FILENAME = "app_settings.toml"
 
 _VALID_SOURCE_KINDS = {"ndi", "synthetic"}
 _VALID_HWACCEL_VALUES = {"auto", "none", "nvidia", "intel", "amd"}
+# Phase 11.B: codec/container compatibility matrix.
+_VALID_CODECS = {"mjpeg", "prores", "dnxhr"}
+_VALID_CONTAINERS = {"mkv", "mov"}
+# `mjpeg + mov` is not in the matrix — qtmux + jpegenc is not a
+# standard pairing and §5.2 doesn't list it. ProRes / DNxHR are
+# valid in either container; .mov is the natural pairing.
+_VALID_CODEC_CONTAINER_PAIRS: frozenset[tuple[str, str]] = frozenset({
+    ("mjpeg", "mkv"),
+    ("prores", "mkv"),
+    ("prores", "mov"),
+    ("dnxhr", "mkv"),
+    ("dnxhr", "mov"),
+})
 
 
 def _validate_source_kind(kind: str, *, where: str) -> None:
@@ -36,6 +49,45 @@ def _validate_hwaccel(value: str, *, where: str) -> None:
     raise RuntimeError(
         f"{where}: hardware_acceleration={value!r} is not supported. "
         f"Valid values are {sorted(_VALID_HWACCEL_VALUES)}."
+    )
+
+
+def _validate_codec(value: str, *, where: str) -> None:
+    """Phase 11.B: reject unknown `[recording] codec` values."""
+    if value in _VALID_CODECS:
+        return
+    raise RuntimeError(
+        f"{where}: codec={value!r} is not supported. "
+        f"Valid values are {sorted(_VALID_CODECS)}."
+    )
+
+
+def _validate_container(value: str, *, where: str) -> None:
+    """Phase 11.B: reject unknown `[recording] container` values."""
+    if value in _VALID_CONTAINERS:
+        return
+    raise RuntimeError(
+        f"{where}: container={value!r} is not supported. "
+        f"Valid values are {sorted(_VALID_CONTAINERS)}."
+    )
+
+
+def _validate_codec_container(codec: str, container: str, *, where: str) -> None:
+    """Phase 11.B: reject incompatible codec/container combinations.
+
+    Some pairings (mjpeg+mov in particular) aren't standard and
+    splitmuxsink would fail at element-construction time. Catch them
+    at config-load with a clear matrix so the operator sees the
+    accepted set, not a downstream GStreamer error.
+    """
+    if (codec, container) in _VALID_CODEC_CONTAINER_PAIRS:
+        return
+    accepted = ", ".join(
+        f"{c}+{x}" for c, x in sorted(_VALID_CODEC_CONTAINER_PAIRS)
+    )
+    raise RuntimeError(
+        f"{where}: codec={codec!r} + container={container!r} is not a "
+        f"supported combination. Accepted pairs: {accepted}."
     )
 
 
@@ -201,6 +253,16 @@ class AppSettings:
             settings.recording_container = (
                 str(recording_config["container"]).strip().lower()
             )
+        # Phase 11.B: validate codec, container, and the pair. Run
+        # unconditionally so defaults round-trip too — if a future
+        # default ends up incompatible the test suite catches it.
+        _validate_codec(settings.recording_codec, where="[recording]")
+        _validate_container(settings.recording_container, where="[recording]")
+        _validate_codec_container(
+            settings.recording_codec,
+            settings.recording_container,
+            where="[recording]",
+        )
         if "audio_enabled" in recording_config:
             settings.recording_audio_enabled = bool(recording_config["audio_enabled"])
         if "disk_budget_mb_s" in recording_config:

@@ -1,15 +1,19 @@
-"""Phase 11.A — recording-branch encoder selection.
+"""Phase 11.A / 11.B — recording-branch encoder selection.
 
-The pipeline used to hardcode `jpegenc` on the splitmuxsink branch. As of
-Phase 11.A the choice is driven by `[media] hardware_acceleration` in
-`app_settings.toml`: the factory probes `Gst.ElementFactory.find()` for
-the platform-appropriate hwaccel encoder element, falls back to software
-when the requested element is unavailable, and surfaces the choice
-(plus reason) for logging and diagnostics.
+The pipeline used to hardcode `jpegenc` on the splitmuxsink branch.
 
-Only `codec="mjpeg"` rows are wired today; ProRes / DNxHR rows are
-queued for Phase 11.B and slot in alongside the existing entries
-without changing the public API.
+- Phase 11.A introduced this factory and wired hardware-MJPEG selection
+  (Intel QuickSync via `qsvjpegenc`) with a software fallback to
+  `jpegenc`.
+- Phase 11.B adds ProRes (`avenc_prores_ks` → `avenc_prores`) and DNxHR
+  (`avenc_dnxhd`). Both are software-only on Windows — there is no
+  native ProRes hwaccel encoder anywhere, no DNxHR hwaccel encoder
+  anywhere, and `proresenc` from `gst-plugins-bad` isn't built into
+  UCRT64. The libav-wrapped FFmpeg encoders ride on `gst-libav`.
+
+The hwaccel parameter is honored but has no effect for ProRes/DNxHR;
+the reason string is explicit so the operator isn't confused about why
+"intel"/"nvidia" don't change anything for those codecs.
 """
 
 from __future__ import annotations
@@ -20,6 +24,35 @@ from typing import Any
 
 VALID_HWACCEL_VALUES = ("auto", "none", "nvidia", "intel", "amd")
 SOFTWARE_MJPEG_ELEMENT = "jpegenc"
+# avenc_prores_ks ("Kostya" implementation) is meaningfully faster than
+# avenc_prores at the same target quality; probe it first.
+SOFTWARE_PRORES_PRIORITY = ("avenc_prores_ks", "avenc_prores")
+SOFTWARE_DNXHR_ELEMENT = "avenc_dnxhd"
+
+# Per-element factory-arg defaults. Applied via `set_property` at
+# pipeline-build time. Sensible Phase 11.B defaults; Phase 11.C
+# introduces a `[recording] encoder_settings` TOML table that
+# overrides these per-codec.
+_DEFAULT_FACTORY_ARGS: dict[str, dict[str, Any]] = {
+    # ProRes 422 LT — `avenc_prores_ks` profile=2 maps to LT, the
+    # second-fastest profile and the closest analogue to MJPEG's
+    # bitrate/quality balance. 11.C will let operators tune this.
+    "avenc_prores_ks": {"profile": 2},
+    # `avenc_prores` has no profile property; defaults to ProRes 422.
+    "avenc_prores": {},
+    # DNxHR LB target at 1080p30 (~36 Mbit/s). `avenc_dnxhd` requires
+    # an explicit bitrate — without one it falls back to a legacy DNxHD
+    # profile that may not match the input resolution.
+    "avenc_dnxhd": {"bitrate": 36000000},
+}
+
+# Operator-friendly install hint surfaced when ProRes / DNxHR encoders
+# aren't registered. UCRT64 ships `gst-libav` as a separate pacman
+# package from the GStreamer core.
+_LIBAV_INSTALL_HINT = (
+    "Install `mingw-w64-ucrt-x86_64-gst-libav` via pacman to enable "
+    "ProRes / DNxHR encoding."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +61,14 @@ class EncoderSelection:
 
     `reason` is a short human-readable string used verbatim in the
     startup INFO log and the diagnostics widget — the operator can see
-    at a glance which encoder ran and why."""
+    at a glance which encoder ran and why.
+
+    `is_software_fallback=True` means a hwaccel candidate was tried (or
+    would have been tried at higher priority) and the chosen element
+    is software. ProRes / DNxHR with software encoders set this False
+    because no hwaccel candidate exists on the platform — software is
+    the canonical pick, not a fallback.
+    """
 
     element_name: str
     is_software_fallback: bool
@@ -37,15 +77,47 @@ class EncoderSelection:
     factory_args: dict[str, Any] = field(default_factory=dict)
 
 
-def _mjpeg_priority(hwaccel: str) -> tuple[str, ...]:
-    """Hwaccel-encoder probe order for MJPEG. Software always last."""
-    if hwaccel in ("auto", "intel"):
-        return ("qsvjpegenc", SOFTWARE_MJPEG_ELEMENT)
-    # NVENC has no MJPEG element on Windows builds; AMD likewise.
-    # Returning just software keeps the selection deterministic and
-    # surfaces a `hwaccel_fallback` event for the unrequested-but-not-
-    # available case.
-    return (SOFTWARE_MJPEG_ELEMENT,)
+def _priority_for_codec(codec: str, hwaccel: str) -> tuple[str, ...]:
+    """Element-probe priority for `(codec, hwaccel)`."""
+    if codec == "mjpeg":
+        if hwaccel in ("auto", "intel"):
+            return ("qsvjpegenc", SOFTWARE_MJPEG_ELEMENT)
+        # NVENC has no MJPEG element on Windows builds; AMD likewise.
+        return (SOFTWARE_MJPEG_ELEMENT,)
+    if codec == "prores":
+        return SOFTWARE_PRORES_PRIORITY
+    if codec == "dnxhr":
+        return (SOFTWARE_DNXHR_ELEMENT,)
+    raise NotImplementedError(
+        f"encoder_factory does not wire codec={codec!r}"
+    )
+
+
+def _is_software_element(name: str) -> bool:
+    return name in {
+        SOFTWARE_MJPEG_ELEMENT,
+        *SOFTWARE_PRORES_PRIORITY,
+        SOFTWARE_DNXHR_ELEMENT,
+    }
+
+
+def _codec_has_hwaccel_option(codec: str) -> bool:
+    """True iff this codec has at least one hwaccel candidate on Windows.
+
+    Used to decide whether picking a software element counts as a
+    *fallback* (for events / diagnostics) or as the canonical pick.
+    Only MJPEG has a hwaccel option (`qsvjpegenc` via Intel QuickSync).
+    """
+    return codec == "mjpeg"
+
+
+def _hwaccel_label(hwaccel: str) -> str:
+    return {
+        "auto": "auto-selected",
+        "intel": "Intel",
+        "nvidia": "NVIDIA",
+        "amd": "AMD",
+    }.get(hwaccel, hwaccel)
 
 
 def select_encoder(
@@ -59,9 +131,10 @@ def select_encoder(
 
     `gst_module` must expose `ElementFactory.find(name)` returning a
     truthy factory when the element is registered. Tests pass a stub.
-    `force_software=True` short-circuits the probe and returns the
-    software fallback — used by the bus-error retry path when an
-    hwaccel element fails caps negotiation at PLAYING.
+    `force_software=True` short-circuits MJPEG to `jpegenc` — used by
+    the bus-error retry path when an hwaccel encoder fails caps
+    negotiation. For ProRes/DNxHR the flag is honored but has no
+    effect (the only candidates are already software).
     """
     requested = (hwaccel or "auto").strip().lower()
     if requested not in VALID_HWACCEL_VALUES:
@@ -71,16 +144,14 @@ def select_encoder(
         )
 
     codec_normalized = (codec or "").strip().lower()
-    if codec_normalized != "mjpeg":
-        # Phase 11.A only wires MJPEG. ProRes / DNxHR rows arrive with
-        # 11.B; until then any other codec value is a config error
-        # caught upstream — but be explicit if we're called anyway.
-        raise NotImplementedError(
-            f"encoder_factory does not yet wire codec={codec!r}; "
-            "Phase 11.B introduces ProRes / DNxHR selection."
-        )
+    priority = _priority_for_codec(codec_normalized, requested)
+    factory_finder = gst_module.ElementFactory.find
 
-    if force_software or requested == "none":
+    # Dedicated MJPEG software-pin path. The reason string differs from
+    # the general fallback case so the operator can see at a glance
+    # whether they explicitly opted out (`hardware_acceleration =
+    # "none"`) or hit the runtime negotiation-failure retry.
+    if codec_normalized == "mjpeg" and (force_software or requested == "none"):
         if force_software:
             reason = (
                 f"{SOFTWARE_MJPEG_ELEMENT} (software fallback after "
@@ -96,51 +167,86 @@ def select_encoder(
             is_software_fallback=True,
             requested_hwaccel=requested,
             reason=reason,
+            factory_args=dict(
+                _DEFAULT_FACTORY_ARGS.get(SOFTWARE_MJPEG_ELEMENT, {})
+            ),
         )
 
-    priority = _mjpeg_priority(requested)
-    factory_finder = gst_module.ElementFactory.find
     for candidate in priority:
-        if factory_finder(candidate):
-            is_software = candidate == SOFTWARE_MJPEG_ELEMENT
-            if is_software and len(priority) > 1:
-                # A hwaccel was requested but the requested element
-                # wasn't found — name the missing one in the reason so
-                # the operator can tell at a glance.
-                missing = priority[0]
-                reason = (
-                    f"{candidate} (software fallback; {missing} not found "
-                    f"for hardware_acceleration={requested})"
-                )
-            elif is_software:
-                # No hwaccel option exists for this combination on this
-                # platform (e.g. nvidia / amd MJPEG).
-                reason = (
-                    f"{candidate} (no hwaccel MJPEG element for "
-                    f"hardware_acceleration={requested}; software only)"
-                )
-            else:
-                hwaccel_label = {
-                    "auto": "auto-selected",
-                    "intel": "Intel",
-                    "nvidia": "NVIDIA",
-                    "amd": "AMD",
-                }.get(requested, requested)
-                reason = (
-                    f"{candidate} ({hwaccel_label} hwaccel; "
-                    f"hardware_acceleration={requested})"
-                )
-            return EncoderSelection(
-                element_name=candidate,
-                is_software_fallback=is_software,
-                requested_hwaccel=requested,
-                reason=reason,
-            )
+        if not factory_finder(candidate):
+            continue
+        is_software = _is_software_element(candidate)
+        # `is_software_fallback` is only True when picking software
+        # *after* a hwaccel candidate would have been preferred. For
+        # codecs with no hwaccel option, software is canonical.
+        is_fallback = (
+            is_software
+            and _codec_has_hwaccel_option(codec_normalized)
+        )
+        reason = _build_reason(
+            codec=codec_normalized,
+            element_name=candidate,
+            requested_hwaccel=requested,
+            priority=priority,
+            is_software=is_software,
+            is_fallback=is_fallback,
+        )
+        return EncoderSelection(
+            element_name=candidate,
+            is_software_fallback=is_fallback,
+            requested_hwaccel=requested,
+            reason=reason,
+            factory_args=dict(_DEFAULT_FACTORY_ARGS.get(candidate, {})),
+        )
 
-    # Shouldn't be reachable — `jpegenc` ships in `gst-plugins-good`,
-    # which the rest of the pipeline already requires. If it really
-    # isn't here we've got bigger problems than encoder selection.
+    # Nothing in the priority list is registered. Tailor the install
+    # hint per codec — gst-libav for ProRes/DNxHR, gst-plugins-good for
+    # MJPEG (which would be a misconfigured environment).
+    if codec_normalized == "mjpeg":
+        raise RuntimeError(
+            f"no MJPEG encoder available; tried {list(priority)}. "
+            f"Check that gst-plugins-good is installed."
+        )
     raise RuntimeError(
-        f"no MJPEG encoder available; tried {list(priority)}. "
-        f"Check that gst-plugins-good is installed."
+        f"no {codec_normalized.upper()} encoder available; tried "
+        f"{list(priority)}. {_LIBAV_INSTALL_HINT}"
     )
+
+
+def _build_reason(
+    *,
+    codec: str,
+    element_name: str,
+    requested_hwaccel: str,
+    priority: tuple[str, ...],
+    is_software: bool,
+    is_fallback: bool,
+) -> str:
+    if not is_software:
+        return (
+            f"{element_name} ({_hwaccel_label(requested_hwaccel)} hwaccel; "
+            f"hardware_acceleration={requested_hwaccel})"
+        )
+    if is_fallback and len(priority) > 1:
+        return (
+            f"{element_name} (software fallback; {priority[0]} not found "
+            f"for hardware_acceleration={requested_hwaccel})"
+        )
+    if codec == "mjpeg":
+        # nvidia / amd MJPEG: no hwaccel option exists, so the operator
+        # asked for hwaccel that doesn't apply.
+        return (
+            f"{element_name} (no hwaccel MJPEG element for "
+            f"hardware_acceleration={requested_hwaccel}; software only)"
+        )
+    if codec == "prores":
+        return (
+            f"{element_name} (software ProRes; no hwaccel ProRes "
+            f"option exists on this platform)"
+        )
+    if codec == "dnxhr":
+        return (
+            f"{element_name} (software DNxHR; no hwaccel DNxHR "
+            f"option exists on this platform)"
+        )
+    return f"{element_name} (software)"
