@@ -449,7 +449,7 @@ Optional/testing only:
 
 4. FFV1 / UTVideo, when disk budget and playback support are validated.
 
-> **Currently shipped:** MJPEG, ProRes, and DNxHR are all selectable as of Phase 11.B. ProRes uses `avenc_prores_ks` (with `avenc_prores` as a same-codec fallback) and DNxHR uses `avenc_dnxhd` — both ship in `gst-libav` (UCRT64 package `mingw-w64-ucrt-x86_64-gst-libav`). `proresenc` from `gst-plugins-bad` isn't built into UCRT64 but the libav-wrapped encoders produce equivalent ProRes bitstreams. The disk-budget coefficient table has entries for all three codecs (`prores=0.25`, `dnxhr=0.30`); Phase 11.C's profile selection will refine the DNxHR coefficient.
+> **Currently shipped:** MJPEG-in-MKV only. Phase 11.B trialed ProRes and DNxHR in MOV containers (encoder factory wired, settings matrix accepting them, codec-aware caps for the videoconvert→encoder edge) but couldn't reliably mux audio into qtmux at record time without hardware-class capture infrastructure. The §5.2 ranking is broadcast-archive bias — broadcasters prefer those formats for *deliverables*, not for live record-and-replay paths. For archive deliverables, use the post-session processor to transcode from the MJPEG-MKV master. The encoder factory's ProRes/DNxHR rows + disk-budget coefficients remain in the codebase for future re-investigation (e.g. if hardware capture is added) but `[recording] codec` rejects anything but `mjpeg` at config-load.
 
 Avoid for replay:
 
@@ -483,7 +483,7 @@ Reason:
 - Active rolling buffers and crash recovery are harder with MP4.
 - MP4 is suitable for post-session exports, not the active recording path.
 
-> **Currently shipped:** MKV (matroskamux) and MOV (qtmux), as of Phase 11.B. The splitmuxsink `muxer-factory` switches per `[recording] container` and the segment-name extension matches. Compatibility matrix: `mjpeg+mkv`, `prores+mkv`, `prores+mov`, `dnxhr+mkv`, `dnxhr+mov`. `mjpeg+mov` is rejected at config-load (qtmux + jpegenc isn't a standard pairing).
+> **Currently shipped:** MKV (matroskamux) only on the live recording path. MOV/qtmux is the broadcast-archive natural pairing for ProRes/DNxHR but those codecs are off the live path (see §5.2 note above). The post-session processor handles MOV transcode for archive deliverables.
 
 ## 5.4 Long game recording format
 
@@ -1419,6 +1419,19 @@ app_mode = "development"   # development | production
 # (~720p ceiling). Default off.
 force_python_push_preview = false
 
+# Phase 11.C — queue policy per branch. Preview is leaky-downstream
+# (drop oldest), recording is non-leaky (disk pressure surfaces as
+# RECORDING_ERROR). The recording max_size_time_ms auto-derives from
+# `recording_segment_duration_seconds` unless overridden.
+[media.queue_policy.preview]
+leaky            = 2                  # GstQueueLeaky: 0=none, 1=upstream, 2=downstream
+max_buffers      = 4
+max_size_time_ms = 200
+[media.queue_policy.recording]
+leaky            = 0
+max_buffers      = 256
+# max_size_time_ms = 4000             # omitted → auto-derived from segment duration
+
 # Live-preview cap. Raising past 1280×720@30 requires a working native
 # preview path on every enabled feed (see §3.A.3 / §4); the synthetic
 # dev source stays python_push so it caps the rig.
@@ -1443,8 +1456,16 @@ touch_button_height = 72
 # Phase 4 splitmuxsink-driven segmented recording.
 enabled                  = true
 segment_duration_seconds = 4.0
-codec                    = "mjpeg"   # mjpeg | prores | dnxhr (Phase 11.B; see §5.2)
-container                = "mkv"     # mkv | mov (Phase 11.B; see §5.3 — mjpeg+mov rejected)
+codec                    = "mjpeg"   # mjpeg only on the live path (see §5.2)
+container                = "mkv"     # mkv only on the live path (see §5.3)
+
+# Phase 11.C — per-codec encoder property overrides. Defaults match
+# what `app/media/encoder_factory.py` applies; override only what you
+# need to tune. Only `mjpeg` is on the live path today; the prores/
+# dnxhr entries remain in the encoder factory for future reuse and
+# the validators accept them harmlessly.
+[recording.encoder_settings.mjpeg]
+quality = 85                          # jpegenc/qsvjpegenc, range 1-100
 # Phase 4.F + Phase 9.C. Upper-bound override: false forces video-only
 # regardless of source capability. When true, the runtime detects audio
 # presence per feed and wires the audio_record branch only if buffers flow.
@@ -2821,14 +2842,14 @@ Exit criteria:
 
 | Task | Today |
 |---|---|
-| Hardware acceleration selection | Pipeline hardcoded to `jpegenc` (software MJPEG). No `hardware_acceleration` TOML key, no element-availability probe, no startup log of selected encoder. **Gap.** |
-| Software fallback | Implicit — `jpegenc` is software, so the only path today *is* the fallback. There is no auto-selection logic that would need to fall back. **N/A until 11.A.** |
-| ProRes / DNxHR codec support | Spec ranks both above MJPEG (§5.2) but neither is wired. `_CODEC_RATIO_VS_RAW_RGB` only has an `"mjpeg"` entry; container loader accepts only `mkv`. **Gap.** |
-| Queue sizes tunable | `leaky=2 / 200 ms / 4 buffers` is hardcoded in `pipeline_manager.py`. No per-deployment override. **Hardcoded.** |
-| Segment duration tunable | `recording_segment_duration_seconds: 4.0` is a TOML setting; no validation against codec/keyframe alignment. **Tunable, untuned.** |
-| Encoder settings tunable | `jpegenc` runs at default quality (≈ 85). No exposed bitrate / quality / GOP setting. **Hardcoded.** |
-| Acceptance harness | No automated multi-feed run-and-measure. Validation is manual via `python main.py`. **Gap.** |
-| Performance profiles | No profile artifact format; telemetry samples are emitted to stdout / JSONL but not aggregated into a comparable run-over-run record. **Gap.** |
+| Hardware acceleration selection | `[media] hardware_acceleration` selects from `auto / none / nvidia / intel / amd`; `app/media/encoder_factory.py` probes `Gst.ElementFactory.find()` and emits a per-feed INFO log + `pipeline_mode`-style `recording_encoder` field on `FeedMetricsSnapshot`. **Closed in 11.A.** |
+| Software fallback | Build-time link-failure path swaps in `jpegenc` when the chosen hwaccel encoder refuses the upstream caps; `_force_software_encoder` is sticky for the rest of the process. Bus-error path catches the runtime variant. **Closed in 11.A.** |
+| ProRes / DNxHR codec support | `[recording] codec` accepts `prores` and `dnxhr`; `[recording] container` accepts `mov`; codec/container compatibility matrix validated at config-load. `avenc_prores_ks` / `avenc_prores` / `avenc_dnxhd` wired via the encoder factory; `qtmux` swaps in for `matroskamux` when the container is `mov`; segment naming + recovery regex pick up the new extension; `_CODEC_RATIO_VS_RAW_RGB` covers all three codecs. **Closed in 11.B.** |
+| Queue sizes tunable | `[media.queue_policy.preview]` and `[media.queue_policy.recording]` accept `leaky / max_buffers / max_size_time_ms`. Defaults reproduce the pre-11.C hardcoded behavior. Recording's `max_size_time_ms` auto-derives from segment duration when omitted. **Closed in 11.C.** |
+| Segment duration tunable | `recording_segment_duration_seconds` (existing) is now gated by `validate_segment_duration(codec, seconds)` in `app/media/encoder_factory.py` — no-op for the current intra-frame codecs, but the seam catches non-positive values and gates future long-GOP additions. **Closed in 11.C.** |
+| Encoder settings tunable | `[recording.encoder_settings.{mjpeg|prores|dnxhr}]` exposes `quality` (mjpeg) and `profile` (prores/dnxhr). Profile names map to the integer enum values exposed by gst-libav. **Closed in 11.C.** |
+| Acceptance harness | No automated multi-feed run-and-measure. Validation is manual via `python main.py`. **Gap until 11.D.** |
+| Performance profiles | No profile artifact format; telemetry samples are emitted to stdout / JSONL but not aggregated into a comparable run-over-run record. **Gap until 11.D.** |
 
 Phase 11 closes these by way of four slices:
 

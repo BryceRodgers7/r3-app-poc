@@ -138,7 +138,11 @@
       "Bash(python -m unittest discover -s tests -p 'test_audio_relink_on_rebuild.py')",
       "Bash(python -m unittest discover -s tests -p 'test_session_clock.py')",
       "Bash(python *)",
-      "Bash(git grep *)"
+      "Bash(git grep *)",
+      "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe avenc_prores_ks)",
+      "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe avenc_dnxhd)",
+      "Bash(awk 'NR>=1610 && NR<=1810' run.log)",
+      "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe qtmux *)"
     ]
   }
 }

@@ -14,6 +14,7 @@ from app.media.encoder_factory import (
     SOFTWARE_MJPEG_ELEMENT,
     EncoderSelection,
     select_encoder,
+    validate_segment_duration,
 )
 
 
@@ -38,12 +39,14 @@ def _select(
     available: set[str],
     codec: str = "mjpeg",
     force_software: bool = False,
+    encoder_settings: dict[str, dict[str, object]] | None = None,
 ) -> EncoderSelection:
     return select_encoder(
         hwaccel=hwaccel,
         codec=codec,
         gst_module=_StubGst(available),
         force_software=force_software,
+        encoder_settings=encoder_settings,
     )
 
 
@@ -178,12 +181,16 @@ class ProresSelectionTests(unittest.TestCase):
         self.assertIn("gst-libav", str(ctx.exception).lower())
 
     def test_factory_args_include_prores_lt_profile(self) -> None:
+        # Phase 11.C regression: profile=1 is "lt" in avenc_prores_ks.
+        # Phase 11.B mistakenly set profile=2 ("standard") thinking
+        # that was LT — the architecture-doc disk-budget coefficient
+        # was sized against profile 1.
         sel = _select(
             hwaccel="auto",
             available={"avenc_prores_ks"},
             codec="prores",
         )
-        self.assertEqual(sel.factory_args.get("profile"), 2)
+        self.assertEqual(sel.factory_args.get("profile"), 1)
 
     def test_hwaccel_request_does_not_change_prores_selection(self) -> None:
         # Operator asks for Intel hwaccel + ProRes; there's no hwaccel
@@ -229,15 +236,19 @@ class DnxhrSelectionTests(unittest.TestCase):
             _select(hwaccel="auto", available=set(), codec="dnxhr")
         self.assertIn("gst-libav", str(ctx.exception).lower())
 
-    def test_factory_args_include_dnxhr_default_bitrate(self) -> None:
-        # avenc_dnxhd needs an explicit bitrate; default targets
-        # DNxHR LB at 1080p30.
+    def test_factory_args_default_uses_dnxhr_lb_profile(self) -> None:
+        # Phase 11.C: avenc_dnxhd takes a profile enum
+        # (1=dnxhr_lb, 2=dnxhr_sq, 3=dnxhr_hq). The encoder picks
+        # bitrate from profile + input caps. 11.B set a manual
+        # `bitrate=36_000_000` workaround; 11.C drops it.
         sel = _select(
             hwaccel="auto",
             available={"avenc_dnxhd"},
             codec="dnxhr",
         )
-        self.assertEqual(sel.factory_args.get("bitrate"), 36000000)
+        self.assertEqual(sel.factory_args.get("profile"), 1)
+        # Regression: the 11.B bitrate workaround must not come back.
+        self.assertNotIn("bitrate", sel.factory_args)
 
 
 class ReasonStringTests(unittest.TestCase):
@@ -267,6 +278,95 @@ class ReasonStringTests(unittest.TestCase):
             codec="dnxhr",
         )
         self.assertIn("no hwaccel", sel.reason)
+
+
+class EncoderSettingsTests(unittest.TestCase):
+    """Phase 11.C: encoder_settings dict overrides factory defaults."""
+
+    def test_mjpeg_quality_override_passes_through_to_factory_args(self) -> None:
+        sel = _select(
+            hwaccel="none",
+            available={"jpegenc"},
+            codec="mjpeg",
+            encoder_settings={"mjpeg": {"quality": 60}},
+        )
+        self.assertEqual(sel.factory_args.get("quality"), 60)
+
+    def test_mjpeg_default_quality_is_85_when_no_override(self) -> None:
+        sel = _select(
+            hwaccel="none",
+            available={"jpegenc"},
+            codec="mjpeg",
+        )
+        self.assertEqual(sel.factory_args.get("quality"), 85)
+
+    def test_prores_profile_name_maps_to_correct_integer(self) -> None:
+        # Phase 11.C regression: profile name → avenc_prores_ks integer.
+        # `gst-inspect-1.0`: 0=proxy, 1=lt, 2=standard, 3=hq.
+        cases = [("proxy", 0), ("lt", 1), ("standard", 2), ("hq", 3)]
+        for name, expected in cases:
+            with self.subTest(profile=name):
+                sel = _select(
+                    hwaccel="auto",
+                    available={"avenc_prores_ks"},
+                    codec="prores",
+                    encoder_settings={"prores": {"profile": name}},
+                )
+                self.assertEqual(sel.factory_args.get("profile"), expected)
+
+    def test_dnxhr_profile_name_maps_to_correct_integer(self) -> None:
+        # Phase 11.C: avenc_dnxhd profile enum
+        # (1=dnxhr_lb, 2=dnxhr_sq, 3=dnxhr_hq).
+        cases = [("lb", 1), ("sq", 2), ("hq", 3)]
+        for name, expected in cases:
+            with self.subTest(profile=name):
+                sel = _select(
+                    hwaccel="auto",
+                    available={"avenc_dnxhd"},
+                    codec="dnxhr",
+                    encoder_settings={"dnxhr": {"profile": name}},
+                )
+                self.assertEqual(sel.factory_args.get("profile"), expected)
+                # Phase 11.B's `bitrate=36000000` workaround must not
+                # come back when the profile surface is in use.
+                self.assertNotIn("bitrate", sel.factory_args)
+
+    def test_avenc_prores_has_no_factory_args(self) -> None:
+        # avenc_prores has no profile property exposed; its
+        # factory_args stay empty regardless of the prores settings.
+        sel = _select(
+            hwaccel="auto",
+            available={"avenc_prores"},
+            codec="prores",
+            encoder_settings={"prores": {"profile": "hq"}},
+        )
+        self.assertEqual(sel.factory_args, {})
+
+
+class SegmentDurationValidatorTests(unittest.TestCase):
+    """Phase 11.C: validate_segment_duration is a seam for future
+    long-GOP codecs. Today's intra-frame codecs always pass."""
+
+    def test_intra_frame_codecs_accept_any_positive_duration(self) -> None:
+        for codec in ("mjpeg", "prores", "dnxhr"):
+            with self.subTest(codec=codec):
+                validate_segment_duration(codec, 4.0)
+                validate_segment_duration(codec, 0.5)
+                validate_segment_duration(codec, 60.0)
+
+    def test_zero_duration_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            validate_segment_duration("mjpeg", 0.0)
+
+    def test_negative_duration_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            validate_segment_duration("mjpeg", -1.0)
+
+    def test_unknown_codec_raises_not_implemented(self) -> None:
+        # Future long-GOP codecs (h264-export pipeline) would slot in
+        # here. Until then, an unknown codec is a clear error.
+        with self.assertRaises(NotImplementedError):
+            validate_segment_duration("h264", 4.0)
 
 
 if __name__ == "__main__":

@@ -39,20 +39,51 @@ audio_bitrate = 128000
 # the diagnostics widget shows what actually got picked.
 hardware_acceleration = "auto"
 
+# Phase 11.C — per-branch queue policy. Defaults reproduce the
+# pre-11.C hardcoded behavior. Override any subset; missing keys
+# stay at default. `leaky` is the GstQueueLeaky enum:
+#   0 = no leak (block upstream)
+#   1 = upstream (drop incoming)
+#   2 = downstream (drop oldest, default)
+# [media.queue_policy.preview]
+# leaky = 2
+# max_buffers = 4
+# max_size_time_ms = 200
+
+# The recording queue is non-leaky (disk pressure surfaces as a
+# health event rather than dropping frames). `max_size_time_ms` is
+# auto-derived from `recording_segment_duration_seconds` (one
+# segment's worth of nanoseconds) unless set explicitly here.
+# [media.queue_policy.recording]
+# leaky = 0
+# max_buffers = 256
+# max_size_time_ms = 4000   # explicit override; auto-derived if omitted
+
 [recording]
 enabled = true
 segment_duration_seconds = 4.0
-# Phase 11.B: codec / container compatibility matrix.
-#   "mjpeg" + "mkv"    — the original Phase-4 path; works everywhere.
-#   "prores" + "mov"   — ProRes 422 LT via avenc_prores_ks (gst-libav).
-#   "prores" + "mkv"   — same encoder, MKV instead of MOV.
-#   "dnxhr"  + "mov"   — DNxHR LB via avenc_dnxhd (gst-libav). Default
-#                        bitrate targets 1080p30; lower resolutions
-#                        will need 11.C's profile selection.
-#   "dnxhr"  + "mkv"   — same encoder, MKV container.
-# `mjpeg + mov` is not in the matrix (qtmux does not pair with jpegenc).
+# Live recording is MJPEG-in-MKV. Phase 11.B trialed ProRes/DNxHR
+# in MOV containers but the qtmux late-pad-allocation behavior
+# couldn't be reconciled with our software-encoder + NDI pipeline.
+# For broadcast-archive deliverables (ProRes, DNxHR, H.264/MP4),
+# use the post-session processor to transcode from the MJPEG-MKV
+# master at export time.
 codec = "mjpeg"
 container = "mkv"
+
+# Phase 11.C — per-codec encoder property overrides.
+#   mjpeg.quality   — jpegenc / qsvjpegenc quality (1-100, default 85).
+#   prores.profile  — avenc_prores_ks profile name: proxy | lt | standard | hq (default lt).
+#   dnxhr.profile   — avenc_dnxhd profile name: lb | sq | hq (default lb).
+# The encoder factory (`app/media/encoder_factory.py`) maps profile
+# names to the integer enum values exposed by gst-libav. Higher
+# profiles produce larger files at higher quality.
+# [recording.encoder_settings.mjpeg]
+# quality = 85
+# [recording.encoder_settings.prores]
+# profile = "lt"
+# [recording.encoder_settings.dnxhr]
+# profile = "lb"
 # Slice 4.F: when true, audio is muxed into segment files alongside
 # video. Sources with no audio (synthetic, NDI Tools Screen Capture)
 # MUST set this to false — splitmuxsink stalls waiting for audio

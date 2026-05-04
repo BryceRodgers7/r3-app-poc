@@ -771,6 +771,9 @@ def build_default_application_coordinator(
             audio_bitrate=settings.audio_bitrate,
             force_python_push_preview=settings.force_python_push_preview,
             media_hardware_acceleration=settings.media_hardware_acceleration,
+            preview_queue_policy=settings.media_preview_queue_policy,
+            recording_queue_policy=settings.media_recording_queue_policy,
+            encoder_settings=settings.recording_encoder_settings,
         )
         feed_metrics = telemetry_hub.register(feed.feed_id, feed.display_name)
         feed_metrics.set_pipeline_mode(source.pipeline_mode.value)

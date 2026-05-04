@@ -39,7 +39,11 @@ from app.config.settings import _VALID_CODEC_CONTAINER_PAIRS
 from app.core.session_clock import SessionClock
 from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
-from app.media.encoder_factory import EncoderSelection, select_encoder
+from app.media.encoder_factory import (
+    EncoderSelection,
+    select_encoder,
+    validate_segment_duration,
+)
 from app.media.frame_overlay import render_frame_overlay
 from app.media.gst_bus_log import log_bus_message
 from app.media.source_interface import PipelineMode
@@ -151,6 +155,9 @@ class PipelineManager:
         audio_bitrate: int = 128_000,
         force_python_push_preview: bool = False,
         media_hardware_acceleration: str = "auto",
+        preview_queue_policy: dict[str, Any] | None = None,
+        recording_queue_policy: dict[str, Any] | None = None,
+        encoder_settings: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._source = source
         self._preview_output = preview_output
@@ -169,8 +176,33 @@ class PipelineManager:
         # path catches an encoder negotiation failure — subsequent
         # rebuilds within this process pin to software.
         self._media_hardware_acceleration = media_hardware_acceleration
+        # Phase 11.C: queue policy + encoder settings. None defaults
+        # reproduce the values that were hardcoded before 11.C, so
+        # tests and ad-hoc construction stay byte-identical to the
+        # pre-11.C pipeline.
+        self._preview_queue_policy: dict[str, Any] = (
+            dict(preview_queue_policy) if preview_queue_policy is not None
+            else {"leaky": 2, "max_buffers": 4, "max_size_time_ms": 200}
+        )
+        self._recording_queue_policy: dict[str, Any] = (
+            dict(recording_queue_policy) if recording_queue_policy is not None
+            else {"leaky": 0, "max_buffers": 256, "max_size_time_ms": None}
+        )
+        self._encoder_settings: dict[str, dict[str, Any]] | None = (
+            encoder_settings
+        )
         self._force_software_encoder: bool = False
         self._record_branch_encoder_selection: EncoderSelection | None = None
+        # Phase 11.B follow-up: when the audio_record chain build
+        # fails (qtmux refusing late audio_%u request pads is the
+        # main case), this latches True and the lazy chain build is
+        # skipped on every subsequent Start. Without this latch, game
+        # 2's rebuild path successfully wires audio into a fresh
+        # qtmux instance — but then ProRes-encode + qtmux audio/video
+        # interleaving has been observed to wedge the pipeline within
+        # seconds. Sticking to video-only after first failure keeps
+        # recording reliable across all games in a session.
+        self._audio_record_permanently_disabled: bool = False
         # Phase 11.A: handler invoked when the bus catches an encoder
         # negotiation failure. Wired by ApplicationCoordinator to the
         # owning FeedRuntime — bypasses the DISCONNECTED →
@@ -309,6 +341,14 @@ class PipelineManager:
                 f"container={self._recording_container!r}. "
                 f"Accepted: {accepted}."
             )
+        # Phase 11.C: GOP / segment-duration consistency check. No-op
+        # for intra-frame codecs (mjpeg / prores / dnxhr), but the
+        # seam catches sub-zero durations and gates future long-GOP
+        # codec additions.
+        validate_segment_duration(
+            self._recording_codec,
+            self._recording_segment_duration_seconds,
+        )
         # Phase 7.E + 9.C: audio-presence detection.
         #
         # `_audio_present_observed` is set by a buffer probe on the
@@ -403,10 +443,6 @@ class PipelineManager:
             try:
                 self._rebuild_splitmuxsink_locked()
             except Exception:
-                # ERROR-level + a health event so the symptom
-                # (no segments written for game N+1) lines up with a
-                # visible failure in the operator's diagnostics rather
-                # than a silent exception buried in the log.
                 LOGGER.exception(
                     "splitmuxsink rebuild raised on re-enable for feed_id=%s — "
                     "subsequent game will record zero segments. Inspect the "
@@ -428,7 +464,10 @@ class PipelineManager:
             # been observed since pipeline construction, late-build the
             # audio_record branch BEFORE we open the recording valve so
             # the first segment's matroskamux sees the audio pad during
-            # caps negotiation.
+            # caps negotiation. (For qtmux/.mov this attempt will fail
+            # because qtmux refuses late audio_%u pads — game 1 records
+            # video-only with .mov. Fix A's chain-cleanup helper keeps
+            # game 2+ from cascading on the failure.)
             self._ensure_audio_record_branch_built_locked()
         self._set_branch_enabled("record", True)
         self._recording_running = True
@@ -981,16 +1020,17 @@ class PipelineManager:
     def _configure_preview_queue(self, queue: Any, branch_name: str) -> None:
         """Apply the §4.3 preview queue policy.
 
-        Leaky-downstream so a slow preview drops frames rather than
-        pushing back on the source tee, time-bounded at 200ms, with a
-        small buffer-count cap as a secondary guard.
+        Leaky-downstream by default so a slow preview drops frames
+        rather than pushing back on the source tee, time-bounded, with
+        a small buffer-count cap as a secondary guard. Phase 11.C made
+        these values overridable via `[media.queue_policy.preview]`.
         """
-        # `leaky=2` is GST_QUEUE_LEAK_DOWNSTREAM — drop the oldest
-        # buffer when the queue is full, never block upstream.
-        max_size_buffers = 4
-        max_size_time_ns = 200_000_000  # 200 ms
+        policy = self._preview_queue_policy
+        leaky = int(policy["leaky"])
+        max_size_buffers = int(policy["max_buffers"])
+        max_size_time_ns = int(policy["max_size_time_ms"]) * 1_000_000
         try:
-            queue.set_property("leaky", 2)
+            queue.set_property("leaky", leaky)
             queue.set_property("max-size-buffers", max_size_buffers)
             queue.set_property("max-size-time", max_size_time_ns)
             queue.set_property("max-size-bytes", 0)
@@ -1005,18 +1045,29 @@ class PipelineManager:
     def _configure_record_queue(self, queue: Any, branch_name: str) -> None:
         """Apply the §4.4 record queue policy.
 
-        Non-leaky: pressure on the recording branch must surface as a
-        `RECORDING_ERROR` health event rather than silently dropping
-        buffers. Time-bounded at one segment's worth of frames so a
-        wedged disk eventually stops the pipeline rather than ballooning
-        memory unbounded.
+        Non-leaky by default: pressure on the recording branch must
+        surface as a `RECORDING_ERROR` health event rather than
+        silently dropping buffers. Time-bounded at one segment's worth
+        of frames (auto-derived from `recording_segment_duration_seconds`)
+        unless the operator has set an explicit `max_size_time_ms` in
+        `[media.queue_policy.recording]`. Phase 11.C made these values
+        overridable.
         """
         Gst = self._Gst
         assert Gst is not None
-        max_size_buffers = 256
-        max_size_time_ns = int(self._recording_segment_duration_seconds * Gst.SECOND)
+        policy = self._recording_queue_policy
+        leaky = int(policy["leaky"])
+        max_size_buffers = int(policy["max_buffers"])
+        configured_time_ms = policy.get("max_size_time_ms")
+        if configured_time_ms is None:
+            # Default — derive one segment's worth of nanoseconds.
+            max_size_time_ns = int(
+                self._recording_segment_duration_seconds * Gst.SECOND
+            )
+        else:
+            max_size_time_ns = int(configured_time_ms) * 1_000_000
         try:
-            queue.set_property("leaky", 0)  # GST_QUEUE_LEAK_NO
+            queue.set_property("leaky", leaky)
             queue.set_property("max-size-buffers", max_size_buffers)
             queue.set_property("max-size-time", max_size_time_ns)
             queue.set_property("max-size-bytes", 0)
@@ -1324,19 +1375,14 @@ class PipelineManager:
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
         self._configure_record_queue(queue, branch_name)
-        # Force the input to the encoder to be BT.601 I420. JPEG has no
-        # standardized colorimetry tag; players decode assuming BT.601.
-        # If we let the BT.709 source flow straight to the encoder,
-        # players will use the wrong matrix to convert YUV→RGB and
-        # colors will shift visibly. Pinning caps here pushes
-        # videoconvert to do the 709→601 conversion before encoding, so
-        # the JPEG content actually matches what decoders expect.
+        # Phase 11.B caps follow-up: pin the format to whatever the
+        # selected encoder accepts. MJPEG wants 4:2:0 BT.601; ProRes
+        # wants 10-bit 4:2:2; DNxHR (LB/SQ/HQ) wants 8-bit 4:2:2. See
+        # `_recording_encode_caps_string` for the rationale.
         encode_caps = self._make_element("capsfilter", f"{branch_name}_encode_caps")
         encode_caps.set_property(
             "caps",
-            Gst.Caps.from_string(
-                "video/x-raw,format=I420,colorimetry=bt601"
-            ),
+            Gst.Caps.from_string(self._recording_encode_caps_string()),
         )
         # Phase 11.A: pick the encoder element via the factory.
         # Sticky-software fallback when a prior pipeline build saw the
@@ -1347,6 +1393,7 @@ class PipelineManager:
             codec=self._recording_codec,
             gst_module=Gst,
             force_software=self._force_software_encoder,
+            encoder_settings=self._encoder_settings,
         )
         encoder = self._make_element(
             encoder_selection.element_name,
@@ -1399,7 +1446,7 @@ class PipelineManager:
                 message=(
                     f"feed={feed_id_for_log}: {failed_element_name} could not "
                     f"link to upstream caps "
-                    f"(video/x-raw,format=I420,colorimetry=bt601) — "
+                    f"({self._recording_encode_caps_string()}) — "
                     f"falling back to software encoder."
                 ),
                 feed_id=feed_id_for_log,
@@ -1407,6 +1454,7 @@ class PipelineManager:
                     "failed_element": failed_element_name,
                     "requested_hwaccel": encoder_selection.requested_hwaccel,
                     "stage": "build_time_link",
+                    "encode_caps": self._recording_encode_caps_string(),
                 },
             )
             self._pipeline.remove(encoder)
@@ -1416,6 +1464,7 @@ class PipelineManager:
                 codec=self._recording_codec,
                 gst_module=Gst,
                 force_software=True,
+                encoder_settings=self._encoder_settings,
             )
             encoder = self._make_element(
                 encoder_selection.element_name,
@@ -1469,8 +1518,8 @@ class PipelineManager:
 
         self._branch_valves[branch_name] = valve
         self._splitmuxsink = splitmuxsink
-        # Capture refs needed to rebuild the splitmuxsink on the next
-        # disable/enable cycle.
+        # Capture refs needed by the rebuild path / first-start
+        # splitmuxsink build.
         self._record_branch_encoder = encoder
         self._record_branch_encoder_selection = encoder_selection
         self._record_branch_name = branch_name
@@ -1543,6 +1592,38 @@ class PipelineManager:
             )
         return muxer
 
+    def _recording_encode_caps_string(self) -> str:
+        """Phase 11.B caps follow-up: pick the videoconvert→encoder
+        capsfilter constraint per codec.
+
+        Each encoder accepts a different pixel-format set:
+
+        - `jpegenc` / `qsvjpegenc` (MJPEG): I420 (8-bit 4:2:0). Pinned
+          to BT.601 colorimetry because JPEG has no standardized
+          colorimetry tag — players decode assuming BT.601, so the
+          source's BT.709 must be converted upstream of the encoder
+          to keep colors stable.
+        - `avenc_prores_ks` / `avenc_prores`: I422_10LE only (10-bit
+          4:2:2). 8-bit and 4:2:0 are rejected outright.
+        - `avenc_dnxhd` (DNxHR LB/SQ/HQ): Y42B (8-bit 4:2:2).
+          Higher-bit-depth profiles (HQX/444) want 10-bit but they're
+          out of 11.B/C scope.
+
+        Colorimetry pinning is JPEG-specific; ProRes/DNxHR carry
+        proper colorimetry tags in the bitstream + container, so
+        videoconvert is free to pass the source's colorimetry through.
+        """
+        if self._recording_codec == "mjpeg":
+            return "video/x-raw,format=I420,colorimetry=bt601"
+        if self._recording_codec == "prores":
+            return "video/x-raw,format=I422_10LE"
+        if self._recording_codec == "dnxhr":
+            return "video/x-raw,format=Y42B"
+        raise AssertionError(
+            f"unexpected recording_codec={self._recording_codec!r} "
+            f"(should have been caught by __init__ validator)"
+        )
+
     def _segment_extension(self) -> str:
         """Phase 11.B: file extension matching the muxer's container."""
         if self._recording_container == "mkv":
@@ -1583,12 +1664,12 @@ class PipelineManager:
         element instance has no such state.
 
         Steps:
-          1. Unlink jpegenc → old splitmuxsink.
+          1. Unlink encoder → old splitmuxsink.
           2. Set old splitmuxsink to NULL (defensive — disable should
              have done this already, but a no-op repeat is safe).
           3. Remove old splitmuxsink from the pipeline.
           4. Build a fresh splitmuxsink with the same config.
-          5. Add to pipeline, link jpegenc → new splitmuxsink.
+          5. Add to pipeline, link encoder → new splitmuxsink.
           6. `sync_state_with_parent` to bring it to PLAYING.
           7. Update `self._splitmuxsink` to point at the new instance.
         """
@@ -1601,7 +1682,7 @@ class PipelineManager:
         ):
             LOGGER.warning(
                 "rebuild_splitmuxsink: prerequisites missing; skipping rebuild "
-                "(splitmuxsink=%s jpegenc=%s branch=%s pipeline=%s Gst=%s)",
+                "(splitmuxsink=%s encoder=%s branch=%s pipeline=%s Gst=%s)",
                 self._splitmuxsink is not None,
                 self._record_branch_encoder is not None,
                 self._record_branch_name is not None,
@@ -1610,16 +1691,18 @@ class PipelineManager:
             )
             return
         old = self._splitmuxsink
-        jpegenc = self._record_branch_encoder
+        encoder = self._record_branch_encoder
         branch_name = self._record_branch_name
         LOGGER.info(
             "rebuild_splitmuxsink: starting for feed_id=%s",
             self._recording_feed_id,
         )
         try:
-            jpegenc.unlink(old)
+            encoder.unlink(old)
         except Exception:
-            LOGGER.exception("rebuild_splitmuxsink: unlink jpegenc → old failed")
+            LOGGER.exception(
+                "rebuild_splitmuxsink: unlink encoder → old failed"
+            )
         # Explicitly unlink the audio encoder's src pad from the OLD
         # splitmuxsink's audio_%u request pad BEFORE we remove `old` from
         # the pipeline.
@@ -1664,7 +1747,10 @@ class PipelineManager:
         try:
             old.set_state(self._Gst.State.NULL)
         except Exception:
-            LOGGER.debug("rebuild_splitmuxsink: old set_state(NULL) raised", exc_info=True)
+            LOGGER.debug(
+                "rebuild_splitmuxsink: old set_state(NULL) raised",
+                exc_info=True,
+            )
         try:
             removed_ok = self._pipeline.remove(old)
             LOGGER.info(
@@ -1672,7 +1758,9 @@ class PipelineManager:
                 removed_ok,
             )
         except Exception:
-            LOGGER.exception("rebuild_splitmuxsink: pipeline.remove(old) failed")
+            LOGGER.exception(
+                "rebuild_splitmuxsink: pipeline.remove(old) failed"
+            )
         new_sink = self._build_splitmuxsink_element(branch_name)
         added_ok = self._pipeline.add(new_sink)
         LOGGER.info(
@@ -1696,14 +1784,15 @@ class PipelineManager:
         # `_add_audio_record_branch_to_splitmuxsink`). No-op when
         # `_audio_record_encoder` is None (audio never observed).
         self._link_audio_encoder_to_splitmuxsink_locked(new_sink)
-        link_ok = jpegenc.link(new_sink)
+        link_ok = encoder.link(new_sink)
         LOGGER.info(
-            "rebuild_splitmuxsink: jpegenc.link(new) returned %s",
+            "rebuild_splitmuxsink: encoder.link(new) returned %s element=%s",
             link_ok,
+            encoder.get_name() if hasattr(encoder, "get_name") else "?",
         )
         if not link_ok:
             raise RuntimeError(
-                "rebuild_splitmuxsink: failed to link jpegenc → new splitmuxsink"
+                "rebuild_splitmuxsink: failed to link encoder → new splitmuxsink"
             )
         # `sync_state_with_parent()` returns a `bool`. If False, the
         # new splitmuxsink failed to enter the parent's state and
@@ -2236,16 +2325,30 @@ class PipelineManager:
         # pointing at an orphan element, and every subsequent rebuild
         # raises `WRONG_HIERARCHY` from the link helper.
         self._audio_record_encoder = encoder
+        # Phase 11.B follow-up: if the encoder→splitmuxsink link fails
+        # (qtmux refuses late audio_%u after stream-start), the audio
+        # chain elements (queue/valve/convert/resample/encoder) are
+        # already in the pipeline. They MUST be removed here, or the
+        # next rebuild's `pipeline.add(audio_record_mux_*)` call hits
+        # "Name 'audio_record_mux_queue' is not unique in bin" and the
+        # new elements are silently dropped → cascading WRONG_HIERARCHY
+        # on the next link attempt → game 2 freeze.
         try:
             self._link_audio_encoder_to_splitmuxsink_locked(self._splitmuxsink)
         except Exception:
             self._audio_record_encoder = None
+            self._discard_audio_record_chain_elements(
+                queue, valve, convert, resample, encoder
+            )
             raise
 
         tee_src_pad = self._request_audio_tee_pad()
         queue_sink_pad = queue.get_static_pad("sink")
         if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
             self._audio_record_encoder = None
+            self._discard_audio_record_chain_elements(
+                queue, valve, convert, resample, encoder
+            )
             raise RuntimeError(
                 "Failed to link audio tee output to the audio_record branch."
             )
@@ -2257,6 +2360,57 @@ class PipelineManager:
             "Audio record branch wired into splitmuxsink at %d bps (opus).",
             self._audio_bitrate,
         )
+
+    def _discard_audio_record_chain_elements(self, *elements: Any) -> None:
+        """Phase 11.B follow-up: best-effort cleanup of partially-built
+        audio_record chain elements when the splitmuxsink link fails.
+
+        Called from the `_add_audio_record_branch_to_splitmuxsink`
+        exception handlers. Sets each element to NULL and removes it
+        from the pipeline so the next rebuild attempt doesn't trip
+        over name collisions ('Name X is not unique in bin'). Any
+        per-element exception is logged and swallowed — we're already
+        on the error path and the goal is to leave the pipeline in a
+        salvageable state for the next game.
+
+        Also latches `_audio_record_permanently_disabled = True` so
+        subsequent rebuilds skip the audio chain build entirely. The
+        most likely failure cause (qtmux refusing late audio_%u request
+        pads) recovers on the rebuild path's fresh qtmux — but enabling
+        audio + video on qtmux mid-session has shown to overwhelm the
+        ProRes encoder + interleaving timing, causing NDI to disconnect.
+        Better to record video-only consistently than to flicker between
+        broken audio attempts and source disconnects.
+        """
+        self._audio_record_permanently_disabled = True
+        LOGGER.warning(
+            "audio_record chain disabled for the rest of this process "
+            "(latched after first failure). subsequent games will "
+            "record video-only."
+        )
+        if self._pipeline is None or self._Gst is None:
+            return
+        for element in elements:
+            if element is None:
+                continue
+            try:
+                element.set_state(self._Gst.State.NULL)
+            except Exception:
+                LOGGER.debug(
+                    "discard_audio_record_chain: set_state(NULL) raised "
+                    "for %r",
+                    element,
+                    exc_info=True,
+                )
+            try:
+                self._pipeline.remove(element)
+            except Exception:
+                LOGGER.debug(
+                    "discard_audio_record_chain: pipeline.remove raised "
+                    "for %r",
+                    element,
+                    exc_info=True,
+                )
 
     def _install_audio_presence_probe_locked(self, tee: Any) -> None:
         """Phase 9.C: detect the first audio buffer that flows through
@@ -2314,6 +2468,8 @@ class PipelineManager:
         that gains audio between games picks it up on the next game.
         """
         if not self._recording_audio_enabled:
+            return
+        if self._audio_record_permanently_disabled:
             return
         if self._audio_format is None:
             return

@@ -11,19 +11,59 @@ CONFIG_FILENAME = "app_settings.toml"
 
 _VALID_SOURCE_KINDS = {"ndi", "synthetic"}
 _VALID_HWACCEL_VALUES = {"auto", "none", "nvidia", "intel", "amd"}
-# Phase 11.B: codec/container compatibility matrix.
-_VALID_CODECS = {"mjpeg", "prores", "dnxhr"}
-_VALID_CONTAINERS = {"mkv", "mov"}
-# `mjpeg + mov` is not in the matrix — qtmux + jpegenc is not a
-# standard pairing and §5.2 doesn't list it. ProRes / DNxHR are
-# valid in either container; .mov is the natural pairing.
+# Phase 11.B follow-up: live recording matrix is MJPEG+MKV only.
+# ProRes / DNxHR / MOV were trialed (Phase 11.B) but the live
+# recording path can't reliably mux audio into qtmux without
+# hardware-class capture infrastructure that real broadcast
+# instant-replay systems use. The post-session processor exists
+# for archive-format export — operators wanting ProRes-MOV
+# deliverables get them via that path, transcoded from the
+# MJPEG-MKV master with audio properly multiplexed.
+_VALID_CODECS = {"mjpeg"}
+_VALID_CONTAINERS = {"mkv"}
 _VALID_CODEC_CONTAINER_PAIRS: frozenset[tuple[str, str]] = frozenset({
     ("mjpeg", "mkv"),
-    ("prores", "mkv"),
-    ("prores", "mov"),
-    ("dnxhr", "mkv"),
-    ("dnxhr", "mov"),
 })
+
+# Phase 11.C — pipeline tuning matrix.
+#
+# Queue-policy defaults reproduce what `pipeline_manager.py` had
+# hardcoded since Phase 3.B. Preview and recording have *different*
+# defaults — preview is leaky-downstream so a slow preview drops
+# rather than pushes back on the source; recording is non-leaky so
+# disk pressure surfaces as a health event rather than dropping
+# frames. `leaky` corresponds to GstQueueLeaky (0=no leak,
+# 1=upstream/oldest, 2=downstream/newest).
+#
+# `max_size_time_ms = None` on the recording default means "derive
+# from `recording_segment_duration_seconds` at pipeline-build time"
+# (the §4.4 invariant: the queue holds at most one segment).
+# Operators can override with an explicit ms value.
+_DEFAULT_PREVIEW_QUEUE_POLICY: dict[str, Any] = {
+    "leaky": 2,
+    "max_buffers": 4,
+    "max_size_time_ms": 200,
+}
+_DEFAULT_RECORDING_QUEUE_POLICY: dict[str, Any] = {
+    "leaky": 0,
+    "max_buffers": 256,
+    "max_size_time_ms": None,
+}
+_VALID_LEAKY_VALUES = {0, 1, 2}
+
+# Per-codec encoder settings. Defaults match what the encoder factory
+# applies when no `[recording.encoder_settings]` block is present.
+# 11.C fixes 11.B's prores profile off-by-one (was integer 2 = standard;
+# correct LT integer is 1) and switches DNxHR from a `bitrate` workaround
+# to the `profile` enum surface — both flow through the profile-name
+# mapping in `app/media/encoder_factory.py`.
+_VALID_PRORES_PROFILES = {"proxy", "lt", "standard", "hq"}
+_VALID_DNXHR_PROFILES = {"lb", "sq", "hq"}
+_DEFAULT_ENCODER_SETTINGS: dict[str, dict[str, Any]] = {
+    "mjpeg": {"quality": 85},
+    "prores": {"profile": "lt"},
+    "dnxhr": {"profile": "lb"},
+}
 
 
 def _validate_source_kind(kind: str, *, where: str) -> None:
@@ -53,9 +93,25 @@ def _validate_hwaccel(value: str, *, where: str) -> None:
 
 
 def _validate_codec(value: str, *, where: str) -> None:
-    """Phase 11.B: reject unknown `[recording] codec` values."""
+    """Phase 11.B follow-up: reject anything but MJPEG.
+
+    ProRes / DNxHR were trialed for the live recording path but
+    couldn't be made to reliably mux audio in our software-encoder
+    pipeline. They remain useful as *export* formats — see the
+    post-session processor for archive-quality transcoding from
+    the MJPEG-MKV master.
+    """
     if value in _VALID_CODECS:
         return
+    if value in {"prores", "dnxhr"}:
+        raise RuntimeError(
+            f"{where}: codec={value!r} is not supported on the live "
+            f"recording path (Phase 11.B follow-up — qtmux audio-mux "
+            f"timing issues couldn't be resolved without hardware "
+            f"capture). Use codec='mjpeg' here; transcode to "
+            f"{value} via the post-session processor for archive "
+            f"deliverables."
+        )
     raise RuntimeError(
         f"{where}: codec={value!r} is not supported. "
         f"Valid values are {sorted(_VALID_CODECS)}."
@@ -63,13 +119,85 @@ def _validate_codec(value: str, *, where: str) -> None:
 
 
 def _validate_container(value: str, *, where: str) -> None:
-    """Phase 11.B: reject unknown `[recording] container` values."""
+    """Phase 11.B follow-up: reject anything but MKV."""
     if value in _VALID_CONTAINERS:
         return
+    if value == "mov":
+        raise RuntimeError(
+            f"{where}: container={value!r} is not supported on the "
+            f"live recording path. Use container='mkv' here; "
+            f"transcode to .mov via the post-session processor."
+        )
     raise RuntimeError(
         f"{where}: container={value!r} is not supported. "
         f"Valid values are {sorted(_VALID_CONTAINERS)}."
     )
+
+
+def _validate_queue_policy(policy: dict[str, Any], *, where: str) -> None:
+    """Phase 11.C: range-check a queue-policy sub-table.
+
+    `leaky` must match the GstQueueLeaky enum; `max_buffers` and
+    `max_size_time_ms` must be positive. Unknown keys are ignored so
+    that future fields in the same sub-table don't trip older configs.
+    """
+    if "leaky" in policy:
+        leaky = int(policy["leaky"])
+        if leaky not in _VALID_LEAKY_VALUES:
+            raise RuntimeError(
+                f"{where}: leaky={leaky} is not in "
+                f"{sorted(_VALID_LEAKY_VALUES)} (GstQueueLeaky enum)."
+            )
+    if "max_buffers" in policy:
+        max_buffers = int(policy["max_buffers"])
+        if max_buffers <= 0:
+            raise RuntimeError(
+                f"{where}: max_buffers={max_buffers} must be > 0."
+            )
+    if "max_size_time_ms" in policy:
+        raw = policy["max_size_time_ms"]
+        # `None` is a valid value for the recording queue: "derive
+        # from segment duration". Validator only rejects bogus
+        # integers; pipeline_manager handles the None branch.
+        if raw is not None:
+            max_time = int(raw)
+            if max_time <= 0:
+                raise RuntimeError(
+                    f"{where}: max_size_time_ms={max_time} must be > 0."
+                )
+
+
+def _validate_encoder_settings(
+    settings: dict[str, dict[str, Any]], *, where: str
+) -> None:
+    """Phase 11.C: range-check the per-codec encoder-settings sub-tables."""
+    for codec, codec_settings in settings.items():
+        if codec not in _VALID_CODECS:
+            raise RuntimeError(
+                f"{where}: encoder_settings has unknown codec={codec!r}. "
+                f"Valid codecs are {sorted(_VALID_CODECS)}."
+            )
+        if codec == "mjpeg" and "quality" in codec_settings:
+            quality = int(codec_settings["quality"])
+            if not (1 <= quality <= 100):
+                raise RuntimeError(
+                    f"{where}: mjpeg.quality={quality} is out of range "
+                    f"[1, 100]."
+                )
+        if codec == "prores" and "profile" in codec_settings:
+            profile = str(codec_settings["profile"]).strip().lower()
+            if profile not in _VALID_PRORES_PROFILES:
+                raise RuntimeError(
+                    f"{where}: prores.profile={profile!r} is not in "
+                    f"{sorted(_VALID_PRORES_PROFILES)}."
+                )
+        if codec == "dnxhr" and "profile" in codec_settings:
+            profile = str(codec_settings["profile"]).strip().lower()
+            if profile not in _VALID_DNXHR_PROFILES:
+                raise RuntimeError(
+                    f"{where}: dnxhr.profile={profile!r} is not in "
+                    f"{sorted(_VALID_DNXHR_PROFILES)}."
+                )
 
 
 def _validate_codec_container(codec: str, container: str, *, where: str) -> None:
@@ -140,6 +268,18 @@ class AppSettings:
     # probe toward that vendor's elements but still fall back to
     # software when unavailable. See architecture §7.4.
     media_hardware_acceleration: str = "auto"
+    # Phase 11.C: per-branch queue policy. Defaults match what was
+    # hardcoded in `pipeline_manager.py` since Phase 3.B. Preview is
+    # leaky-downstream (slow preview drops the oldest); recording is
+    # non-leaky (disk pressure surfaces as a health event). The
+    # recording queue's `max_size_time_ms = None` means "derive from
+    # `recording_segment_duration_seconds`" at pipeline-build time.
+    media_preview_queue_policy: dict[str, Any] = field(
+        default_factory=lambda: dict(_DEFAULT_PREVIEW_QUEUE_POLICY)
+    )
+    media_recording_queue_policy: dict[str, Any] = field(
+        default_factory=lambda: dict(_DEFAULT_RECORDING_QUEUE_POLICY)
+    )
     # [recording] block — Phase 4. Native segmented recording via
     # `splitmuxsink`. MJPEG-in-MKV is the 4.A target codec/container; both
     # are intra-frame seekable per §15.7 and use elements that ship in
@@ -151,6 +291,16 @@ class AppSettings:
     recording_segment_duration_seconds: float = 4.0
     recording_codec: str = "mjpeg"
     recording_container: str = "mkv"
+    # Phase 11.C: per-codec encoder property overrides. Keys are codec
+    # names (`mjpeg` / `prores` / `dnxhr`); values are sub-dicts of
+    # property-name → value. Defaults match what `encoder_factory`
+    # applies when no override is configured.
+    recording_encoder_settings: dict[str, dict[str, Any]] = field(
+        default_factory=lambda: {
+            codec: dict(props)
+            for codec, props in _DEFAULT_ENCODER_SETTINGS.items()
+        }
+    )
     # Slice 4.F: when True, the audio tee feeds opusenc into splitmuxsink
     # alongside the video branch, so segment files contain audio. When
     # False (or when the source has no audio), the audio_record branch
@@ -239,6 +389,32 @@ class AppSettings:
             )
             _validate_hwaccel(raw_hwaccel, where="[media]")
             settings.media_hardware_acceleration = raw_hwaccel
+        # Phase 11.C: queue-policy sub-tables. Validate, then merge
+        # over the per-queue defaults so a partial config (only
+        # `max_buffers = 16`, say) keeps the other keys at their
+        # default. Preview and recording have different defaults
+        # (different leaky/max-buffers semantics).
+        queue_policy_config = cls._as_dict(media_config.get("queue_policy"))
+        preview_policy = cls._as_dict(queue_policy_config.get("preview"))
+        if preview_policy:
+            _validate_queue_policy(
+                preview_policy, where="[media.queue_policy.preview]"
+            )
+            settings.media_preview_queue_policy = {
+                **_DEFAULT_PREVIEW_QUEUE_POLICY,
+                **{k: v for k, v in preview_policy.items()
+                   if k in _DEFAULT_PREVIEW_QUEUE_POLICY},
+            }
+        recording_policy = cls._as_dict(queue_policy_config.get("recording"))
+        if recording_policy:
+            _validate_queue_policy(
+                recording_policy, where="[media.queue_policy.recording]"
+            )
+            settings.media_recording_queue_policy = {
+                **_DEFAULT_RECORDING_QUEUE_POLICY,
+                **{k: v for k, v in recording_policy.items()
+                   if k in _DEFAULT_RECORDING_QUEUE_POLICY},
+            }
 
         recording_config = cls._as_dict(data.get("recording"))
         if "enabled" in recording_config:
@@ -263,6 +439,28 @@ class AppSettings:
             settings.recording_container,
             where="[recording]",
         )
+        # Phase 11.C: per-codec encoder settings. Each sub-table
+        # merges over the per-codec defaults so a partial override
+        # (e.g. just `mjpeg.quality = 60`) keeps the other codec
+        # entries at their defaults.
+        encoder_settings_config = cls._as_dict(
+            recording_config.get("encoder_settings")
+        )
+        if encoder_settings_config:
+            parsed: dict[str, dict[str, Any]] = {}
+            for codec, sub in encoder_settings_config.items():
+                parsed[codec.lower()] = cls._as_dict(sub)
+            _validate_encoder_settings(
+                parsed, where="[recording.encoder_settings]"
+            )
+            merged: dict[str, dict[str, Any]] = {
+                codec: dict(props)
+                for codec, props in _DEFAULT_ENCODER_SETTINGS.items()
+            }
+            for codec, codec_settings in parsed.items():
+                merged.setdefault(codec, {})
+                merged[codec].update(codec_settings)
+            settings.recording_encoder_settings = merged
         if "audio_enabled" in recording_config:
             settings.recording_audio_enabled = bool(recording_config["audio_enabled"])
         if "disk_budget_mb_s" in recording_config:

@@ -142,47 +142,202 @@ hardware_acceleration = "intel"
             settings = AppSettings.load(config_path)
         self.assertEqual(settings.media_hardware_acceleration, "intel")
 
-    def test_recording_codec_container_matrix_round_trip(self) -> None:
-        # Phase 11.B: every accepted codec/container pair must round-trip.
-        accepted = [
-            ("mjpeg", "mkv"),
-            ("prores", "mkv"),
-            ("prores", "mov"),
-            ("dnxhr", "mkv"),
-            ("dnxhr", "mov"),
-        ]
-        for codec, container in accepted:
-            with self.subTest(codec=codec, container=container):
+    def test_queue_policy_defaults_match_pre_11c_constants(self) -> None:
+        # Phase 11.C regression guardrail: the defaults must match
+        # what was hardcoded in `pipeline_manager.py` since Phase 3.B.
+        # If anyone ever bumps these we want the test to flag it.
+        settings = AppSettings()
+        self.assertEqual(
+            settings.media_preview_queue_policy,
+            {"leaky": 2, "max_buffers": 4, "max_size_time_ms": 200},
+        )
+        self.assertEqual(
+            settings.media_recording_queue_policy,
+            {"leaky": 0, "max_buffers": 256, "max_size_time_ms": None},
+        )
+
+    def test_queue_policy_partial_override_merges_with_defaults(self) -> None:
+        # Setting only `max_buffers` keeps the other two at default.
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[media.queue_policy.recording]
+max_buffers = 16
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(
+            settings.media_recording_queue_policy,
+            {"leaky": 0, "max_buffers": 16, "max_size_time_ms": None},
+        )
+
+    def test_queue_policy_rejects_invalid_leaky(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[media.queue_policy.preview]
+leaky = 5
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("leaky", str(ctx.exception))
+
+    def test_queue_policy_rejects_zero_max_buffers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[media.queue_policy.preview]
+max_buffers = 0
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                AppSettings.load(config_path)
+
+    def test_encoder_settings_defaults(self) -> None:
+        settings = AppSettings()
+        self.assertEqual(settings.recording_encoder_settings["mjpeg"]["quality"], 85)
+        self.assertEqual(
+            settings.recording_encoder_settings["prores"]["profile"], "lt"
+        )
+        self.assertEqual(
+            settings.recording_encoder_settings["dnxhr"]["profile"], "lb"
+        )
+
+    def test_encoder_settings_round_trip(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording.encoder_settings.mjpeg]
+quality = 60
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(
+            settings.recording_encoder_settings["mjpeg"]["quality"], 60
+        )
+        # Defaults preserved for codecs that aren't on the live path
+        # but whose entries the encoder factory still uses internally.
+        self.assertEqual(
+            settings.recording_encoder_settings["prores"]["profile"], "lt"
+        )
+        self.assertEqual(
+            settings.recording_encoder_settings["dnxhr"]["profile"], "lb"
+        )
+
+    def test_encoder_settings_rejects_quality_out_of_range(self) -> None:
+        for bad in (0, 101):
+            with self.subTest(quality=bad):
                 with TemporaryDirectory() as temp_dir:
                     config_path = Path(temp_dir) / "app_settings.toml"
                     config_path.write_text(
                         f"""
-[recording]
-codec = "{codec}"
-container = "{container}"
+[recording.encoder_settings.mjpeg]
+quality = {bad}
 """.strip(),
                         encoding="utf-8",
                     )
-                    settings = AppSettings.load(config_path)
-                self.assertEqual(settings.recording_codec, codec)
-                self.assertEqual(settings.recording_container, container)
+                    with self.assertRaises(RuntimeError):
+                        AppSettings.load(config_path)
 
-    def test_recording_rejects_mjpeg_mov_pair(self) -> None:
-        # Phase 11.B: mjpeg+mov isn't in the matrix (qtmux + jpegenc
-        # isn't a standard pairing). The error names the accepted set.
+    def test_encoder_settings_rejects_unknown_codec_key(self) -> None:
+        # Phase 11.B follow-up: the live recording matrix is
+        # MJPEG-only, so even prores/dnxhr keys under
+        # `encoder_settings` are rejected at config-load.
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording.encoder_settings.dnxhr]
+profile = "lb"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("dnxhr", str(ctx.exception))
+
+    def test_encoder_settings_rejects_unknown_codec(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording.encoder_settings.h264]
+quality = 80
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                AppSettings.load(config_path)
+
+    def test_recording_accepts_mjpeg_mkv(self) -> None:
+        # Phase 11.B follow-up: live recording matrix is MJPEG+MKV only.
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "app_settings.toml"
             config_path.write_text(
                 """
 [recording]
 codec = "mjpeg"
+container = "mkv"
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.recording_codec, "mjpeg")
+        self.assertEqual(settings.recording_container, "mkv")
+
+    def test_recording_rejects_prores_with_export_hint(self) -> None:
+        # ProRes is rejected at config-load with a hint pointing at
+        # the post-session processor for archive deliverables.
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
+codec = "prores"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("prores", str(ctx.exception))
+        self.assertIn("post-session processor", str(ctx.exception))
+
+    def test_recording_rejects_dnxhr_with_export_hint(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
+codec = "dnxhr"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("dnxhr", str(ctx.exception))
+        self.assertIn("post-session processor", str(ctx.exception))
+
+    def test_recording_rejects_mov_container(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[recording]
 container = "mov"
 """.strip(),
                 encoding="utf-8",
             )
             with self.assertRaises(RuntimeError) as ctx:
                 AppSettings.load(config_path)
-        self.assertIn("mjpeg", str(ctx.exception))
         self.assertIn("mov", str(ctx.exception))
 
     def test_recording_rejects_unknown_codec(self) -> None:
@@ -205,7 +360,6 @@ codec = "h264"
             config_path.write_text(
                 """
 [recording]
-codec = "prores"
 container = "mp4"
 """.strip(),
                 encoding="utf-8",

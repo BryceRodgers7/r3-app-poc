@@ -53,6 +53,20 @@ class _StubGst:
     class PadLinkReturn:
         OK = _PAD_LINK_OK
 
+    class State:
+        # Phase 11.B follow-up: rebuild path now sets new_sink to
+        # READY before pad requests so qtmux is instantiated and in
+        # the pipeline hierarchy.
+        NULL = "NULL"
+        READY = "READY"
+        PLAYING = "PLAYING"
+
+    class StateChangeReturn:
+        SUCCESS = "SUCCESS"
+        ASYNC = "ASYNC"
+
+    SECOND = 1_000_000_000
+
 
 class _StubEncoder:
     """A `Gst.Element`-shaped stand-in with a single static `src` pad."""
@@ -88,7 +102,17 @@ class _StubSplitmuxsink:
         return True
 
     def set_state(self, _state: object) -> object:
-        return _state
+        # Return SUCCESS so the caller doesn't try to wait for ASYNC.
+        return _StubGst.StateChangeReturn.SUCCESS
+
+    def get_state(self, _timeout: object) -> object:
+        return _StubGst.StateChangeReturn.SUCCESS
+
+    def set_locked_state(self, _locked: bool) -> bool:
+        # Phase 11.B follow-up: rebuild path locks new_sink at NULL
+        # while wiring audio so qtmux stays uninstantiated until both
+        # video and audio pads are requested.
+        return True
 
 
 def _build_pm_with_audio() -> tuple[PipelineManager, _StubEncoder]:

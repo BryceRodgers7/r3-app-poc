@@ -28,6 +28,7 @@ def _build_pm(
     audio_record_encoder=None,
     audio_present_observed: bool = False,
     splitmuxsink=object(),
+    audio_record_permanently_disabled: bool = False,
 ) -> PipelineManager:
     pm = PipelineManager.__new__(PipelineManager)
     pm._recording_audio_enabled = recording_audio_enabled
@@ -35,6 +36,9 @@ def _build_pm(
     pm._audio_record_encoder = audio_record_encoder
     pm._audio_present_observed = audio_present_observed
     pm._splitmuxsink = splitmuxsink
+    # Phase 11.B follow-up: latch that prevents the gate from
+    # retrying audio chain build after a prior failure.
+    pm._audio_record_permanently_disabled = audio_record_permanently_disabled
     return pm
 
 
@@ -128,6 +132,23 @@ class EnsureAudioRecordBranchBuiltTests(unittest.TestCase):
         ):
             # Must NOT raise.
             pm._ensure_audio_record_branch_built_locked()
+
+    def test_no_op_when_permanently_disabled_after_failure(self) -> None:
+        # Phase 11.B follow-up: once the audio chain build has failed
+        # once (e.g. qtmux refusing late audio_%u), the latch keeps
+        # subsequent rebuilds from retrying. This avoids the failure
+        # mode where game 2's fresh qtmux DOES accept the audio pad
+        # but the resulting audio+video interleaving overwhelms the
+        # ProRes encoder pipeline within seconds.
+        pm = _build_pm(
+            audio_present_observed=True,
+            audio_record_permanently_disabled=True,
+        )
+        with mock.patch.object(
+            pm, "_add_audio_record_branch_to_splitmuxsink"
+        ) as add:
+            pm._ensure_audio_record_branch_built_locked()
+        add.assert_not_called()
 
 
 class AudioPresenceProbeTests(unittest.TestCase):

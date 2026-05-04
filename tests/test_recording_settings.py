@@ -201,6 +201,7 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.set_state_calls: list = []
                 self.emit_calls: list = []
+                self.sync_state_calls: int = 0
                 _StubSplitmuxsink.instance_counter += 1
                 self.instance_id = _StubSplitmuxsink.instance_counter
 
@@ -218,6 +219,19 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
                 # streaming thread) stays out of scope here.
                 self.emit_calls.append(signal_name)
 
+            def sync_state_with_parent(self) -> bool:
+                # Phase 11.B follow-up: enable_file_recording now
+                # syncs the splitmuxsink to PLAYING after audio is
+                # wired (qtmux late-pad fix).
+                self.sync_state_calls += 1
+                return True
+
+            def set_locked_state(self, _locked: bool) -> bool:
+                # Phase 11.B follow-up: enable_file_recording unlocks
+                # state before syncing; rebuild locks new_sink at NULL
+                # during construction.
+                return True
+
         # Reset class-level counter so test ordering doesn't matter.
         _StubSplitmuxsink.instance_counter = 0
         with TemporaryDirectory() as tmp:
@@ -227,9 +241,10 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
             pm._splitmuxsink = initial_sink
             pm._Gst = _StubGst
             pm._set_branch_enabled = lambda *_args, **_kwargs: None
+            pm._ensure_audio_record_branch_built_locked = lambda: None
             # Stub out the rebuild helper so it just swaps the
             # _splitmuxsink reference without touching real GStreamer
-            # plumbing (jpegenc, pipeline, link/unlink).
+            # plumbing (encoder, pipeline, link/unlink).
             def fake_rebuild() -> None:
                 pm._splitmuxsink = _StubSplitmuxsink()
             pm._rebuild_splitmuxsink_locked = fake_rebuild

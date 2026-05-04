@@ -29,21 +29,41 @@ SOFTWARE_MJPEG_ELEMENT = "jpegenc"
 SOFTWARE_PRORES_PRIORITY = ("avenc_prores_ks", "avenc_prores")
 SOFTWARE_DNXHR_ELEMENT = "avenc_dnxhd"
 
-# Per-element factory-arg defaults. Applied via `set_property` at
-# pipeline-build time. Sensible Phase 11.B defaults; Phase 11.C
-# introduces a `[recording] encoder_settings` TOML table that
-# overrides these per-codec.
-_DEFAULT_FACTORY_ARGS: dict[str, dict[str, Any]] = {
-    # ProRes 422 LT — `avenc_prores_ks` profile=2 maps to LT, the
-    # second-fastest profile and the closest analogue to MJPEG's
-    # bitrate/quality balance. 11.C will let operators tune this.
-    "avenc_prores_ks": {"profile": 2},
-    # `avenc_prores` has no profile property; defaults to ProRes 422.
-    "avenc_prores": {},
-    # DNxHR LB target at 1080p30 (~36 Mbit/s). `avenc_dnxhd` requires
-    # an explicit bitrate — without one it falls back to a legacy DNxHD
-    # profile that may not match the input resolution.
-    "avenc_dnxhd": {"bitrate": 36000000},
+# Phase 11.C — per-codec defaults applied when no
+# `[recording.encoder_settings]` block is configured. The profile
+# names map to GStreamer-libav integer enum values via
+# `_PRORES_PROFILE_INT` / `_DNXHR_PROFILE_INT` below. These are the
+# *named* defaults; the int translation happens in
+# `_factory_args_for_element` at pipeline-build time.
+_BUILTIN_ENCODER_SETTINGS: dict[str, dict[str, Any]] = {
+    "mjpeg": {"quality": 85},
+    "prores": {"profile": "lt"},
+    "dnxhr": {"profile": "lb"},
+}
+
+# `avenc_prores_ks profile` enum from `gst-inspect-1.0`:
+#   (0=proxy, 1=lt, 2=standard, 3=hq, 4=4444, 5=4444xq).
+# Phase 11.B accidentally set 2 (standard) when the architecture-doc
+# §5.2 disk-budget coefficient (0.25, ProRes 422 LT) was sized
+# against profile 1 — 11.C corrects this via the profile-name TOML
+# surface.
+_PRORES_PROFILE_INT: dict[str, int] = {
+    "proxy": 0,
+    "lt": 1,
+    "standard": 2,
+    "hq": 3,
+}
+
+# `avenc_dnxhd profile` enum:
+#   (0=dnxhd legacy, 1=dnxhr_lb, 2=dnxhr_sq, 3=dnxhr_hq, 4=dnxhr_hqx, 5=dnxhr_444).
+# Phase 11.B used a `bitrate` workaround because the encoder's
+# 200000-bps default is nonsensical. The profile enum is the right
+# surface — picking it lets the encoder compute bitrate from
+# profile + input caps, no manual tuning needed.
+_DNXHR_PROFILE_INT: dict[str, int] = {
+    "lb": 1,
+    "sq": 2,
+    "hq": 3,
 }
 
 # Operator-friendly install hint surfaced when ProRes / DNxHR encoders
@@ -120,12 +140,67 @@ def _hwaccel_label(hwaccel: str) -> str:
     }.get(hwaccel, hwaccel)
 
 
+def _resolve_encoder_settings(
+    encoder_settings: dict[str, dict[str, Any]] | None,
+    codec: str,
+) -> dict[str, Any]:
+    """Phase 11.C: merge operator overrides over per-codec defaults.
+
+    `encoder_settings` is the full per-codec dict (keys are codec
+    names). When None, the built-in defaults apply unmodified. When
+    set, the relevant codec's sub-dict overrides the defaults
+    field-by-field — missing fields keep their default.
+    """
+    base = dict(_BUILTIN_ENCODER_SETTINGS.get(codec, {}))
+    if encoder_settings is not None:
+        override = encoder_settings.get(codec, {})
+        base.update(override)
+    return base
+
+
+def _factory_args_for_element(
+    element_name: str,
+    codec: str,
+    codec_settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Phase 11.C: translate operator-facing codec settings into the
+    GStreamer-element property names + values to apply at construction.
+
+    Profile names (`"lt"`, `"lb"`, etc.) are mapped to the integer
+    enum values that `avenc_prores_ks` and `avenc_dnxhd` expose. Other
+    elements that don't accept the property silently skip — the
+    pipeline-build site already tolerates an empty factory_args dict.
+    """
+    if element_name == "jpegenc":
+        return {"quality": int(codec_settings["quality"])}
+    if element_name == "qsvjpegenc":
+        # Intel QuickSync's MJPEG encoder also exposes a `quality`
+        # property; pass it through verbatim. If a future hwaccel
+        # build doesn't accept it, the element-construction path will
+        # raise and the build-time link fallback (Phase 11.A) catches it.
+        return {"quality": int(codec_settings["quality"])}
+    if element_name == "avenc_prores_ks":
+        return {
+            "profile": _PRORES_PROFILE_INT[codec_settings["profile"]],
+        }
+    if element_name == "avenc_prores":
+        # `avenc_prores` has no profile property exposed via gst-libav
+        # mapping; defaults to ProRes 422 standard. No factory_args.
+        return {}
+    if element_name == "avenc_dnxhd":
+        return {
+            "profile": _DNXHR_PROFILE_INT[codec_settings["profile"]],
+        }
+    return {}
+
+
 def select_encoder(
     *,
     hwaccel: str,
     codec: str,
     gst_module: Any,
     force_software: bool = False,
+    encoder_settings: dict[str, dict[str, Any]] | None = None,
 ) -> EncoderSelection:
     """Pick a recording-branch encoder element for `(hwaccel, codec)`.
 
@@ -135,6 +210,9 @@ def select_encoder(
     the bus-error retry path when an hwaccel encoder fails caps
     negotiation. For ProRes/DNxHR the flag is honored but has no
     effect (the only candidates are already software).
+
+    `encoder_settings` is the per-codec override dict (Phase 11.C). When
+    None, the built-in defaults apply.
     """
     requested = (hwaccel or "auto").strip().lower()
     if requested not in VALID_HWACCEL_VALUES:
@@ -146,6 +224,9 @@ def select_encoder(
     codec_normalized = (codec or "").strip().lower()
     priority = _priority_for_codec(codec_normalized, requested)
     factory_finder = gst_module.ElementFactory.find
+    codec_settings = _resolve_encoder_settings(
+        encoder_settings, codec_normalized
+    )
 
     # Dedicated MJPEG software-pin path. The reason string differs from
     # the general fallback case so the operator can see at a glance
@@ -167,8 +248,8 @@ def select_encoder(
             is_software_fallback=True,
             requested_hwaccel=requested,
             reason=reason,
-            factory_args=dict(
-                _DEFAULT_FACTORY_ARGS.get(SOFTWARE_MJPEG_ELEMENT, {})
+            factory_args=_factory_args_for_element(
+                SOFTWARE_MJPEG_ELEMENT, codec_normalized, codec_settings
             ),
         )
 
@@ -196,7 +277,9 @@ def select_encoder(
             is_software_fallback=is_fallback,
             requested_hwaccel=requested,
             reason=reason,
-            factory_args=dict(_DEFAULT_FACTORY_ARGS.get(candidate, {})),
+            factory_args=_factory_args_for_element(
+                candidate, codec_normalized, codec_settings
+            ),
         )
 
     # Nothing in the priority list is registered. Tailor the install
@@ -210,6 +293,29 @@ def select_encoder(
     raise RuntimeError(
         f"no {codec_normalized.upper()} encoder available; tried "
         f"{list(priority)}. {_LIBAV_INSTALL_HINT}"
+    )
+
+
+def validate_segment_duration(codec: str, duration_seconds: float) -> None:
+    """Phase 11.C: refuse a segment duration shorter than the codec's GOP.
+
+    Today's codecs (`mjpeg` / `prores` / `dnxhr`) are all intra-frame —
+    GOP=1 frame, so any positive duration is valid. The validator
+    exists as a seam: when 11.D-or-later adds a long-GOP codec
+    (H.264-export pipeline, say), the shorter-than-GOP check slots in
+    here without changing every caller.
+    """
+    codec_normalized = (codec or "").strip().lower()
+    if duration_seconds <= 0.0:
+        raise RuntimeError(
+            f"recording_segment_duration_seconds={duration_seconds} "
+            f"must be > 0."
+        )
+    if codec_normalized in {"mjpeg", "prores", "dnxhr"}:
+        return  # intra-frame; no GOP constraint.
+    raise NotImplementedError(
+        f"validate_segment_duration: codec={codec!r} has no registered "
+        f"GOP rule. Add a case here when wiring a new codec."
     )
 
 
