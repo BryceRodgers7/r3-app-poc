@@ -1353,10 +1353,76 @@ class PipelineManager:
             queue.link(valve)
             and valve.link(convert)
             and convert.link(encode_caps)
-            and encode_caps.link(encoder)
-            and encoder.link(splitmuxsink)
         ):
-            raise RuntimeError(f"Failed to link the {branch_name} branch.")
+            raise RuntimeError(
+                f"Failed to link queue/valve/convert/encode_caps for "
+                f"branch={branch_name}"
+            )
+
+        # Phase 11.A: hwaccel encoders sometimes refuse the
+        # `video/x-raw,format=I420,colorimetry=bt601` caps that
+        # encode_caps pins (driver-specific; observed with
+        # `qsvjpegenc` on some Intel driver versions). When the link
+        # fails AND the chosen encoder is hwaccel, swap in the
+        # software fallback in-place so the pipeline can still build,
+        # set the sticky software flag for the rest of the process,
+        # and emit a `hwaccel_negotiation_failed` WARNING.
+        feed_id_for_log = self._source.get_feed_id()
+        if not encode_caps.link(encoder):
+            if encoder_selection.is_software_fallback:
+                raise RuntimeError(
+                    f"software encoder {encoder_selection.element_name} "
+                    f"failed to link from encode_caps for branch={branch_name}"
+                )
+            failed_element_name = encoder_selection.element_name
+            LOGGER.warning(
+                "encoder %s failed to link from encode_caps for feed=%s — "
+                "swapping in software fallback",
+                failed_element_name,
+                feed_id_for_log,
+            )
+            record_health_event(
+                severity=HealthSeverity.WARNING,
+                category="hwaccel_negotiation_failed",
+                message=(
+                    f"feed={feed_id_for_log}: {failed_element_name} could not "
+                    f"link to upstream caps "
+                    f"(video/x-raw,format=I420,colorimetry=bt601) — "
+                    f"falling back to software encoder."
+                ),
+                feed_id=feed_id_for_log,
+                metadata={
+                    "failed_element": failed_element_name,
+                    "requested_hwaccel": encoder_selection.requested_hwaccel,
+                    "stage": "build_time_link",
+                },
+            )
+            self._pipeline.remove(encoder)
+            self._force_software_encoder = True
+            encoder_selection = select_encoder(
+                hwaccel=self._media_hardware_acceleration,
+                codec=self._recording_codec,
+                gst_module=Gst,
+                force_software=True,
+            )
+            encoder = self._make_element(
+                encoder_selection.element_name,
+                f"{branch_name}_{encoder_selection.element_name}",
+            )
+            for prop_name, prop_value in encoder_selection.factory_args.items():
+                encoder.set_property(prop_name, prop_value)
+            self._pipeline.add(encoder)
+            if not encode_caps.link(encoder):
+                raise RuntimeError(
+                    f"software encoder {encoder_selection.element_name} also "
+                    f"failed to link from encode_caps for branch={branch_name}"
+                )
+
+        if not encoder.link(splitmuxsink):
+            raise RuntimeError(
+                f"Failed to link encoder {encoder_selection.element_name} → "
+                f"splitmuxsink for branch={branch_name}"
+            )
 
         tee_src_pad = self._request_tee_pad()
         queue_sink_pad = queue.get_static_pad("sink")
@@ -1402,7 +1468,6 @@ class PipelineManager:
         # (operator asked for hwaccel and got software). When the operator
         # explicitly set `hardware_acceleration = "none"`, software is
         # the requested behavior and no event fires.
-        feed_id_for_log = self._source.get_feed_id()
         LOGGER.info(
             "recording encoder feed=%s codec=%s element=%s reason=%s",
             feed_id_for_log,
