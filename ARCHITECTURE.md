@@ -29,7 +29,7 @@ The current codebase is a good vertical slice, not a finished foundation. Severa
 **Still open before the app matches the full “target” story in this document:**
 
 - A first-class **`PlaybackSession`** model (timeline position, rate, per-output state) as a named type — today much of this lives inside `PlaybackController`.
-- ProRes / DNxHR codec support and the `[recording] container = "mov"` path. MJPEG-in-MKV ships today; queued for Phase 11 alongside hardware-accelerated encoder selection.
+- Hardware-accelerated MJPEG encoding (Intel QuickSync via `qsvjpegenc`) — landed in Phase 11.A. The encoder factory probes `[media] hardware_acceleration` and picks the best available encoder; `qsvjpegenc` is selected automatically on Intel-iGPU rigs. ProRes / DNxHR / MOV were trialed for the live path in Phase 11.B but couldn't be made to mux audio reliably (qtmux's late-pad-allocation behavior); they remain available as *export* formats via the post-session processor. See `docs/r3_app_architecture.md` §11.B for the writeup.
 - Phase 10 production hardening: source-loss policy across reconnects, drift correction across many feeds, disk-full / encoder-failure recovery beyond the existing health-event surface.
 - The synthetic dev source remains on the Python-push path by design (it is the camera-less dev fallback). Production NDI ingest is fully native (Phase 3.A.2 + 3.A.3 retry); USB / OpenCV ingest was removed in Phase 2.5.
 
@@ -242,7 +242,7 @@ Conclusion:
 7. ~~Extend replay to multi-feed timeline semantics~~ — Phase 5 `SessionClock` + Phase 5.B / 5.C cross-feed render loop with §8.6.1 clamping. A few transport methods still lean on the primary feed; full removal is a small follow-up.
 8. ~~Convert NDI ingest to a native GStreamer source bin~~ — Phase 3.A.2 + 3.A.3 retry
 9. ~~Re-introduce embedded audio in segments~~ — slice 4.F + Phase 7.G + Phase 9.C dynamic wiring
-10. Add ProRes / DNxHR codec support and the `mov` container path — queued for Phase 11
+10. ~~Add ProRes / DNxHR codec support and the `mov` container path~~ — Phase 11.B finding: live recording stays MJPEG-in-MKV (qtmux late-pad incompatibility with our software-encoded NDI pipeline). ProRes/DNxHR remain available as post-session export formats. ~~Hardware-accelerated MJPEG encoding (Intel QuickSync)~~ — Phase 11.A landed.
 11. Phase 10 production hardening (source-loss policy, drift correction, disk-full recovery)
 
 ## Architectural Verdict

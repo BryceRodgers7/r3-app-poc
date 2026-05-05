@@ -2855,31 +2855,56 @@ Phase 11 closes these by way of four slices:
 
 ### Slices
 
-**11.A — Encoder factory + hwaccel detection**
+**11.A — Encoder factory + hwaccel detection — ✅ committed.**
 
-The hardcoded `jpegenc` element in `_build_pipeline` becomes one branch of an explicit factory. The factory probes element availability at GStreamer init, picks an encoder based on `[media] hardware_acceleration`, and falls back to software when the hwaccel element is missing or fails to negotiate caps.
+The hardcoded `jpegenc` element in `_build_pipeline` became one branch of an explicit factory. The factory probes element availability at GStreamer init, picks an encoder based on `[media] hardware_acceleration`, and falls back to software when the hwaccel element is missing or fails to negotiate caps.
 
-- **`[media] hardware_acceleration`** — new TOML key matching §7.4: `"auto" | "none" | "nvidia" | "intel" | "amd"`. Default `"auto"`. Persisted on `AppSettings`.
-- **`app/media/encoder_factory.py`** — new module with `select_encoder(settings, codec, gst)` returning a `(element_name, factory_args)` pair. Probes `Gst.ElementFactory.find()` for `nvh264enc` / `qsvh264enc` (gated by codec) / `vaapi*enc` etc., plus the platform-specific NVENC/QuickSync MJPEG and ProRes encoders. Returns the software fallback (`jpegenc` for MJPEG, `proresenc` for ProRes, etc.) when hwaccel is disabled or unavailable.
-- **Startup logging** — one INFO line per feed at pipeline-build time: `feed=cam_a encoder=jpegenc (software, hwaccel=auto: nvh264enc not found)`. Operator can see at a glance which path each feed is on. Also surfaced as a `pipeline_mode`-style field on `FeedMetricsSnapshot` so the diagnostics widget shows it next to the existing `native / py-push` indicator.
-- **Software fallback events** — when `hardware_acceleration != "none"` and the requested element is unavailable, emit a `hwaccel_fallback` health event (INFO severity, NOT operator-visible — diagnostic only). The diagnostics widget surfaces a count.
-- **Negotiation failure handling** — when the hwaccel element is found but caps negotiation fails at PLAYING transition (driver bug, missing runtime), the bus error path tears down and reconstructs the pipeline with the software fallback. Distinct `hwaccel_negotiation_failed` health event (WARNING). The 10.B reconnect supervisor doesn't trigger because the source itself is fine — this is an encoder-side fault.
-- **Tests** — element-availability probe with stub `Gst.ElementFactory`; selection matrix against `(hwaccel, codec, available_elements)`; software fallback when probe returns None; settings round-trip from TOML.
+- **`[media] hardware_acceleration`** — TOML key matching §7.4: `"auto" | "none" | "nvidia" | "intel" | "amd"`. Default `"auto"`. Persisted on `AppSettings`.
+- **`app/media/encoder_factory.py`** — `select_encoder(hwaccel, codec, gst_module, encoder_settings, force_software)` returning an `EncoderSelection` (element name, factory args, fallback flag, reason text). Probes `Gst.ElementFactory.find()` per the priority table for the chosen codec.
+- **Live MJPEG selection table** — `auto`/`intel`: `qsvjpegenc` → `jpegenc`. `nvidia`/`amd`: `jpegenc` (no NVENC/AMF MJPEG element on Windows). `none`: `jpegenc` always. The factory still has wired entries for ProRes/DNxHR for future reuse, but the `[recording] codec` validator narrows the live path to MJPEG (see 11.B note below).
+- **Startup logging** — one INFO line per feed at pipeline-build time: `recording encoder feed=cam_a codec=mjpeg element=qsvjpegenc reason=Intel hwaccel; hardware_acceleration=auto`. Surfaced as `recording_encoder` on `FeedMetricsSnapshot` so the diagnostics widget shows it next to the existing `native / py-push` indicator.
+- **Software fallback events** — when `hardware_acceleration != "none"` and the requested element is unavailable, emit a `hwaccel_fallback` INFO health event with metadata identifying which element was missing.
+- **Build-time negotiation handling** — when the hwaccel element is found but the link from the upstream caps filter to it fails (driver-specific format quirk), the build path swaps in the software fallback in-place and emits a `hwaccel_negotiation_failed` WARNING. `_force_software_encoder` latches sticky-True so subsequent in-process rebuilds also pin to software.
+- **Bus-error fast-path** — when caps negotiation fails at PLAYING transition (different from the build-time link failure), the bus-error handler at `pipeline_manager.py` distinguishes encoder-side faults from source-side faults and triggers an in-process pipeline rebuild via `FeedRuntime.request_encoder_software_fallback()` rather than routing through `FeedState.DISCONNECTED` and the 10.B reconnect supervisor (the source is fine, only the encoder needs replacement).
+- **Tests** — `tests/test_encoder_factory.py` (selection matrix + reason strings + force-software override); settings round-trip in `tests/test_app_settings.py`.
 
-**Out of scope for 11.A:** AMD VCN encoder paths (rare on Windows recording rigs); decoder hwaccel for replay (replay is intra-frame on the recording-side codec, so decode hwaccel is moot for MJPEG/ProRes/DNxHR); per-feed hwaccel override (single setting governs every feed).
+**Out of scope for 11.A:** AMD VCN encoder paths; decoder hwaccel for replay; per-feed hwaccel override.
 
-**11.B — ProRes / DNxHR codec support**
+**11.B — ProRes / DNxHR codec support — partially landed; live-path codec matrix narrowed back to MJPEG-only.**
 
-Closes the §5.2 deferral. MJPEG stays the default until field testing proves a hwaccel path is reliable; ProRes and DNxHR become selectable for deployments with `gst-plugins-bad` available.
+The full slice was implemented (encoder factory rows, codec/container compatibility matrix, qtmux muxer wiring, codec-aware caps for the videoconvert→encoder edge, disk-budget coefficients, profile-name → integer mapping). It was then reverted to MJPEG-only on the live path after extensive field testing surfaced an irreducible muxer-timing problem.
 
-- **Element-availability gate** — `AppSettings.load` rejects `[recording] codec = "prores" | "dnxhr"` at startup if `proresenc` / `avenc_dnxhd` aren't found. Error message names the missing element so the operator knows to install `gst-plugins-bad`.
-- **Splitmuxsink branch** — `_build_pipeline` switches on `recording_codec` to pick `jpegenc` (existing), `proresenc`, or `avenc_dnxhd`. Keep the encoder-factory seam from 11.A as the dispatch point.
-- **Disk-budget coefficients** — extend `_CODEC_RATIO_VS_RAW_RGB` in `app/core/disk_budget.py` with calibrated entries. ProRes 422 LT ≈ 0.20–0.25 vs raw RGB at 1080p; DNxHR LB ≈ 0.18; HQ ≈ 0.45. Phase 7.A's pre-flight reads the right coefficient automatically.
-- **Container expansion** — `[recording] container` accepts `mov` for the ProRes / DNxHR pairing. Codec/container compatibility validated at load time: `mjpeg → mkv`, `prores → mov | mkv`, `dnxhr → mov | mkv`. `qtmux` replaces `matroskamux` when the container is `.mov`. Segment naming (`segment_NNNNN.{ext}`) and the on-disk-recovery regex pick up the new extension.
-- **Settings table & defaults updated** — §13.1 codec/container documentation reflects the new accepted values; §19's "long-term target" row remains ProRes/DNxHR/MOV.
-- **Tests** — codec/container compatibility matrix; element-availability gate refuses bad combos; disk-budget coefficient lookups for the new codecs; segment finalization writes `.mov` files with the right ext.
+**The qtmux finding (the practical reason ProRes/DNxHR-on-MOV doesn't work in this pipeline):**
 
-**Out of scope for 11.B:** ProRes 4444 / 4444 XQ (bandwidth out of line with the in-session replay use case); DNxHD (legacy form, superseded by DNxHR); FFV1 / UTVideo — flagged in §5.2 as "optional/testing only" and not part of the operator-facing matrix.
+`qtmux` (the GStreamer MOV muxer that splitmuxsink wraps for `.mov` segments) refuses `audio_%u` request pads after `STREAM_START` flows through its video pad. In our pipeline, the operator clicks Start *after* the source has been delivering buffers (and thus events) for several seconds — by then qtmux has already received STREAM_START on its video pad and locked its pad set. Phase 9.C's "wire audio when first buffer arrives" pattern works fine for `matroskamux` (permissive about late pads) but produces `Not providing request pad after stream start` warnings + audio-chain build failures with qtmux. Game 1 records video-only; on game 2's rebuild a fresh qtmux instance accepts the audio pad, but the audio + video interleaving has been observed to wedge the pipeline within seconds in some configurations.
+
+**Things that were tried and didn't work:**
+
+- **Hold splitmuxsink in READY state via `set_state(Gst.State.READY)`** — parent state machine auto-syncs children to PLAYING regardless; the READY state didn't stick.
+- **Use `gst_element_set_locked_state(true)` to keep splitmuxsink in NULL** — broke sticky-event propagation; downstream couldn't respond to upstream caps queries; recording branch backpressured immediately.
+- **Don't add splitmuxsink to the pipeline at all until enable_file_recording** — left the encoder's `src` pad dangling, which similarly broke caps negotiation; queue stalled.
+- **`gst_pad_add_probe` with `GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM` on encoder.src** — same root cause: the probe blocks events that the pipeline's state propagation needs.
+
+The pattern: anything that keeps STREAM_START from reaching qtmux during pipeline preroll also breaks the rest of the pipeline. There is no clean way to selectively block STREAM_START.
+
+**How real instant-replay systems handle this** (and the architectural lesson):
+
+Pro broadcast systems (EVS, Tedial, Evertz) decouple audio and video at record time — video to a file/DPX-sequence, audio to a separate WAV/PCM stream — and combine them only at edit/export time. They also use hardware capture cards with on-board ProRes/DNxHR ASICs and dedicated record-only pipelines. **The MOV/qtmux ecosystem was designed around that hardware model, not around general-purpose software-encoded pipelines fed by NDI.**
+
+For our use case (operator-driven instant replay during a game + full-length recording for re-watch), the broadcast-archive properties of ProRes/DNxHR (4:2:2 chroma, 10-bit precision, NLE compatibility) don't carry over: instant-replay scrubbing only requires intra-frame coding (MJPEG qualifies), color quality at 4:2:0 8-bit is fine for sports replay, and "broadcasters expect ProRes" is a *deliverable* property addressed by the post-session processor's transcode step.
+
+**What shipped:**
+
+- The encoder factory's ProRes/DNxHR rows (`avenc_prores_ks` → `avenc_prores`, `avenc_dnxhd`), profile-name → integer mapping (`_PRORES_PROFILE_INT`, `_DNXHR_PROFILE_INT`), and per-codec encode caps (`I422_10LE` for ProRes, `Y42B` for DNxHR) all live in `app/media/encoder_factory.py` and `app/media/pipeline_manager.py`. They're well-tested but unreachable from the live config path; they're retained for reuse by a future post-session-processor internal pipeline or a future hardware-capture rebuild.
+- Disk-budget coefficients for `prores` (0.25) and `dnxhr` (0.30) remain in `_CODEC_RATIO_VS_RAW_RGB` for the same reason.
+- The audio-chain cleanup helper (`_discard_audio_record_chain_elements`) and the permanent-disable latch (`_audio_record_permanently_disabled`) are general-purpose defensive code — they protect against any future audio-build failure and are kept.
+
+**What was reverted:**
+
+- The `[recording] codec` matrix narrows back to `{"mjpeg"}`; `[recording] container` to `{"mkv"}`. `_validate_codec` and `_validate_container` reject `prores` / `dnxhr` / `mov` at config-load with explicit messages pointing at the post-session processor for archive deliverables.
+- §13.1 / §5.2 / §5.3 / §19 reflect MJPEG-as-live, ProRes/DNxHR-as-export.
+
+**Out of scope (now permanently — until the architectural model changes):** ProRes/DNxHR/MOV as live recording targets. The post-session processor is the canonical path to those formats.
 
 **11.C — Pipeline tuning matrix**
 
@@ -2909,10 +2934,11 @@ The §16.3 performance acceptance tests need a runnable home. 11.D adds a benchm
 ### Phase 11 sequencing notes
 
 - **11.A first.** Both 11.B (codec wiring) and 11.C (encoder settings) reach into the encoder construction site; landing the factory seam first means each later slice extends rather than replaces it.
-- **11.B and 11.C are mostly independent** but a deployment running ProRes wants ProRes-profile tunability — recommend 11.B before 11.C so 11.C's `encoder_settings` table covers the codecs the operator actually has access to.
-- **11.D is last.** Its pass/fail rules need to be exercised against the encoder selection landed by 11.A–11.C. Running 11.D early would lock in a baseline against the MJPEG-only path, which the §5.2 ranking flags as the fallback, not the target.
-- **Field-testing dependency.** The §5.2 ranking ("ProRes / DNxHR preferred over MJPEG") was a desk decision; 11.D's profile artifacts are how the ranking gets validated or rewritten. If 11.D's runs show MJPEG-software outperforming ProRes-hwaccel on the chosen rig, the §5.2 ranking flips and §19's "long-term target" row gets updated to match.
-- **No Phase 10 dependency.** Phase 10 is operator-experience hardening; Phase 11 is performance scaling. They can interleave if priority demands it, though doing Phase 10 first means Phase 11's failure modes get the foreground banner treatment automatically.
+- **11.B turned out to be a partial-rollback slice.** The implementation work (encoder factory rows, codec/container matrix, qtmux wiring, profile mapping, disk-budget coefficients) shipped, but extensive field testing showed that `qtmux` refuses late audio request pads in our software-encoded NDI pipeline and there's no clean way to work around it. The live-path codec matrix narrowed back to MJPEG-only. The architectural lesson — that pro broadcast systems decouple audio from video at record time and use hardware capture — informs the §5.2 framing change: ProRes/DNxHR are *export* formats produced by the post-session processor, not live recording targets. See the 11.B writeup above.
+- **11.C was partially shipped.** Queue policy + encoder settings + segment-duration validator landed cleanly. The smoke-benchmark sub-item was deferred to 11.D (where it slots into the same harness infrastructure). The encoder_settings keys for `prores` / `dnxhr` are still parsed and validated even though they don't reach the live pipeline — they remain useful for post-session-processor configuration if that work eventually lands.
+- **11.D is last.** Its pass/fail rules need to be exercised against the encoder selection landed by 11.A. Running 11.D early would have produced a baseline against the broken-ProRes path; with that path off the table, 11.D measures the actual shipped MJPEG/MKV pipeline.
+- **The §5.2 ranking has been updated** based on 11.B's findings — ProRes/DNxHR are *export* targets, not live targets, in this codebase. The §19 defaults table reflects this.
+- **No Phase 10 dependency.** Phase 10 is operator-experience hardening; Phase 11 is performance scaling. They can interleave if priority demands it.
 
 ---
 
@@ -2922,8 +2948,9 @@ Use these defaults unless hardware testing proves otherwise. The "shipped" colum
 
 | Setting | Shipped today | Long-term target |
 |---|---|---|
-| Recording / replay-source codec | MJPEG | ProRes or DNxHR (Phase 11; see §5.2) |
-| Recording / replay-source container | MKV | MOV or MKV |
+| Live recording codec | MJPEG | MJPEG (Phase 11.B finding — ProRes/DNxHR couldn't be made to work on the live path; see §5.2) |
+| Live recording container | MKV | MKV (matroskamux's permissive late-pad handling is needed for the Phase 9.C audio-wiring pattern) |
+| Archive deliverable codec | H.264/AAC MP4 (post-session processor) | ProRes/DNxHR or H.264 (operator-selectable; produced by post-session transcode) |
 | Recording segment duration | 4 seconds | 4 seconds |
 | In-session replay scope | recording start through latest finalized segment while recording is active | same |
 | Instant replay shortcuts | Rewind 10s only | 10 / 30 / 60 / 120 seconds (additional shortcuts queued — see §15.3) |

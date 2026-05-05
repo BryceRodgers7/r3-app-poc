@@ -426,13 +426,21 @@ SOURCE  (native NDI elements OR python_push appsrc)
 videoconvert (only on python_push path)
    ↓
 source_tee  ──┬──→  preview branch (per-mode)
-              └──→  record branch (queue → valve → videoconvert → I420/bt601 capsfilter → jpegenc → splitmuxsink)
+              └──→  record branch (queue → valve → videoconvert → I420/bt601 capsfilter → <encoder> → splitmuxsink)
 
 audio_tee  ──┬──→  live audio (queue → valve → audioconvert → audioresample → wasapisink)
              └──→  audio_record drain appsink (always built — drains the tee even when audio_record into splitmuxsink is not wired)
              ↓ (Phase 9.C dynamic, conditional)
              audio_record branch (queue → valve → audioconvert → audioresample → opusenc → splitmuxsink.audio_%u)
 ```
+
+`<encoder>` is selected by `app/media/encoder_factory.py` based on
+`[media] hardware_acceleration`. For the live recording matrix
+(MJPEG-in-MKV — see architecture §5.2), the candidates are
+`qsvjpegenc` (Intel QuickSync hardware MJPEG, when present) or
+`jpegenc` (software fallback). The chosen element name is logged at
+pipeline-build time and surfaced on `FeedMetricsSnapshot
+.recording_encoder` for the diagnostics widget.
 
 Preview branch shape depends on `source.pipeline_mode`:
 
@@ -572,7 +580,8 @@ across state changes, so post-Start buffers append to the previous
 game's last file. `_rebuild_splitmuxsink_locked` builds a fresh
 element from scratch, in this exact order:
 
-1. Unlink `jpegenc → old splitmuxsink`.
+1. Unlink `<encoder> → old splitmuxsink` (the encoder element name
+   varies — `jpegenc` or `qsvjpegenc` per the encoder factory).
 2. **Explicitly unlink the audio encoder's src pad from the old
    splitmuxsink's audio request pad, then call
    `old.release_request_pad(peer)`.** Mirrors the video unlink in
@@ -583,7 +592,7 @@ element from scratch, in this exact order:
    for orphaned-element peers), the defensive unlink in
    `_link_audio_encoder_to_splitmuxsink_locked` is skipped, and the
    new audio link returns `PadLinkReturn.WAS_LINKED`. That aborts
-   the rebuild before step 7 (jpegenc → new sink) runs and the next
+   the rebuild before step 8 (encoder → new sink) runs and the next
    game records zero segments. No-op for video-only feeds (encoder
    is `None`).
 3. `old.set_state(NULL)`; remove from pipeline.
@@ -596,7 +605,7 @@ element from scratch, in this exact order:
 7. Call `_link_audio_encoder_to_splitmuxsink_locked` (Phase 7.G —
    re-link the existing audio encoder's src pad to the new
    splitmuxsink's `audio_%u` pad).
-8. `jpegenc.link(new_sink)`.
+8. `<encoder>.link(new_sink)`.
 9. `new_sink.sync_state_with_parent()`.
 
 **Order matters.** Reversing steps 6 / 7 with step 8 silently
