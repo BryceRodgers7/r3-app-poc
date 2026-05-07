@@ -368,6 +368,15 @@ class PipelineManager:
         self._audio_present_observed: bool = False
         self._audio_record_first_buffer_at_ns: int | None = None
         self._audio_missing_warned: bool = False
+        # Stale-PTS drop floor for `_on_audio_record_buffer_probe`.
+        # Armed by `_arm_audio_stale_pts_drop_locked` at every Start press;
+        # the probe drops audio buffers whose PTS is older than this
+        # floor (i.e., stranded opus packets carrying a prior game's
+        # PTS — the leak documented in `r3_app_architecture.md` §6.2.2
+        # / `GSTREAMER_INVARIANTS.md` §10). Cleared by the probe itself
+        # once a fresh-PTS buffer flows so steady-state recording isn't
+        # taxed by per-buffer comparisons.
+        self._audio_stale_pts_drop_floor_ns: int | None = None
 
     def describe_architecture(self) -> str:
         """Describe the current tee/fan-out architecture."""
@@ -469,6 +478,12 @@ class PipelineManager:
             # video-only with .mov. Fix A's chain-cleanup helper keeps
             # game 2+ from cascading on the failure.)
             self._ensure_audio_record_branch_built_locked()
+        # Arm the stale-PTS drop on the audio probe BEFORE opening the
+        # valve, so any opus packet stranded on encoder.src across the
+        # Stop/Start boundary is dropped before it can reach the new
+        # splitmuxsink. See `r3_app_architecture.md` §6.2.2 (per-game
+        # recording contract) and `GSTREAMER_INVARIANTS.md` §11.
+        self._arm_audio_stale_pts_drop_locked()
         self._set_branch_enabled("record", True)
         self._recording_running = True
         self._recording_was_disabled = False
@@ -2073,15 +2088,55 @@ class PipelineManager:
         return Gst.PadProbeReturn.OK
 
     def _on_audio_record_buffer_probe(
-        self, _pad: Any, _info: Any, _user: Any
+        self, _pad: Any, info: Any, _user: Any
     ) -> Any:
         """Phase 7.E: capture the moment the first audio record-branch
         buffer flowed past opusenc. Used by `_maybe_warn_audio_missing`
         to differentiate "audio chain wired and producing" from "audio
-        chain wired but source has no audio"."""
+        chain wired but source has no audio".
+
+        Also enforces the per-game data-quality contract by dropping
+        audio buffers whose PTS predates the current game's start
+        (`_audio_stale_pts_drop_floor_ns`). The disable-time flush in
+        `_flush_audio_mux_branch_locked` is supposed to clear opusenc's
+        pending state across Stop/Start, but observation on
+        session_177 / session_178 shows ONE stranded opus packet
+        reliably survives — its PTS is from somewhere in the prior
+        game's encoding window, and on game N+1 it becomes seg 0's
+        first audio sample, dragging the file's start_time tens of
+        seconds before the first video frame. The floor is armed at
+        every `enable_file_recording` and cleared by the probe itself
+        once a fresh-PTS buffer passes, so steady-state recording is
+        unaffected. See `r3_app_architecture.md` §6.2.2 and
+        `GSTREAMER_INVARIANTS.md` §11.
+        """
         Gst = self._Gst
         if Gst is None:
             return 0
+        floor = self._audio_stale_pts_drop_floor_ns
+        if floor is not None:
+            buffer = None
+            try:
+                buffer = info.get_buffer()
+            except Exception:
+                pass
+            pts = buffer.pts if buffer is not None else None
+            if (
+                pts is not None
+                and pts != Gst.CLOCK_TIME_NONE
+                and pts < floor
+            ):
+                LOGGER.info(
+                    "dropping stranded audio buffer pts=%dns floor=%dns "
+                    "feed_id=%s — opus packet from prior game's encoding "
+                    "window survived disable-time flush",
+                    pts, floor, self._recording_feed_id,
+                )
+                return Gst.PadProbeReturn.DROP
+            # Fresh-PTS buffer (or unknown PTS — pass through rather than
+            # gamble on dropping a buffer we can't classify). Disarm so
+            # steady-state recording skips this branch entirely.
+            self._audio_stale_pts_drop_floor_ns = None
         if self._audio_record_first_buffer_at_ns is None:
             self._audio_record_first_buffer_at_ns = time.monotonic_ns()
         return Gst.PadProbeReturn.OK
@@ -2486,6 +2541,53 @@ class PipelineManager:
                 "Phase 9.C: late-build of audio_record branch failed; "
                 "this game will record video-only"
             )
+
+    def _arm_audio_stale_pts_drop_locked(self) -> None:
+        """Set the stale-PTS drop floor for the audio record probe.
+
+        Called from `enable_file_recording` on every Start press. The
+        floor is the current pipeline running-time minus a 1-second
+        tolerance — any audio buffer whose PTS is older than that is
+        treated as a stranded packet from a prior game and dropped by
+        `_on_audio_record_buffer_probe`. The 1-second tolerance covers
+        normal sub-frame priming offsets and small clock-skew without
+        accidentally dropping legitimate first-game audio (which
+        arrives within a few hundred ms of the running clock).
+
+        No-op when the audio mux chain isn't built (video-only feed
+        or `[recording] audio_enabled = false`) — there's no probe
+        installed to read the floor.
+        """
+        if (
+            self._audio_record_encoder is None
+            or self._pipeline is None
+            or self._Gst is None
+        ):
+            return
+        Gst = self._Gst
+        clock = self._pipeline.get_clock()
+        if clock is None:
+            return
+        try:
+            now = clock.get_time()
+            base_time = self._pipeline.get_base_time()
+        except Exception:
+            return
+        if now == Gst.CLOCK_TIME_NONE or base_time == Gst.CLOCK_TIME_NONE:
+            return
+        running_time_ns = int(now) - int(base_time)
+        if running_time_ns <= 0:
+            # Game 1 on a fresh pipeline: no prior state could exist.
+            # Don't bother arming.
+            return
+        tolerance_ns = 1_000_000_000  # 1 s
+        floor = max(0, running_time_ns - tolerance_ns)
+        self._audio_stale_pts_drop_floor_ns = floor
+        LOGGER.info(
+            "armed stale-PTS audio drop, floor=%dns running_time=%dns "
+            "feed_id=%s",
+            floor, running_time_ns, self._recording_feed_id,
+        )
 
     def _flush_audio_mux_branch_locked(self) -> None:
         """Drop any pending buffers and encoder window state in the

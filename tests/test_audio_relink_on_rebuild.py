@@ -388,6 +388,180 @@ class AudioMuxBranchFlushTests(unittest.TestCase):
         self.assertEqual(head_queue.sink_pad.events_sent, [])
 
 
+class _StubBuffer:
+    def __init__(self, pts: int) -> None:
+        self.pts = pts
+
+
+class _StubProbeInfo:
+    def __init__(self, buffer: _StubBuffer | None) -> None:
+        self._buffer = buffer
+
+    def get_buffer(self) -> _StubBuffer | None:
+        return self._buffer
+
+
+class _StubGstWithProbeReturn:
+    CLOCK_TIME_NONE = 18446744073709551615  # GST_CLOCK_TIME_NONE
+
+    class PadProbeReturn:
+        OK = "OK"
+        DROP = "DROP"
+
+
+class _StubClock:
+    def __init__(self, now_ns: int) -> None:
+        self._now = now_ns
+
+    def get_time(self) -> int:
+        return self._now
+
+
+class _StubPipelineWithClock:
+    def __init__(self, now_ns: int, base_time_ns: int) -> None:
+        self._clock = _StubClock(now_ns)
+        self._base_time = base_time_ns
+
+    def get_clock(self) -> _StubClock:
+        return self._clock
+
+    def get_base_time(self) -> int:
+        return self._base_time
+
+
+class AudioStalePtsDropTests(unittest.TestCase):
+    """Bug regression (session_177 / session_178 game-2 leak):
+
+    Even with `_flush_audio_mux_branch_locked` running on Stop, ONE
+    opus packet reliably survives onto `opusenc.src` carrying a stale
+    PTS from a prior game's encoding window. On rebuild, that packet
+    flows first and pins game N+1's seg 0 audio start_time tens of
+    seconds before the first video frame.
+
+    The defense is a two-part contract:
+
+    1. `enable_file_recording` arms a stale-PTS drop floor via
+       `_arm_audio_stale_pts_drop_locked` AFTER the splitmuxsink
+       rebuild and BEFORE the recording valve opens.
+    2. `_on_audio_record_buffer_probe` reads that floor and DROPs
+       buffers with PTS < floor; once a fresh-PTS buffer flows it
+       disarms itself so steady-state recording skips the check.
+
+    See `r3_app_architecture.md` §6.2.2 and
+    `GSTREAMER_INVARIANTS.md` §11.
+    """
+
+    def _make_pm(
+        self,
+        *,
+        floor_ns: int | None,
+    ) -> object:
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGstWithProbeReturn
+        pm._audio_stale_pts_drop_floor_ns = floor_ns
+        pm._audio_record_first_buffer_at_ns = None
+        pm._recording_feed_id = "ndi_1"
+        return pm
+
+    def test_probe_drops_buffer_with_pts_below_floor(self) -> None:
+        # Floor at 95s; stranded packet at 34.5s — must be dropped.
+        pm = self._make_pm(floor_ns=95_000_000_000)
+        info = _StubProbeInfo(_StubBuffer(pts=34_572_000_000))
+        result = pm._on_audio_record_buffer_probe(None, info, None)
+        self.assertEqual(result, _StubGstWithProbeReturn.PadProbeReturn.DROP)
+        # Floor stays armed — there may be more stranded packets.
+        self.assertEqual(pm._audio_stale_pts_drop_floor_ns, 95_000_000_000)
+
+    def test_probe_passes_fresh_pts_and_disarms(self) -> None:
+        # Floor at 95s; fresh packet at 95.142s passes AND clears the
+        # floor so subsequent buffers skip the comparison.
+        pm = self._make_pm(floor_ns=95_000_000_000)
+        info = _StubProbeInfo(_StubBuffer(pts=95_142_000_000))
+        result = pm._on_audio_record_buffer_probe(None, info, None)
+        self.assertEqual(result, _StubGstWithProbeReturn.PadProbeReturn.OK)
+        self.assertIsNone(pm._audio_stale_pts_drop_floor_ns)
+        # First-buffer timestamp captured (the Phase 7.E behavior).
+        self.assertIsNotNone(pm._audio_record_first_buffer_at_ns)
+
+    def test_probe_passes_when_floor_unset(self) -> None:
+        # Steady-state: no floor armed, all buffers flow regardless of PTS.
+        pm = self._make_pm(floor_ns=None)
+        info = _StubProbeInfo(_StubBuffer(pts=10_000_000_000))
+        result = pm._on_audio_record_buffer_probe(None, info, None)
+        self.assertEqual(result, _StubGstWithProbeReturn.PadProbeReturn.OK)
+
+    def test_probe_passes_when_pts_unknown_and_disarms(self) -> None:
+        # `pts == GST_CLOCK_TIME_NONE` — pass through (don't gamble on
+        # dropping a buffer we can't classify) and disarm.
+        pm = self._make_pm(floor_ns=95_000_000_000)
+        info = _StubProbeInfo(
+            _StubBuffer(pts=_StubGstWithProbeReturn.CLOCK_TIME_NONE)
+        )
+        result = pm._on_audio_record_buffer_probe(None, info, None)
+        self.assertEqual(result, _StubGstWithProbeReturn.PadProbeReturn.OK)
+        self.assertIsNone(pm._audio_stale_pts_drop_floor_ns)
+
+    def test_arm_sets_floor_to_running_time_minus_tolerance(self) -> None:
+        # Pipeline running-time = clock - base = 95.0s. Floor must be
+        # 94.0s (1s tolerance for normal priming offsets).
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGstWithProbeReturn
+        pm._audio_record_encoder = _StubEncoder()
+        pm._pipeline = _StubPipelineWithClock(
+            now_ns=200_000_000_000,
+            base_time_ns=105_000_000_000,
+        )
+        pm._audio_stale_pts_drop_floor_ns = None
+        pm._recording_feed_id = "ndi_1"
+
+        pm._arm_audio_stale_pts_drop_locked()
+
+        # running_time = 200 - 105 = 95s; floor = 95 - 1 = 94s.
+        self.assertEqual(pm._audio_stale_pts_drop_floor_ns, 94_000_000_000)
+
+    def test_arm_no_op_when_audio_chain_unbuilt(self) -> None:
+        # Video-only feed: no encoder, nothing to arm. The probe
+        # itself doesn't exist, so setting a floor would be misleading.
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGstWithProbeReturn
+        pm._audio_record_encoder = None
+        pm._pipeline = _StubPipelineWithClock(
+            now_ns=200_000_000_000,
+            base_time_ns=105_000_000_000,
+        )
+        pm._audio_stale_pts_drop_floor_ns = None
+        pm._recording_feed_id = "ndi_1"
+
+        pm._arm_audio_stale_pts_drop_locked()
+
+        self.assertIsNone(pm._audio_stale_pts_drop_floor_ns)
+
+    def test_arm_no_op_at_pipeline_start_zero_running_time(self) -> None:
+        # Game 1 on a fresh pipeline (running_time = 0): nothing could
+        # possibly be stranded, so don't bother arming.
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = _StubGstWithProbeReturn
+        pm._audio_record_encoder = _StubEncoder()
+        pm._pipeline = _StubPipelineWithClock(
+            now_ns=100_000_000_000,
+            base_time_ns=100_000_000_000,
+        )
+        pm._audio_stale_pts_drop_floor_ns = None
+        pm._recording_feed_id = "ndi_1"
+
+        pm._arm_audio_stale_pts_drop_locked()
+
+        self.assertIsNone(pm._audio_stale_pts_drop_floor_ns)
+
+
 class AudioRecordBranchNameCollisionTests(unittest.TestCase):
     """Bug regression test (session_147):
 

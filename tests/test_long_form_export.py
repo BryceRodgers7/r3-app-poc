@@ -29,6 +29,7 @@ from app.tools.long_form_export import (
     FfmpegNotFoundError,
     LongFormExporter,
     _format_concat_line,
+    _probe_audio_leak_seconds,
     export_all,
 )
 from app.tools.post_session_processor import LongFormPlanItem
@@ -88,6 +89,7 @@ class FfmpegArgsTests(unittest.TestCase):
         # the resolver since we just want to inspect arg construction.
         self.exporter = LongFormExporter.__new__(LongFormExporter)
         self.exporter._ffmpeg_path = Path("/fake/ffmpeg")
+        self.exporter._ffprobe_path = None
 
     def test_args_include_concat_demuxer_and_codecs(self) -> None:
         concat_path = Path("/tmp/concat.txt")
@@ -136,6 +138,40 @@ class FfmpegArgsTests(unittest.TestCase):
         idx = args.index("-avoid_negative_ts")
         self.assertEqual(args[idx + 1], "make_zero")
 
+    def test_default_args_omit_skip_seek(self) -> None:
+        # When no audio leak is detected (game 1 baseline, or ffprobe
+        # missing), no `-ss` should appear — preserves the original
+        # path so game 1's output is byte-equivalent.
+        args = self.exporter._build_ffmpeg_args(
+            Path("/tmp/concat.txt"),
+            Path("/tmp/out.mp4"),
+        )
+        self.assertNotIn("-ss", args)
+
+    def test_skip_seconds_emits_output_side_seek(self) -> None:
+        # Bug regression (game-2-blank-prefix): for games 2+ within a
+        # single app run, splitmuxsink's first segment receives audio
+        # buffers queued during the inter-game downtime ahead of the
+        # first post-resume video frame. `-avoid_negative_ts make_zero`
+        # alone shifts streams by the smallest first PTS (audio's),
+        # leaving video starting at +downtime_seconds (visible as a
+        # blank prefix and a non-zero start time). The fix probes seg 0
+        # for the audio→video gap and emits `-ss <gap>` *after* `-i` to
+        # discard the leak before the encoder.
+        args = self.exporter._build_ffmpeg_args(
+            Path("/tmp/concat.txt"),
+            Path("/tmp/out.mp4"),
+            skip_seconds=32.024,
+        )
+        self.assertIn("-ss", args)
+        ss_idx = args.index("-ss")
+        # Output-side `-ss` must follow `-i <list>` and precede the
+        # codec args — input-side `-ss` (before `-i`) is rejected by
+        # the concat demuxer.
+        self.assertGreater(ss_idx, args.index("-i"))
+        self.assertLess(ss_idx, args.index("libx264"))
+        self.assertEqual(float(args[ss_idx + 1]), 32.024)
+
 
 class ConcatListFormatTests(unittest.TestCase):
     def test_simple_path(self) -> None:
@@ -153,12 +189,124 @@ class ConcatListFormatTests(unittest.TestCase):
         self.assertEqual(_format_concat_line(path), expected)
 
 
+class ProbeAudioLeakTests(unittest.TestCase):
+    """Verify `_probe_audio_leak_seconds` interprets ffprobe JSON correctly."""
+
+    def _fake_run(self, ffprobe_stdout: str, returncode: int = 0):
+        def fake(args, capture_output, text, timeout, check):
+            return subprocess.CompletedProcess(
+                args=args, returncode=returncode,
+                stdout=ffprobe_stdout, stderr="",
+            )
+        return fake
+
+    def _seg(self, tmp: Path) -> Path:
+        seg = tmp / "seg.mkv"
+        seg.write_bytes(b"")
+        return seg
+
+    def test_returns_zero_when_ffprobe_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            seg = self._seg(Path(tmp))
+            self.assertEqual(_probe_audio_leak_seconds(None, seg), 0.0)
+
+    def test_returns_zero_when_segment_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(
+                _probe_audio_leak_seconds(
+                    Path(tmp) / "ffprobe", Path(tmp) / "missing.mkv"
+                ),
+                0.0,
+            )
+
+    def test_detects_leak_above_threshold(self) -> None:
+        # Real session_177 numbers: audio first PTS 68.643s, video
+        # first PTS 100.667s — a 32.024s leak from the inter-game
+        # downtime that produced the blank-prefix bug.
+        payload = json.dumps({
+            "streams": [
+                {"codec_type": "audio", "start_time": "68.643000"},
+                {"codec_type": "video", "start_time": "100.667000"},
+            ]
+        })
+        with TemporaryDirectory() as tmp:
+            seg = self._seg(Path(tmp))
+            with mock.patch(
+                "app.tools.long_form_export.subprocess.run",
+                self._fake_run(payload),
+            ):
+                leak = _probe_audio_leak_seconds(Path(tmp) / "ffprobe", seg)
+            self.assertAlmostEqual(leak, 32.024, places=3)
+
+    def test_below_threshold_returns_zero(self) -> None:
+        # Game 1 baseline: ~23ms priming offset. Below the 50ms
+        # threshold so the trim should be skipped.
+        payload = json.dumps({
+            "streams": [
+                {"codec_type": "video", "start_time": "8.000000"},
+                {"codec_type": "audio", "start_time": "8.023000"},
+            ]
+        })
+        with TemporaryDirectory() as tmp:
+            seg = self._seg(Path(tmp))
+            with mock.patch(
+                "app.tools.long_form_export.subprocess.run",
+                self._fake_run(payload),
+            ):
+                leak = _probe_audio_leak_seconds(Path(tmp) / "ffprobe", seg)
+            self.assertEqual(leak, 0.0)
+
+    def test_video_starts_before_audio_returns_zero(self) -> None:
+        # No leak — video starts first. Negative deltas must clamp to 0
+        # so we never seek backward.
+        payload = json.dumps({
+            "streams": [
+                {"codec_type": "video", "start_time": "5.000000"},
+                {"codec_type": "audio", "start_time": "5.100000"},
+            ]
+        })
+        with TemporaryDirectory() as tmp:
+            seg = self._seg(Path(tmp))
+            with mock.patch(
+                "app.tools.long_form_export.subprocess.run",
+                self._fake_run(payload),
+            ):
+                leak = _probe_audio_leak_seconds(Path(tmp) / "ffprobe", seg)
+            self.assertEqual(leak, 0.0)
+
+    def test_missing_audio_stream_returns_zero(self) -> None:
+        payload = json.dumps({
+            "streams": [
+                {"codec_type": "video", "start_time": "5.000000"},
+            ]
+        })
+        with TemporaryDirectory() as tmp:
+            seg = self._seg(Path(tmp))
+            with mock.patch(
+                "app.tools.long_form_export.subprocess.run",
+                self._fake_run(payload),
+            ):
+                leak = _probe_audio_leak_seconds(Path(tmp) / "ffprobe", seg)
+            self.assertEqual(leak, 0.0)
+
+    def test_ffprobe_failure_returns_zero(self) -> None:
+        with TemporaryDirectory() as tmp:
+            seg = self._seg(Path(tmp))
+            with mock.patch(
+                "app.tools.long_form_export.subprocess.run",
+                self._fake_run("garbage", returncode=1),
+            ):
+                leak = _probe_audio_leak_seconds(Path(tmp) / "ffprobe", seg)
+            self.assertEqual(leak, 0.0)
+
+
 class ExportTests(unittest.TestCase):
     """Drive `LongFormExporter.export` against a stubbed subprocess.run."""
 
     def _make_exporter(self) -> LongFormExporter:
         ex = LongFormExporter.__new__(LongFormExporter)
         ex._ffmpeg_path = Path("/fake/ffmpeg")
+        ex._ffprobe_path = None  # disable leak probe in unit tests
         return ex
 
     def test_no_segments_returns_failed(self) -> None:

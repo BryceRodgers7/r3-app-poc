@@ -21,7 +21,9 @@ auto-detection.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -88,11 +90,24 @@ _DEFAULT_AUDIO_CODEC_ARGS = (
 )
 
 
+# If video's first PTS exceeds audio's by more than this, treat it as
+# an audio-only leak from inter-game downtime that needs to be trimmed.
+# 50ms tolerates the harmless ~20–30ms audio/video offset that's normal
+# even for clean recordings (different stream priming latencies).
+_AUDIO_LEAK_THRESHOLD_SECONDS = 0.05
+
+
 class LongFormExporter:
     """Encodes `(game_subdir, feed_id)` plan items to MP4 via ffmpeg."""
 
     def __init__(self, ffmpeg_path: Path | None = None) -> None:
         self._ffmpeg_path = self._resolve_ffmpeg(ffmpeg_path)
+        # Best-effort: ffprobe is used to detect inter-game audio leak in
+        # the first segment so we can trim it via `-ss`. Missing ffprobe
+        # is non-fatal — we just skip the trim and behavior matches the
+        # pre-fix path. (ffprobe ships with ffmpeg in every distribution
+        # we care about, so this should always resolve in practice.)
+        self._ffprobe_path = self._resolve_ffprobe(self._ffmpeg_path)
 
     @staticmethod
     def _resolve_ffmpeg(override: Path | None) -> Path:
@@ -121,6 +136,20 @@ class LongFormExporter:
                 "or pass `--ffmpeg-path C:/path/to/ffmpeg.exe`."
             )
         return Path(located)
+
+    @staticmethod
+    def _resolve_ffprobe(ffmpeg_path: Path) -> Path | None:
+        """Locate ffprobe alongside ffmpeg, then on PATH. None if missing.
+
+        Probing is best-effort — a missing ffprobe just disables audio-leak
+        trimming, it doesn't fail the export.
+        """
+        sibling_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        sibling = ffmpeg_path.parent / sibling_name
+        if sibling.exists():
+            return sibling
+        located = shutil.which("ffprobe")
+        return Path(located) if located is not None else None
 
     @property
     def ffmpeg_path(self) -> Path:
@@ -160,7 +189,23 @@ class LongFormExporter:
             for seg in segment_paths:
                 concat_file.write(_format_concat_line(seg))
         try:
-            args = self._build_ffmpeg_args(concat_path, plan_item.output_path)
+            # Probe the first segment for an audio-only leading prefix.
+            # See `_probe_audio_leak_seconds` for the why.
+            leak_seconds = _probe_audio_leak_seconds(
+                self._ffprobe_path, segment_paths[0]
+            )
+            if leak_seconds > 0:
+                LOGGER.info(
+                    "trimming %.3fs audio-only leak from %s/%s seg 0",
+                    leak_seconds,
+                    plan_item.game_subdir,
+                    plan_item.feed_id,
+                )
+            args = self._build_ffmpeg_args(
+                concat_path,
+                plan_item.output_path,
+                skip_seconds=leak_seconds,
+            )
             LOGGER.info(
                 "encoding %s/%s -> %s (%d segments)",
                 plan_item.game_subdir,
@@ -221,38 +266,58 @@ class LongFormExporter:
         )
 
     def _build_ffmpeg_args(
-        self, concat_path: Path, output_path: Path
+        self,
+        concat_path: Path,
+        output_path: Path,
+        *,
+        skip_seconds: float = 0.0,
     ) -> list[str]:
         """Return the full ffmpeg argv for encoding one artifact.
 
         Factored out so tests can assert the args structure without
         actually running ffmpeg.
 
-        `-avoid_negative_ts make_zero` is load-bearing for games beyond
-        the first within a single app run. Each `recording/<game_NNN>/`
-        subtree's segment files inherit PTS from the GStreamer
-        pipeline's running clock, which keeps ticking across Stop/Start
-        cycles (the clock is per-pipeline, not per-game). Without this
-        flag, the encoded MP4 for game 2+ starts at whatever PTS the
-        first segment of that game has — e.g. `0:42` if game 1 ran for
-        42 seconds — and players show the timeline starting at that
-        offset rather than 0. `make_zero` instructs the muxer to shift
-        the smallest input timestamp to zero, which is exactly the
-        per-file normalization we want here.
+        `skip_seconds` (positional `-ss` *after* `-i`) trims a leading
+        audio-only prefix in the first segment. Games beyond the first
+        within a single app run hit this: the GStreamer pipeline's
+        audio chain stays alive across Stop/Start, so when the
+        splitmuxsink rebuilds for game N>1 the muxer immediately sees
+        the audio buffers that were queued during the inter-game
+        downtime, while the video chain takes a moment to deliver its
+        first post-resume frame. Game N's seg 0 ends up with N seconds
+        of audio-only data ahead of the first video frame. Plain
+        `-avoid_negative_ts make_zero` shifts both streams by the
+        smallest first PTS (audio's), leaving video starting at
+        +N seconds — which the operator sees as a blank video prefix
+        and a non-zero start time. Output-side `-ss` discards everything
+        before the first video frame (decoded but not encoded), and
+        `-avoid_negative_ts make_zero` then pins the kept timeline to 0.
+
+        `skip_seconds=0` (no leak detected, or ffprobe missing) leaves
+        behavior identical to the pre-fix path so game 1 is unaffected.
         """
-        return [
+        args = [
             str(self._ffmpeg_path),
             "-hide_banner",
             "-loglevel", "warning",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_path),
-            *_DEFAULT_VIDEO_CODEC_ARGS,
-            *_DEFAULT_AUDIO_CODEC_ARGS,
+        ]
+        if skip_seconds > 0:
+            # Output-side `-ss` (after `-i`) — frame-accurate seek that
+            # decodes-and-discards. Slower than input-side `-ss` but
+            # required here: input-side `-ss` on the concat demuxer is
+            # rejected ("could not seek to position N").
+            args.extend(["-ss", f"{skip_seconds:.6f}"])
+        args.extend(_DEFAULT_VIDEO_CODEC_ARGS)
+        args.extend(_DEFAULT_AUDIO_CODEC_ARGS)
+        args.extend([
             "-avoid_negative_ts", "make_zero",
             "-y",  # overwrite existing output (8.C will skip via DB instead)
             str(output_path),
-        ]
+        ])
+        return args
 
 
 def export_all(
@@ -366,6 +431,75 @@ def _persist_result_locked(
             plan_item.game_subdir,
             plan_item.feed_id,
         )
+
+
+def _probe_audio_leak_seconds(
+    ffprobe_path: Path | None, segment_path: Path
+) -> float:
+    """Return seconds of audio-only leak before the first video frame.
+
+    Probes `segment_path` (typically game N's seg 0) for the
+    per-stream `start_time`. If audio's first PTS is meaningfully
+    earlier than video's, returns the delta — the caller can pass this
+    to ffmpeg as `-ss` to discard the leak. Returns 0 in any of:
+
+      - ffprobe is unavailable
+      - the segment lacks an audio or video stream
+      - the delta is below `_AUDIO_LEAK_THRESHOLD_SECONDS` (the
+        normal sub-frame priming offset)
+      - probing fails (bad JSON, timeout, non-zero exit)
+
+    Best-effort: probe failures fall through to skip=0, preserving
+    pre-fix behavior rather than breaking the export.
+    """
+    if ffprobe_path is None or not segment_path.exists():
+        return 0.0
+    try:
+        completed = subprocess.run(
+            [
+                str(ffprobe_path),
+                "-v", "error",
+                "-show_entries", "stream=codec_type,start_time",
+                "-of", "json",
+                str(segment_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        LOGGER.debug("ffprobe failed for %s", segment_path, exc_info=True)
+        return 0.0
+    if completed.returncode != 0:
+        return 0.0
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return 0.0
+    video_start: float | None = None
+    audio_start: float | None = None
+    for stream in data.get("streams", []):
+        codec_type = stream.get("codec_type")
+        raw_start = stream.get("start_time")
+        if raw_start is None:
+            continue
+        try:
+            start = float(raw_start)
+        except (TypeError, ValueError):
+            continue
+        # Take the first instance per stream type — multi-track media
+        # is unusual here but defensive against future feeds.
+        if codec_type == "video" and video_start is None:
+            video_start = start
+        elif codec_type == "audio" and audio_start is None:
+            audio_start = start
+    if video_start is None or audio_start is None:
+        return 0.0
+    delta = video_start - audio_start
+    if delta <= _AUDIO_LEAK_THRESHOLD_SECONDS:
+        return 0.0
+    return delta
 
 
 def _format_concat_line(path: Path) -> str:

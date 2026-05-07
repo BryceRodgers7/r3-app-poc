@@ -600,6 +600,18 @@ The Phase 7.D resume-continuation flow (§11.4 Resume) reuses the crashed game's
 
 Sessions are named `session_NNN` (monotonic per `base_data_dir`); `metadata.db` lives at the base directory level, not inside each session, so the post-session processor can address every session through a single SQLite file.
 
+### 6.2.2 Per-game recording contract
+
+The per-game folder layout in §6.2.1 is the *file system* shape; the rest of the system relies on a stronger **data-quality contract** that the recording side must uphold:
+
+1. **Recording is gated by the operator's button presses.** Between "Stop game recording" and the next "Start game recording", the live preview path stays alive (operators must keep watching the feed), but **no audio or video frames are written to disk**. The session is in `STOPPED` (§10.6); `recording/` gains no new bytes until the next Start press.
+2. **Each game's media is self-contained from frame zero.** The first MKV segment in `game_N/<feed_id>/segment_00000.mkv` opens with the first audio/video frame captured *after* that game's Start press. No data from game N−1, and no data from the inter-game STOPPED interval, may appear in game N's files. In particular: audio and video PTS within game N's segments must align (within normal sub-frame priming offsets — typically tens of milliseconds; see §C of [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md)).
+3. **Post-session output starts at 0:00.** Because (2) holds, the post-session processor concatenating game N's segments produces a `<game>.mp4` whose timeline starts at 0:00 representing that game's first captured frame. The processor does not need to re-time, trim, or normalize the timeline beyond what `-avoid_negative_ts make_zero` already does at MP4 mux time. Operators see "0:00" at the start of every game's deliverable, regardless of how many games preceded it within the session.
+
+This contract is what makes the per-game folder layout useful: the deliverable for game N is a function of `game_N/`'s contents alone, not of the wider session. Any cross-game leakage — stale encoder packets, queued audio buffers from the STOPPED interval, video chain priming delays after the splitmuxsink rebuild — is a contract violation and a recording-side bug, not a post-processing problem.
+
+Known violations and their fixes are catalogued in [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) §C. When a new violation is found, the order of operations is: reproduce on a real session, identify the leak source on the recording side, fix it there, then add an invariant entry. Patching the post-processor to mask the symptom is a temporary workaround at best — it doesn't fix in-session replay (which reads the same segment files) and it blocks any future tooling that reads `game_N/` directly.
+
 ## 6.3 Segment metadata
 
 Each segment must have metadata:

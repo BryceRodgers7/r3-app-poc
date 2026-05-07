@@ -217,6 +217,15 @@ greps the source to assert no name reuse between the two helpers.
 
 ## 10. Flush the audio mux-branch on Stop
 
+**Context.** The recording side must uphold the per-game data-quality
+contract spelled out in [`r3_app_architecture.md`](r3_app_architecture.md)
+§6.2.2: each game's MKV segments contain only data from that game's
+recording window, with audio and video PTS aligned (within normal
+sub-frame priming offsets) so post-session output starts at 0:00.
+The invariants in this section are the recording-side mechanisms
+that uphold that contract; each one closes a specific leakage path
+that has been observed to violate it.
+
 **Rule.** `disable_file_recording` must call
 `_flush_audio_mux_branch_locked()` after the audio valve closes.
 The helper sends `FLUSH_START` then `FLUSH_STOP(reset_time=False)`
@@ -247,6 +256,54 @@ though the valve is closed at the time the flush is sent.
 **Code:** `pipeline_manager.py:_flush_audio_mux_branch_locked` and
 its call from `disable_file_recording` step 6. Regression tests in
 `tests/test_audio_relink_on_rebuild.py::AudioMuxBranchFlushTests`.
+
+---
+
+## 11. Drop stranded audio buffers on game start
+
+**Rule.** `enable_file_recording` must call
+`_arm_audio_stale_pts_drop_locked()` after the splitmuxsink rebuild
+and audio relink, but BEFORE opening the recording valve. The arming
+sets a per-game floor (`current_running_time - 1 s`) that
+`_on_audio_record_buffer_probe` reads to drop any audio buffer
+arriving at `opusenc.src` whose PTS predates the floor. The probe
+disarms itself the moment a fresh-PTS buffer flows, so steady-state
+recording bears no per-buffer cost.
+
+**Why.** §10's flush is necessary but not sufficient. Empirical
+evidence on session_177 and session_178 (and likely every multi-game
+session before the fix) shows that even with `_flush_audio_mux_branch_locked()`
+running on Stop, **exactly one** opus packet survives onto
+`opusenc.src` carrying a PTS from somewhere inside the prior game's
+encoding window — typically several to many seconds older than the
+new game's actual Start press. That packet flows the moment the
+encoder is relinked to the new splitmuxsink and becomes game N+1
+seg 0's first audio sample. The matroska demuxer reports the file's
+`format.start_time` as that stale audio PTS, while the first video
+frame's PTS reflects the actual game start, opening a gap of
+`game_N_to_N+1_downtime` seconds that the post-processor cannot
+hide without `-ss`-trimming the leak.
+
+The pad probe is a defense-in-depth net: it doesn't matter
+*precisely* why the flush leaks one packet (opusenc internal pool,
+upstream queue residue, request-pad relink semantics — investigation
+across multiple sessions has not pinned a single root cause). The
+contract from `r3_app_architecture.md` §6.2.2 is that no buffer
+older than the current game's Start may reach disk; a buffer probe
+that drops by PTS comparison enforces this directly.
+
+**Why arm AFTER rebuild but BEFORE the valve opens.** The relink
+inside `_rebuild_splitmuxsink_locked` is what allows the stranded
+buffer to flow at all (it sat unmovable on `opusenc.src` while
+splitmuxsink was at NULL). Arming after the relink means the floor
+is correct relative to the new game's running time. Arming before
+the valve opens means the probe is in place by the time the first
+real audio buffer arrives.
+
+**Code:** `pipeline_manager.py:_arm_audio_stale_pts_drop_locked` +
+the floor check at the top of `_on_audio_record_buffer_probe` +
+the call site in `enable_file_recording` (immediately after audio
+chain handling, before `_set_branch_enabled("record", True)`).
 
 ---
 
