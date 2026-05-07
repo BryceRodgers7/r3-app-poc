@@ -102,3 +102,30 @@ Add a new doc when **all** of these are true:
 Otherwise extend an existing doc. The bar for adding to this index is
 intentionally high — every additional file is one more thing that
 goes stale.
+
+
+
+
+DEVELOPMENT RUN COMMANDS:
+
+
+NAVIGATE TO THE DIRECTORY:
+cd /c/git/r3-app
+
+
+SETUP VIRTUAL ENVIRONMENT:
+/ucrt64/bin/python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+
+
+RUN THE APP (regular, or with extra logging):
+python main.py
+
+OR
+
+GST_DEBUG=3 python main.py 2>&1 | tee run.log
+
+
+POST-SESSION MP4 PROCESSING:
+python -m app.tools.post_session_processor C:/SportsReplay/sessions/session_118 --ffmpeg-path C:/msys64/ucrt64/bin/ffmpeg.exe
+
