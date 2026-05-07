@@ -612,6 +612,20 @@ This contract is what makes the per-game folder layout useful: the deliverable f
 
 Known violations and their fixes are catalogued in [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) §C. When a new violation is found, the order of operations is: reproduce on a real session, identify the leak source on the recording side, fix it there, then add an invariant entry. Patching the post-processor to mask the symptom is a temporary workaround at best — it doesn't fix in-session replay (which reads the same segment files) and it blocks any future tooling that reads `game_N/` directly.
 
+#### Note: source segment `start_time` is in pipeline running-time, not per-game time
+
+The contract above is about *content fidelity*, not timestamp values. The PTS that matroskamux writes into each segment file is the GStreamer pipeline's running-time at first buffer — and the running-clock is set once at pipeline start (app launch / preview start) and ticks monotonically across every Stop/Start cycle within a session. A source segment file therefore has `start_time` ≈ "seconds since the app launched," not "seconds since this game's Start press."
+
+Concretely: in `session_179`, game 1 seg 0 has `start_time=8.0s`, game 2 seg 0 has `start_time=71.467s`, game 3 seg 0 has `start_time=115.066s`. **This is normal**, not a bug. Resetting the clock per game would break the live preview path that shares the pipeline. The non-zero start_time is invisible to every consumer that matters:
+
+- The **post-session processor** normalizes to 0:00 via ffmpeg's `-avoid_negative_ts make_zero` (and the `-ss` audio-leak trim for already-recorded sessions that predate the §6.2.2 fix).
+- **Replay** queries by `session_time_ns`, which is mapped from PTS via the per-segment `pts_to_session_offset_ns` column (§8.3). Each segment carries its own offset, so PTS values don't need to be globally consistent.
+- **`SegmentIndex`** stores raw PTS, but every public query takes session-time inputs.
+
+If you open a source segment directly in VLC and see "0:01:11" at frame 1 instead of "0:00", that's the running-time semantic surfacing. The post-processed `<game>.mp4` (the actual deliverable) is unaffected.
+
+**Manual test for replay correctness on game N>1's first play.** The §7.H.4 "Replay Play" transport seeks to the currently-open play's `start_session_time_ns`, which on game N's first play maps back into seg 0 of `game_N/`. With seg 0 carrying a non-zero `start_time` in PTS terms, this is the test case that exercises the per-segment `pts_to_session_offset_ns` math end-to-end. Recommended sanity check whenever the recording-side timestamp logic is touched: record a 2-game session, press "Replay Play" on game 2's Play #1, confirm playback starts at game 2's actual first frame (not somewhere in game 1, not 71 seconds of black, not the wrong PTS clamping).
+
 ## 6.3 Segment metadata
 
 Each segment must have metadata:
