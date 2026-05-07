@@ -2944,6 +2944,93 @@ Today's queue policy and encoder settings are baked into `pipeline_manager.py` c
 
 ---
 
+## Phase 12 – Frame-by-frame replay stepping
+
+Goal:
+
+- Operator-driven single-frame and multi-frame stepping (forward + backward) for closer review of fast plays, sitting alongside (not replacing) the existing rate-based slow-motion (`Slow 1/2x`, `Slow 1/4x`).
+
+Tasks:
+
+- Add a step-frames primitive on `PlaybackController` that nudges the replay clock by a configurable number of frames in either direction, transitions the replay FSM into PAUSED, and re-renders.
+- Expose two operator buttons (Step ◀, Step ▶) wired to the primitive.
+- Make the per-click frame count configurable via `[replay] frame_step_count`.
+
+Exit criteria:
+
+- Operator can step forward and backward by the configured frame count from any `ACTIVE_REPLAY_STATES` member without leaking back into LIVE.
+- Stepping past the live edge or before the earliest replayable session-time clamps cleanly (no decoder errors, no FSM whiplash) and surfaces an operator-visible "held at edge" status.
+- All existing replay tests still pass; new tests cover clamping, FSM bouncing, and multi-feed coordination.
+
+### State of the world entering Phase 12
+
+| Task | Today |
+|---|---|
+| Frame-step forward | No surface. `set_playback_rate(0.5)` / `0.25` advance smoothly at fractional rate; there is no single-frame jog. |
+| Frame-step backward | No surface. `rewind_10_seconds` is the closest, in 10s quanta. |
+| Configurable step size | No. Rewind is a hardcoded 10s constant (`_REWIND_10S_NS`). |
+| Live-edge / start-of-recording clamping | `_resolve_rewind_target_locked` already clamps via `_replay_store.available_session_time_range()`. The same helper extends to step. |
+| `ReplayState` FSM support | PAUSED supports `SEEKING → PAUSED` and `REPLAYING/SLOW_MOTION → PAUSED`; no new state required. |
+| Cross-segment stepping | `SegmentDecoder` + `RecordingSegmentReplayStore.nearest_frame_location` already resolve arbitrary session-time across segment boundaries. |
+| Frame-period source | `AppSettings.target_fps` is the single global frame rate today. Per-feed fps drift is a separate (deferred) problem. |
+
+Phase 12 closes these by way of two slices:
+
+### Slices
+
+**12.A — Core step primitive + tests**
+
+`PlaybackController.step_frames(frame_delta: int)` — positive forward, negative backward, magnitude is the frame count. Constructor gains `frame_period_ns: int` so the controller is the single source of truth for "how many ns is one frame" within its run. The UI computes the value from `settings.target_fps` at coordinator-build time.
+
+- **Behavior matrix** —
+  - `live_only` controllers, `replay_state is None`, `_replay_actions_allowed() == False`, or `_shutting_down`: no-op with the existing operator-status emission pattern.
+  - From `LIVE_WHILE_RECORDING`: snap to `latest_replayable_session_time`, bounce `LIVE_WHILE_RECORDING → SEEKING → PAUSED`, freeze, then apply `frame_delta`. Mirrors how `set_playback_rate(0.0)` enters replay from live.
+  - From `REPLAYING` / `SLOW_MOTION`: bounce `→ SEEKING → PAUSED`, freeze, then apply.
+  - From `PAUSED`: stay in PAUSED, apply `frame_delta` directly.
+  - From `REPLAY_DEGRADED`: rejected with status "Replay degraded; step unavailable" (matches the existing degradation gating).
+- **Step math** — `target_session_time_ns = current_session_time_ns + frame_delta * frame_period_ns`. Then clamp to `[earliest_replayable, latest_replayable]` via the same range helper Rewind uses. Update `_playback_session_time_ns`, set `_playback_rate = 0.0`, stop the replay clock, render via `_render_at_session_time_ns`.
+- **Status messages** — `"Step +N frames"`, `"Step -N frames"`, `"Step held at live edge"` when forward step clamps to `latest_replayable`, `"Step held at start of recording"` when backward step clamps to `earliest_replayable`.
+- **Multi-feed** — single shared replay clock, so one step call advances every tile via the existing `_render_at_session_time_ns` per-feed iteration. Feeds without coverage at the target time fall back to `nearest_frame_location` exactly as they do for Rewind.
+- **Tests** — `tests/test_playback_controller.py` adds:
+  - Forward step from PAUSED advances `_playback_session_time_ns` by exactly `frame_delta * frame_period_ns`.
+  - Backward step from PAUSED retreats by the same amount.
+  - Step from REPLAYING transitions through SEEKING → PAUSED before applying (verifying `replay_state.state` and `_playback_rate == 0.0`).
+  - Step from LIVE_WHILE_RECORDING bounces through SEEKING → PAUSED and snaps to `latest_replayable` before the delta is applied.
+  - Step beyond `latest_replayable` clamps; emits "held at live edge" status.
+  - Step before `earliest_replayable` clamps; emits "held at start of recording" status.
+  - Step with `_recording_manager.recording_state.state != RECORDING` is rejected (consistent with `_replay_actions_allowed`).
+  - Step on a `live_only` controller is rejected with "This output is locked to live."
+  - `frame_delta == 0` is a no-op (defensive; not a useful UI gesture).
+
+**Out of scope for 12.A:** any UI surface, settings parsing, per-feed `frame_period_ns`, and runtime-adjustable step size.
+
+**12.B — UI buttons + config wiring**
+
+- **`[replay]` block** — new top-level section in `app_settings.toml`. Today no `[replay]` block exists; this slice adds the parsing path matching the `[recording]` / `[media]` patterns in `AppSettings.load`.
+  - **`[replay] frame_step_count`** — positive int, default `1`. Validated at config-load (`int >= 1`).
+  - `app_settings.toml.example` gets a `[replay]` example with the new key documented.
+- **`AppSettings.replay_frame_step_count: int = 1`** — new dataclass field; settings round-trip in `tests/test_app_settings.py`.
+- **`controls_widget.py`** — two new `QPushButton`s, "Step ◀" and "Step ▶", with `step_back_requested` / `step_forward_requested` signals. Disabled outside RECORDING via the same `set_recording_state` toggle that already gates Replay Play and Next Play. Layout placement: between Slow 1/4x and Jump to Live, mirroring how the existing transport row reads left-to-right from "freshest content" (Pause) to "live edge" (Jump to Live).
+- **`MainWindow.__init__` wiring** —
+  - `step_back_requested` → `controller.step_frames(-settings.replay_frame_step_count)`
+  - `step_forward_requested` → `controller.step_frames(+settings.replay_frame_step_count)`
+- **Coordinator wiring** — `build_default_application_coordinator` computes `frame_period_ns = max(1, int(round(1_000_000_000 / settings.target_fps)))` and passes it into both `PlaybackController` constructors. The `max(1, ...)` floor protects against a misconfigured `target_fps <= 0` from sliding into a divide-by-zero or runaway step.
+- **Tests** —
+  - `tests/test_app_settings.py` covers the `[replay]` block round-trip + rejection of `frame_step_count <= 0` and non-int values.
+  - `tests/test_controls_widget.py` (or co-located with the Phase 7.H.2 button tests if those live elsewhere) confirms the new buttons are gated on `set_recording_state` and emit the expected signals.
+
+**Out of scope for 12.B:** runtime-adjustable step size (a +/- control on the operator UI). Could be a `12.C` later if the config-only knob proves too coarse in operator use.
+
+### Phase 12 sequencing notes
+
+- **12.A first.** The clamping + FSM-bounce semantics are subtle (which states bounce through SEEKING, what happens at REPLAY_DEGRADED, what message surfaces at the edges) and benefit from being landed under tests before any UI exposes the primitive. 12.B is mechanical glue once 12.A is solid.
+- **No new `ReplayState`.** PAUSED already supports the bounce-to-SEEKING-and-back pattern via `_REPLAY_TRANSITIONS`. A `FRAME_STEP` state would just duplicate PAUSED with no behavioral difference, so we reuse PAUSED.
+- **Single global frame-period is intentional.** `target_fps` is a single global setting today; per-feed fps drift is a separate problem the Phase 11.D harness can surface later. If drift becomes load-bearing, a per-feed override is a natural follow-on slice (12.C-bis) without needing to revisit the 12.A primitive.
+- **Default `frame_step_count = 1`** matches the operator's stated preference for one-frame-per-click as the baseline; the config knob lets a sport with faster motion (puck, racquet, bat-on-ball) be turned up to 2 / 3 / 5 frames/click without recompile.
+- **No Phase 11 dependency.** Phase 11 is performance scaling; Phase 12 is operator transport. They can ship in either order; Phase 12 reuses the encoder/decoder pipeline as-is.
+
+---
+
 # 19. Recommended Implementation Defaults
 
 Use these defaults unless hardware testing proves otherwise. The "shipped" column shows the current state; the "target" column shows the long-term default.
