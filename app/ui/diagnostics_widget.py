@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import socket
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer
@@ -50,6 +52,7 @@ class DiagnosticsWidget(QFrame):
         self._feeds_label = QLabel("-")
         self._disk_label = QLabel("-")
         self._disk_budget_label = QLabel("-")
+        self._perf_profile_label = QLabel("-")
         self._latency_label = QLabel("-")
         self._replay_lag_label = QLabel("-")
         self._health_label = QLabel("-")
@@ -58,6 +61,7 @@ class DiagnosticsWidget(QFrame):
             self._feeds_label,
             self._disk_label,
             self._disk_budget_label,
+            self._perf_profile_label,
             self._latency_label,
             self._replay_lag_label,
             self._health_label,
@@ -73,6 +77,7 @@ class DiagnosticsWidget(QFrame):
         layout.addWidget(self._feeds_label)
         layout.addWidget(self._disk_label)
         layout.addWidget(self._disk_budget_label)
+        layout.addWidget(self._perf_profile_label)
         layout.addWidget(self._latency_label)
         layout.addWidget(self._replay_lag_label)
         layout.addWidget(self._health_label)
@@ -155,6 +160,7 @@ class DiagnosticsWidget(QFrame):
             )
 
         self._update_disk_budget_label()
+        self._update_perf_profile_label()
 
         lat = [s for s in latency_snapshots() if s.count > 0]
         if not lat:
@@ -233,6 +239,51 @@ class DiagnosticsWidget(QFrame):
             f"{assessment.budget_mb_s:.0f} MB/s est {glyph}"
         )
         self._disk_budget_label.setStyleSheet(f"QLabel {{ color: {color}; }}")
+
+    def _update_perf_profile_label(self) -> None:
+        """Phase 11.D: surface the most recent perf-acceptance profile.
+
+        Reads `<base_data_dir>/perf_profiles/<hostname>/*.json` and shows
+        the newest one's pass/fail. Silent (no row) when no profiles
+        exist for this host.
+        """
+        if self._settings is None:
+            self._perf_profile_label.setVisible(False)
+            return
+        host = socket.gethostname() or "unknown-host"
+        profile_dir = self._settings.base_data_dir / "perf_profiles" / host
+        if not profile_dir.is_dir():
+            self._perf_profile_label.setVisible(False)
+            return
+        artifacts = sorted(
+            (p for p in profile_dir.iterdir() if p.is_file() and p.suffix == ".json"),
+            key=lambda p: p.name,
+        )
+        if not artifacts:
+            self._perf_profile_label.setVisible(False)
+            return
+        latest = artifacts[-1]
+        try:
+            payload = json.loads(latest.read_text(encoding="utf-8"))
+            passed = bool(payload.get("passed"))
+            utc_iso = str(payload.get("utc_iso", ""))
+            feed_count = payload.get("feed_count", "?")
+            resolution = payload.get("resolution", "?")
+        except (OSError, ValueError):
+            self._perf_profile_label.setText(
+                f"perf profile: (unreadable) {latest.name}"
+            )
+            self._perf_profile_label.setStyleSheet("")
+            self._perf_profile_label.setVisible(True)
+            return
+        glyph, color = ("✓", "#9ece6a") if passed else ("✗", "#ff6e6e")
+        verdict = "passed" if passed else "failed"
+        self._perf_profile_label.setText(
+            f"perf profile: {verdict} {glyph}  "
+            f"{feed_count}x{resolution} @ {utc_iso}  ({latest.name})"
+        )
+        self._perf_profile_label.setStyleSheet(f"QLabel {{ color: {color}; }}")
+        self._perf_profile_label.setVisible(True)
 
     def _update_pipeline_banner(self, snaps) -> None:
         """Show / hide the §3.C transitional pipeline banner."""

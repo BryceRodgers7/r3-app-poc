@@ -142,7 +142,10 @@
       "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe avenc_prores_ks)",
       "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe avenc_dnxhd)",
       "Bash(awk 'NR>=1610 && NR<=1810' run.log)",
-      "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe qtmux *)"
+      "Bash(C:/msys64/ucrt64/bin/gst-inspect-1.0.exe qtmux *)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "PowerShell(New-Item *)",
+      "Bash(findstr /R \"^Ran ^OK ^FAILED\")"
     ]
   }
 }

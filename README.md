@@ -73,6 +73,45 @@ Options:
 
 Phase 8 (✅ shipped end-to-end) produces a long-form MP4 per `(game, feed)` plus a `<game_NNN>/plays.json` sidecar per game describing the operator-marked play boundaries (`play_number`, `start_seconds` game-relative, `length_seconds`). Downstream tooling consumes the JSON to navigate the matching MP4. There are no short-clip MP4 outputs — that requirement was dropped in favor of the JSON sidecar + long-form MP4 combination. See [docs/r3_app_architecture.md](docs/r3_app_architecture.md) Phase 7 / 8 sequencing notes for details.
 
+## Performance acceptance harness (Phase 11.D)
+
+`tools/perf_acceptance.py` drives the recording stack headlessly against synthetic feeds, captures per-feed telemetry to a JSON profile, and applies the §16.3 pass/fail rules so a rig can verify "did I regress?" without a manual run. The harness builds the same coordinator graph production uses (under `QCoreApplication`, no widgets), so encoder, queue policy, and `splitmuxsink` are exercised end-to-end.
+
+Usage:
+
+```
+# Smoke test — 1 feed, 30s, fail-fast
+python -m tools.perf_acceptance --smoke
+
+# Full multi-feed run (default 5 minutes)
+python -m tools.perf_acceptance --feeds 4 --resolution 1280x720 --fps 30 --duration 300
+
+# Override harness data directory so it does not mingle with operator session data
+python -m tools.perf_acceptance --feeds 2 --duration 60 --data-dir C:/tmp/perf
+```
+
+Exit code: `0` on pass, `1` on any §16.3 failure.
+
+Pass/fail rules (all must hold):
+
+- Source FPS p50 within 1% of `--fps` for every feed.
+- Recording FPS p50 within 1% of source FPS p50 for every feed.
+- Preview and recording queue saturation peaks ≤ 75% for every feed.
+- No `recording_branch_saturated` / `disk_full` / `disk_full_imminent` health events fired.
+
+Profile artifacts:
+
+- Written to `<base_data_dir>/perf_profiles/<hostname>/<utc_iso>_<feeds>x<WxH>.json`.
+- Newest 50 retained per host; older artifacts pruned automatically.
+- Schema includes per-feed `source_fps_{p50,p95,min}`, `recording_fps_{p50,p95,min}`, dropped-buffer max, queue saturation peaks, the run's full health-event log, and the resulting `passed` / `failures[]`.
+- The diagnostics widget surfaces the most recent profile's pass/fail status, so a rig with no terminal open can still tell if it last passed acceptance.
+
+Caveats:
+
+- Synthetic feeds run on the `python_push` pipeline path, so the harness measures pipeline plumbing (encoder branch, queue saturation, splitmuxsink finalization, disk throughput), not real NDI ingest. The 720p@30 ceiling on the synthetic path applies — runs at 1080p with synthetic feeds are expected to surface saturation.
+- Audio is forced off for harness runs because the synthetic source has no audio stream and `splitmuxsink` would stall waiting on it.
+- The `--data-dir` default is `<cwd>/perf_acceptance_data` so harness sessions don't mingle with operator session data. Profile artifacts go under that directory's `perf_profiles/<hostname>/` unless `--profile-dir` overrides.
+
 - **`kind = "ndi"`**: use the NDI receiver (GStreamer) for that feed. Production deployments use this exclusively.
 - **`kind = "synthetic"`**: deterministic synthetic test pattern from [app/media/test_source.py](app/media/test_source.py). Dev-only fallback for machines without NDI hardware.
 
