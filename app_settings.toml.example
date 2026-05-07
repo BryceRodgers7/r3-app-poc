@@ -3,8 +3,8 @@
 
 [app]
 app_name = "Sports Replay POC"
+referee_window_title = "Sports Replay Referee"
 operator_window_title = "Sports Replay Operator"
-program_window_title = "Sports Replay Program"
 base_data_dir = "C:\\SportsReplay"
 # "development" hides the python_push transitional banner; "production"
 # surfaces it as a high-contrast warning so refactors don't accidentally

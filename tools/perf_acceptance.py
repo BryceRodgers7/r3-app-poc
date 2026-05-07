@@ -454,14 +454,14 @@ class PerfHarness:
         metadata_db = MetadataDb(settings.metadata_db_path)
         session_manager = SessionManager(file_manager, metadata_db)
 
+        referee_renderer = MultiFeedOutputRenderer()
         operator_renderer = MultiFeedOutputRenderer()
-        program_renderer = MultiFeedOutputRenderer()
 
         coordinator = build_default_application_coordinator(
             settings,
             session_manager,
+            referee_renderer=referee_renderer,
             operator_renderer=operator_renderer,
-            program_renderer=program_renderer,
         )
         self._coordinator = coordinator
 

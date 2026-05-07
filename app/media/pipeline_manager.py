@@ -247,10 +247,10 @@ class PipelineManager:
         self._branch_queue_caps: dict[str, dict[str, int]] = {}
         self._preview_sink: Any | None = None
         self._preview_sink_factory_name: str | None = None
+        self._referee_preview_sink: Any | None = None
         self._operator_preview_sink: Any | None = None
-        self._program_preview_sink: Any | None = None
+        self._referee_window_handle: int | None = None
         self._operator_window_handle: int | None = None
-        self._program_window_handle: int | None = None
         self._preview_probe_pad: Any | None = None
         self._preview_probe_id: int | None = None
         self._video_window_handle: int | None = None
@@ -791,18 +791,18 @@ class PipelineManager:
     def set_native_preview_window_handle(self, role: str, window_handle: int) -> None:
         """Bind one of the per-window native preview sinks to a Qt window handle.
 
-        `role` must be `"operator"` or `"program"`. No-op for python_push
+        `role` must be `"referee"` or `"operator"`. No-op for python_push
         sources (their preview path uses an appsink and renders via QImage).
         """
-        if role not in {"operator", "program"}:
+        if role not in {"referee", "operator"}:
             raise ValueError(f"Unknown native preview window role: {role!r}")
         with self._pipeline_lock:
-            if role == "operator":
+            if role == "referee":
+                self._referee_window_handle = int(window_handle)
+                sink = self._referee_preview_sink
+            else:
                 self._operator_window_handle = int(window_handle)
                 sink = self._operator_preview_sink
-            else:
-                self._program_window_handle = int(window_handle)
-                sink = self._program_preview_sink
             if sink is None:
                 # Pipeline not built yet (or not native) — handle stored
                 # for later; the binding happens once native preview
@@ -1007,20 +1007,20 @@ class PipelineManager:
             # the run log whether both sinks got handles before the
             # pipeline transitions to PLAYING.
             LOGGER.info(
-                "native-preview pre-bind: operator_sink=%s operator_handle=%r "
-                "program_sink=%s program_handle=%r",
+                "native-preview pre-bind: referee_sink=%s referee_handle=%r "
+                "operator_sink=%s operator_handle=%r",
+                self._referee_preview_sink.get_name() if self._referee_preview_sink else None,
+                self._referee_window_handle,
                 self._operator_preview_sink.get_name() if self._operator_preview_sink else None,
                 self._operator_window_handle,
-                self._program_preview_sink.get_name() if self._program_preview_sink else None,
-                self._program_window_handle,
             )
+            if self._referee_preview_sink is not None and self._referee_window_handle is not None:
+                self._bind_named_video_sink_locked(
+                    self._referee_preview_sink, self._referee_window_handle
+                )
             if self._operator_preview_sink is not None and self._operator_window_handle is not None:
                 self._bind_named_video_sink_locked(
                     self._operator_preview_sink, self._operator_window_handle
-                )
-            if self._program_preview_sink is not None and self._program_window_handle is not None:
-                self._bind_named_video_sink_locked(
-                    self._program_preview_sink, self._program_window_handle
                 )
 
             state_change = pipeline.set_state(Gst.State.PLAYING)
@@ -1231,21 +1231,21 @@ class PipelineManager:
         valve = self._make_element("valve", f"{branch_name}_valve")
         convert = self._make_element("videoconvert", f"{branch_name}_convert")
         preview_tee = self._make_element("tee", f"{branch_name}_window_tee")
+        referee_sink, referee_factory = self._make_video_sink(
+            f"{branch_name}_referee_sink"
+        )
         operator_sink, operator_factory = self._make_video_sink(
             f"{branch_name}_operator_sink"
-        )
-        program_sink, program_factory = self._make_video_sink(
-            f"{branch_name}_program_sink"
         )
 
         self._configure_preview_queue(queue, branch_name)
         valve.set_property("drop", True)
-        for sink in (operator_sink, program_sink):
+        for sink in (referee_sink, operator_sink):
             self._set_property_if_supported(sink, "sync", False)
             self._set_property_if_supported(sink, "async", False)
             self._set_property_if_supported(sink, "force-aspect-ratio", True)
 
-        for element in (queue, valve, convert, preview_tee, operator_sink, program_sink):
+        for element in (queue, valve, convert, preview_tee, referee_sink, operator_sink):
             self._pipeline.add(element)
 
         if not (queue.link(valve) and valve.link(convert) and convert.link(preview_tee)):
@@ -1259,8 +1259,8 @@ class PipelineManager:
         # native-preview window queues — the head queue already has it
         # via _configure_preview_queue.
         for sink, label in (
+            (referee_sink, "referee"),
             (operator_sink, "operator"),
-            (program_sink, "program"),
         ):
             sink_queue = self._make_element("queue", f"{branch_name}_{label}_queue")
             try:
@@ -1320,10 +1320,10 @@ class PipelineManager:
         # `_preview_sink` is the operator-window sink — that's the one the
         # legacy `_video_window_handle` setter binds to, mirroring the
         # replay-sink convention.
-        self._preview_sink = operator_sink
-        self._preview_sink_factory_name = operator_factory
+        self._preview_sink = referee_sink
+        self._preview_sink_factory_name = referee_factory
+        self._referee_preview_sink = referee_sink
         self._operator_preview_sink = operator_sink
-        self._program_preview_sink = program_sink
 
     def _on_native_preview_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
         """Buffer probe for native preview: ticks metrics + frame-overlay state.
@@ -3099,16 +3099,16 @@ class PipelineManager:
         src_name = message.src.get_name() if message.src is not None else "<None>"
         LOGGER.info(
             "prepare-window-handle from sink=%s; "
-            "operator_handle=%r program_handle=%r",
+            "referee_handle=%r operator_handle=%r",
             src_name,
+            self._referee_window_handle,
             self._operator_window_handle,
-            self._program_window_handle,
         )
         if (
-            self._operator_preview_sink is not None
-            and message.src == self._operator_preview_sink
+            self._referee_preview_sink is not None
+            and message.src == self._referee_preview_sink
         ):
-            if self._operator_window_handle is None:
+            if self._referee_window_handle is None:
                 LOGGER.warning(
                     "prepare-window-handle for operator sink but no "
                     "operator handle stored yet (likely Qt winId race) — "
@@ -3117,14 +3117,14 @@ class PipelineManager:
                 return
             with self._pipeline_lock:
                 self._bind_named_video_sink_locked(
-                    self._operator_preview_sink, self._operator_window_handle
+                    self._referee_preview_sink, self._referee_window_handle
                 )
             return
         if (
-            self._program_preview_sink is not None
-            and message.src == self._program_preview_sink
+            self._operator_preview_sink is not None
+            and message.src == self._operator_preview_sink
         ):
-            if self._program_window_handle is None:
+            if self._operator_window_handle is None:
                 LOGGER.warning(
                     "prepare-window-handle for program sink but no "
                     "program handle stored yet (likely Qt winId race) — "
@@ -3133,7 +3133,7 @@ class PipelineManager:
                 return
             with self._pipeline_lock:
                 self._bind_named_video_sink_locked(
-                    self._program_preview_sink, self._program_window_handle
+                    self._operator_preview_sink, self._operator_window_handle
                 )
             return
         if message.src == self._preview_sink:

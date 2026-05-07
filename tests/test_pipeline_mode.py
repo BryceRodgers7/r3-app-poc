@@ -147,10 +147,10 @@ class PipelineManagerNativeWindowBindingTests(unittest.TestCase):
 
         pm = PipelineManager.__new__(PipelineManager)
         pm._pipeline_lock = __import__("threading").Lock()
+        pm._referee_window_handle = None
         pm._operator_window_handle = None
-        pm._program_window_handle = None
+        pm._referee_preview_sink = None
         pm._operator_preview_sink = None
-        pm._program_preview_sink = None
         with self.assertRaises(ValueError):
             pm.set_native_preview_window_handle("third-monitor", 12345)
 
@@ -159,15 +159,15 @@ class PipelineManagerNativeWindowBindingTests(unittest.TestCase):
 
         pm = PipelineManager.__new__(PipelineManager)
         pm._pipeline_lock = __import__("threading").Lock()
+        pm._referee_window_handle = None
         pm._operator_window_handle = None
-        pm._program_window_handle = None
+        pm._referee_preview_sink = None
         pm._operator_preview_sink = None
-        pm._program_preview_sink = None
         # No sink yet — should just store the handle without raising.
-        pm.set_native_preview_window_handle("operator", 0xABCD)
-        pm.set_native_preview_window_handle("program", 0x1234)
-        self.assertEqual(pm._operator_window_handle, 0xABCD)
-        self.assertEqual(pm._program_window_handle, 0x1234)
+        pm.set_native_preview_window_handle("referee", 0xABCD)
+        pm.set_native_preview_window_handle("operator", 0x1234)
+        self.assertEqual(pm._referee_window_handle, 0xABCD)
+        self.assertEqual(pm._operator_window_handle, 0x1234)
 
 
 if __name__ == "__main__":

@@ -225,7 +225,7 @@ Responsibilities:
 - Own shared `SessionClock`.
 - Own `RecordingManager`.
 - Own replay index/query services for active recording segments.
-- Own operator and program playback controllers (program is live-only; operator has full transport).
+- Own referee and operator playback controllers (operator is live-only; referee has full transport).
 - Coordinate startup/shutdown.
 - Surface health state to UI.
 
@@ -1313,7 +1313,7 @@ feed_state                             -- in-snapshot (today: parallel lookup)
 
 Per-bucket status:
 
-- **`program_fps` / split `dropped_buffers_preview` vs `dropped_buffers_program`** — the operator and program windows render through `MultiFeedOutputRenderer` instances that share the upstream tee. Today the snapshot collapses both into one `preview_fps` / `dropped_per_sec`. Splitting requires per-window-sink instrumentation; deferred until a use case appears (e.g. one window stutters while the other doesn't).
+- **`operator_fps` / split `dropped_buffers_referee` vs `dropped_buffers_operator`** — the referee and operator windows render through `MultiFeedOutputRenderer` instances that share the upstream tee. Today the snapshot collapses both into one `preview_fps` / `dropped_per_sec`. Splitting requires per-window-sink instrumentation; deferred until a use case appears (e.g. one window stutters while the other doesn't).
 - **`encode_latency_ms` / `segment_write_latency_ms`** — the underlying data is already collected by `LatencySampler` (Phase 1.D), just keyed globally (`segment_write_video`, etc.) rather than per-feed. Joining requires re-keying as `(feed_id, name)`; deferred until per-feed latency divergence becomes a real diagnostic question.
 - **`last_completed_segment_end_time` / per-feed `latest_replayable_session_time_ns` / `recording_segments_available_for_replay`** — derivable from `SegmentIndex` on demand without storing in the snapshot. The diagnostics widget reads cross-feed values from `UiState` because they match the operator's single-game-at-a-time mental model. Per-feed values would be additive when a multi-feed-aware diagnostics view is built.
 - **`feed_state` in-snapshot** — minor inconvenience only; the parallel lookup works. Adding it would deduplicate one read.
@@ -1429,8 +1429,8 @@ once aspired to but the loader does not consume are listed under §13.2
 # Window titles and identity strings (purely cosmetic).
 app_name              = "Sports Replay POC"
 window_title          = "Sports Replay Control"
+referee_window_title  = "Sports Replay Referee"
 operator_window_title = "Sports Replay Operator"
-program_window_title  = "Sports Replay Program"
 
 # All session media + metadata lives under here.
 base_data_dir = "C:\\SportsReplay"
@@ -1966,7 +1966,7 @@ Slices delivered:
 - **1.B — Unified GStreamer bus logging.** New `app/media/gst_bus_log.py`. Bus filter expanded from `ERROR | EOS` to `ERROR | WARNING | INFO | EOS`. Every bus log line tagged with `feed_id` and `pipeline_role` (`live` / `replay` / `replay-audio`).
 - **1.C — Disk metrics.** `DiskSampler` + `DiskSnapshot`. Sustained-write MB/s estimated from the change in `shutil.disk_usage(...).free` between samples; emitted on a 5s cadence, surfaced in the diagnostics widget.
 - **1.D — Write/seek timing.** `LatencySampler`, `LatencyRegistry`, and a `time_block(name)` context manager. Wraps `MuxedMediaWriter.write_frame` / `write_audio_chunk` (`segment_write_*`) and the operator-initiated `rewind_10_seconds` lookup (`replay_seek`). Roll-ups (count / avg / p95 / max) flushed by the hub each tick.
-- **1.E — Health events + diagnostics widget.** New `app/core/health_events.py` with append-only JSONL persistence under `<session>/logs/health_events.jsonl`. Hub auto-emits `feed_lost` after 3 consecutive zero-source-fps samples and `disk_low` below 5% free, with paired `feed_recovered` / `disk_recovered` on recovery. New `app/ui/diagnostics_widget.py` mounted on the operator window only.
+- **1.E — Health events + diagnostics widget.** New `app/core/health_events.py` with append-only JSONL persistence under `<session>/logs/health_events.jsonl`. Hub auto-emits `feed_lost` after 3 consecutive zero-source-fps samples and `disk_low` below 5% free, with paired `feed_recovered` / `disk_recovered` on recovery. New `app/ui/diagnostics_widget.py` mounted on the referee window only today; future work will move most of it to the operator window (see Phase 13 notes), keeping only replay-feature-relevant diagnostics on the referee window.
 
 ---
 
@@ -2142,21 +2142,21 @@ A subtlety surfaced during 3.A.2 implementation: getting frames *out of Python o
 
 **3.A.3 — Native preview video sink** *(✅ Committed on retry after Phase 4)*
 
-**Original failure mode:** the first attempt (pre-Phase 4) hit a "third Direct3D11 renderer" top-level window that kept appearing despite a working `prepare-window-handle` bus handler, and the preview tee fan-out froze within seconds. The most likely root cause was the legacy replay pipeline's own `d3d11videosink` (a third sink we weren't binding), which Phase 4.D removed entirely along with the rolling-replay buffer. With only operator + program sinks remaining, the binding race shrinks to a tractable set.
+**Original failure mode:** the first attempt (pre-Phase 4) hit a "third Direct3D11 renderer" top-level window that kept appearing despite a working `prepare-window-handle` bus handler, and the preview tee fan-out froze within seconds. The most likely root cause was the legacy replay pipeline's own `d3d11videosink` (a third sink we weren't binding), which Phase 4.D removed entirely along with the rolling-replay buffer. With only referee + operator sinks remaining, the binding race shrinks to a tractable set.
 
 **Retry shape (committed):**
 
 - `PipelineManager._add_preview_branch` dispatches based on `source.pipeline_mode`: NATIVE → `_add_native_preview_branch` (the d3d11 path), `python_push` → `_add_python_push_preview_branch` (the legacy appsink → QImage path). Synthetic dev source remains on the python_push path because it has no native GStreamer source to feed d3d11 anyway.
 - Per-window queues in `_add_native_preview_branch` are now `leaky=2 (downstream)` + `max-size-time=200ms` + `max-size-buffers=4` so a blocked window (minimized, occluded, dead d3d11 device) drops frames rather than back-pressuring the source tee. This is the single most likely fix for the "tee fan-out froze within seconds" symptom.
 - `VideoWidget` got a live↔replay flip: in native render mode, `set_video_surface_visible(enabled, live=...)` picks `_live_surface` for LIVE and the `_frame_label` QLabel for REPLAY/PAUSED. `display_frame()` also auto-flips to QLabel because receiving a Python frame in native mode means the playback controller is showing a non-live timestamp via `SegmentDecoder`. `MultiFeedVideoPanel.apply_tile_visibility(mode, ...)` derives the `live` flag from `mode == LIVE` and passes it through.
-- `MainWindow` binds the d3d11 sinks for native feeds before `coordinator.initialize()` runs. The role (operator vs program) is derived from `program_live_only`. The bind goes through `coordinator.bind_native_preview_window_handle` which checks `is_native_preview_active(feed_id)` so python_push feeds and the `force_python_push_preview` escape hatch are both honored.
+- `MainWindow` binds the d3d11 sinks for native feeds before `coordinator.initialize()` runs. The role (referee vs operator) is derived from `live_only_window`. The bind goes through `coordinator.bind_native_preview_window_handle` which checks `is_native_preview_active(feed_id)` so python_push feeds and the `force_python_push_preview` escape hatch are both honored.
 - `AppSettings.force_python_push_preview` (default `False`) is the operator-level escape hatch — flip to `true` in `[app]` if d3d11 still misbehaves on the local hardware. The qimage path keeps preview Python-bound (~720p ceiling) but is proven stable.
 
 **10 new tests** in `tests/test_native_preview.py`: settings parsing (default / explicit / missing), VideoWidget render-mode flip matrix (qimage default, native live → live_surface, native replay → frame_label, display_frame in native mode flips to qimage, return-to-live flips back, qimage mode ignores live flag, SOURCE_LOST always shows placeholder).
 
 **Outstanding follow-up:** if the tee freeze symptom returns on hardware, the next direction the doc previously suggested still applies — investigate gst-plugins-bad d3d11videosink version-specific behavior, or try gst-plugins-rs `d3d12sink` as a drop-in.
 
-The intended design: replace the operator-window preview path's `appsink → numpy → QImage` round-trip with a native GStreamer video sink (`d3d11videosink` on Windows) that renders directly into each VideoWidget's native window handle. Two sinks per feed (operator + program), bound via `GstVideoOverlay.set_window_handle()` to the per-window `WId()` returned by Qt. A buffer pad probe on `videoconvert.src` would tick metrics and synthesize `FrameOverlayInfo` so the operator's `PlaybackController` state machine still sees frame-arrival events. No pixel data into Python on the preview hot path.
+The intended design: replace the referee-window preview path's `appsink → numpy → QImage` round-trip with a native GStreamer video sink (`d3d11videosink` on Windows) that renders directly into each VideoWidget's native window handle. Two sinks per feed (referee + operator), bound via `GstVideoOverlay.set_window_handle()` to the per-window `WId()` returned by Qt. A buffer pad probe on `videoconvert.src` would tick metrics and synthesize `FrameOverlayInfo` so the referee window's `PlaybackController` state machine still sees frame-arrival events. No pixel data into Python on the preview hot path.
 
 **What actually happened:** the implementation built (the bin shape was correct, tests passed), but on the user's hardware (Windows + PySide6 + gst-plugins-bad d3d11videosink) the binding misbehaved at runtime: a third "Direct3D11 renderer" top-level window appeared (sink falling back to creating its own window despite preemptive `set_window_handle()`), buffers froze in the per-branch tee within ~1 second, and Python eventually went unresponsive. Adding a `prepare-window-handle` sync-bus-message handler that explicitly recognized both per-window sinks (the canonical GstVideoOverlay protocol) did not change the symptoms.
 
@@ -2731,12 +2731,12 @@ Phase 10 closes the **Gap** rows and upgrades the **Partial** rows to operator-v
 
 **10.A — Operator alert banner (✅ shipped)**
 
-The §11.3 operator-visible warnings list (feed disconnected / recording degraded / replay unavailable / disk nearly full / disk too slow / dropped frames high / encoder failure / session not safely recording) was previously buried in `health_events.jsonl` and reduced to a category-count line in the diagnostics widget. 10.A adds a foregrounded `AlertBanner` widget at the top of the operator window:
+The §11.3 operator-visible warnings list (feed disconnected / recording degraded / replay unavailable / disk nearly full / disk too slow / dropped frames high / encoder failure / session not safely recording) was previously buried in `health_events.jsonl` and reduced to a category-count line in the diagnostics widget. 10.A adds a foregrounded `AlertBanner` widget at the top of the referee window today; Phase 13.C moves it to the operator (live-only) window so it sits with the recording transport (Start/Stop, Next Play). The 10.A wiring described below reflects the pre-13.C state.
 
 - **`HealthEventLog.open_events()`** — additive accessor that returns the full `HealthEvent` payloads for currently-open `(feed_id, category)` pairs, alongside the existing `has_open_event` / `clear_open_event` markers. The original `_last_categories` dict is preserved so existing readers (e.g. `test_telemetry.py`) keep working — a parallel `_open_events` dict mirrors the markers with full payloads.
 - **`AlertBanner` widget (`app/ui/alert_banner.py`)** — polls `default_log().open_events()` on a 1s `QTimer` (matching `DiagnosticsWidget` cadence), filters to a §11.3 allowlist, picks the highest-severity event (ERROR > WARNING > INFO; most-recent id tie-break), and renders it as a colored bar (amber for WARNING, red for ERROR). When more than one operator-visible event is open at once, an inline `+N more` badge surfaces the overflow.
 - **Allowlist mapping** — `feed_lost → "Feed disconnected"`, `feed_degraded → "Recording degraded"`, `replay_degraded → "Replay unavailable"`, `disk_low → "Disk nearly full"`, `recording_branch_saturated → "Disk too slow — recording degraded"`, `recording_error → "Encoder failure"`, `session_dirty → "Session not safely recording"`. Diagnostic-only categories (`audio_missing`, `invalid_transition`, `feed_recovered`, `recording_started`, `recording_stopped`, `disk_recovered`, `session_finalized`) are deliberately excluded — they stay in the diagnostics widget and JSONL log.
-- **Wiring** — banner is inserted at the top of `MainWindow`'s central layout only when `show_controls=True`. The program window (`show_controls=False`, on-air pane) stays uncluttered.
+- **Wiring** — today, banner is inserted at the top of `MainWindow`'s central layout only when `show_controls=True`, which maps to the referee window. The operator window (`show_controls=False`, live-only pane) currently has no banner. Phase 13.C flips this so the banner lives on the operator window with the recording transport.
 - **Tests** — `tests/test_alert_banner.py`: empty log → hidden; single WARNING → visible + label; ERROR outranks concurrent WARNING; `+N more` populates correctly; recovery clears the banner; diagnostic-only categories are excluded from both the primary slot and the count.
 
 **Out of scope for 10.A:** click-to-dismiss (the recovery event is the dismissal); per-feed routing of feed-specific banners to a per-feed widget; operator-visible "dropped frames high" (no producer category exists yet — would need a new telemetry rule that emits one).
@@ -3054,6 +3054,85 @@ Phase 12 closes these by way of two slices:
 - **Single global frame-period is intentional.** `target_fps` is a single global setting today; per-feed fps drift is a separate problem the Phase 11.D harness can surface later. If drift becomes load-bearing, a per-feed override is a natural follow-on slice (12.C-bis) without needing to revisit the 12.A primitive.
 - **Default `frame_step_count = 1`** matches the operator's stated preference for one-frame-per-click as the baseline; the config knob lets a sport with faster motion (puck, racquet, bat-on-ball) be turned up to 2 / 3 / 5 frames/click without recompile.
 - **No Phase 11 dependency.** Phase 11 is performance scaling; Phase 12 is operator transport. They can ship in either order; Phase 12 reuses the encoder/decoder pipeline as-is.
+
+---
+
+## Phase 13 – Split the transport rows across the referee and operator windows
+
+Naming context (see §6.2.2 / `CLAUDE.md` overview): the **referee window** hosts replay/review tools and is used occasionally by a referee. The **operator window** hosts the live-only feed; an operator sits in front of it for the whole session, pressing Start/Stop and Next Play.
+
+Goal:
+
+- Move `Start/Stop game recording` and `Next Play` from the referee window's `ControlsWidget` (where they live today, since the referee window is the only one with controls) to the operator (live-only) window — closer to the persistent operator who is actually using them.
+- Replay transport (`Pause`, `Rewind 10s`, `Replay Play`, `Slow 1/2x`, `Slow 1/4x`, `Step ◀`, `Step ▶`, `Jump to Live`) stays on the referee window — those are the post-action review tools and they belong next to the replay-capable feed.
+
+Rationale:
+
+- Recording transport (start/stop game, mark plays) is a continuous-attention task tied to the live timeline. The persistent operator at the live-only window benefits from having those buttons under the same window they're already watching.
+- Replay transport is an occasional-review workflow. It belongs alongside the referee's replay-capable feed.
+- Today both are in one row on the referee window, which conflates two different roles into one button strip — and asks the operator to look across to the referee window to start/stop a game.
+
+Reverses one design decision documented today: the §10.A AlertBanner note says the operator window (`show_controls=False`, live-only pane) "stays uncluttered." Phase 13 explicitly trades that cleanliness for ergonomic alignment between recording-transport and live-feed visibility — including the AlertBanner itself, which moves with the recording transport (see 13.C below). Whoever is pressing Start/Stop and Next Play is also the person who needs to see recording-error alerts; splitting transport from alerts across two windows would defeat the point of the move.
+
+### State of the world entering Phase 13
+
+| Concern | Today |
+|---|---|
+| Referee window controls | Single row in `ControlsWidget`: Pause, Rewind 10s, Replay Play, Slow 1/2x, Slow 1/4x, Step ◀, Step ▶, Jump to Live, Start game recording, Next Play. |
+| Operator window controls | None. `show_controls=False` in `main.py`. The window has just video + status bar. |
+| Recording state plumbing | `MainWindow._render_state` updates `controls_widget.long_recording_button.setText(...)` from `state.is_recording` and gates `next_play_button` enable via `controls_widget.set_recording_state(state.is_recording)`. Both signals route to the application coordinator, not the per-window `PlaybackController`. |
+| Replay button gating | `set_recording_state` *also* gates `Replay Play`, `Step ◀`, `Step ▶` (they're meaningless outside RECORDING per §10.4). These stay on the referee window after the change, so the gating logic lives in the referee's controls widget. |
+| Coordinator-level signals | `coordinator.toggle_long_session_recording` and `coordinator.mark_next_play` are application-level, not per-controller. Re-pointing the buttons to a different window is a re-wire, not a refactor. |
+
+### Slices
+
+**13.A — Split `ControlsWidget` into two widgets.**
+
+- Rename current `ControlsWidget` → `RefereeControlsWidget`. Drops `long_recording_button` and `next_play_button` and their wiring; keeps everything else. `set_recording_state` still gates `replay_play_button`, `step_back_button`, `step_forward_button` — those buttons remain.
+- New `OperatorControlsWidget`. Two buttons: `long_recording_button` (label flips between "Start game recording" / "Stop game recording") and `next_play_button`. Same touch-friendly button-height + stylesheet defaults as the referee widget. `set_recording_state` here gates only `next_play_button` enable (Start/Stop is always enabled — pressing it IS the toggle).
+- Signals on `OperatorControlsWidget`: `long_recording_toggle_requested`, `next_play_requested`. Same semantics as today.
+
+**13.B — `MainWindow` and `main.py` wiring.**
+
+- `MainWindow.__init__` learns to build either widget. New flag `controls_role: str` with values `"referee"` / `"operator"` / `"none"`. Replaces the single `show_controls: bool`. Default `"referee"` keeps existing behavior for any test that constructs `MainWindow` with no kwargs.
+  - `"referee"` → builds `RefereeControlsWidget`, wires the eight replay/transport signals to the controller (Pause, Rewind, Replay Play, Slow 1/2x, Slow 1/4x, Step ◀, Step ▶, Jump to Live).
+  - `"operator"` → builds `OperatorControlsWidget`, wires Start/Stop and Next Play to the coordinator.
+  - `"none"` → no controls (currently unused; preserves the option for a future "spectator" window).
+- `main.py` referee window passes `controls_role="referee"`. The operator window passes `controls_role="operator"`. `live_only_window=True` on the operator window is unchanged.
+- `_render_state` split: the recording-state-driven button updates (`long_recording_button.setText`, `next_play_button.setEnabled`) live in the operator-window branch. The referee-window branch keeps the gating for `replay_play_button` / step buttons. Recording state is read from the same `state.is_recording` field (UiState) — no new signal plumbing.
+- Layout on operator window: keep the existing video panel + status bar; the two-button row sits directly above the status bar (matching the referee window's bottom-of-layout pattern). Two buttons centered or left-aligned — see open question Q2.
+
+**13.C — Move the AlertBanner from referee to operator window.**
+
+- Today (`MainWindow.__init__`): `AlertBanner(parent=self) if show_controls else None` — meaning referee-only.
+- After 13.C: gate on `controls_role == "operator"` instead. Banner appears at the top of the operator window's layout, above the video panel, matching today's structural placement on the referee window.
+- Referee window loses its banner. Operator-relevant alerts (per §11.3) still fire as health events into the JSONL log; the on-screen surface moves to the operator window.
+- Update the §10.A AlertBanner doc note in this file to reflect the move: "the operator window is the alert surface because it's the recording-transport pane."
+- Tests: `tests/test_main_window.py` (or wherever the banner-presence assertion lives today — TBD when 13.C lands) flips its assertion: banner present iff `controls_role == "operator"`.
+
+### Exit criteria
+
+- Pressing Start game recording on the operator window starts recording; the operator-window button's label flips to "Stop game recording" while RECORDING.
+- Both windows' status bars continue to show recording state (existing `StatusBarWidget.update_state` path is unchanged).
+- Next Play on the operator window is enabled iff `is_recording`; press marks a play boundary via `coordinator.mark_next_play`.
+- Referee window has none of: Start game recording, Stop game recording, Next Play. Every other replay/review transport (Pause, Rewind, Replay Play, Slow 1/2x, Slow 1/4x, Step, Jump to Live) works as it does today.
+- `tests/test_controls_widget.py` is split into per-widget classes (`RefereeControlsWidgetTests` / `OperatorControlsWidgetTests`); each asserts the buttons it owns and rejects (via absence) the buttons it doesn't.
+
+### Open questions to resolve before implementing
+
+1. **DiagnosticsWidget placement.** Today referee-only (gated on `show_controls=True`). The operator's preference (see CLAUDE.md / Phase 13 framing): most diagnostics are eventually hidden or hide-able; if displayed, they go to the operator window. Only replay-feature-relevant diagnostics belong on the referee window. This is a separate slice (13.D?) — flagging here so it doesn't get lost.
+2. **Layout polish on the operator window.** Two buttons at the bottom — left-aligned, centered, or full-width-stretched? With only two buttons, full-width-stretched looks heavy; centered or left-aligned reads cleaner. (13.B can pick one; this isn't load-bearing.)
+
+### Settled questions
+
+- **AlertBanner moves to the operator window.** Phase 13.C. The "live-only pane stays uncluttered" framing is retired in exchange for keeping recording transport and recording alerts on the same window.
+
+### Phase 13 sequencing notes
+
+- **13.A first** since 13.B depends on the new widget classes existing.
+- **No coordinator-side changes.** `toggle_long_session_recording` and `mark_next_play` are unchanged. The change is purely UI-layer button placement + signal-wiring.
+- **No PlaybackController changes.** Both windows continue to drive their own controllers; the recording-transport buttons on the operator window route to the *coordinator*, not the operator controller.
+- **Tests should be the easiest part.** No state-machine logic moves; `MainWindow._render_state` math stays the same, just split across two branches.
 
 ---
 

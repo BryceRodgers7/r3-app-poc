@@ -134,7 +134,7 @@ class PlaybackController:
         # Slice 5.C: one SegmentDecoder per feed. Each owns its own
         # `cv2.VideoCapture` so per-feed seek state doesn't collide
         # when the multi-feed render decodes all tiles on a single
-        # replay tick. Live-only outputs (program window) skip the
+        # replay tick. Live-only outputs (operator window) skip the
         # allocation — they never replay.
         if live_only:
             self._segment_decoders: dict[str, SegmentDecoder] = {}

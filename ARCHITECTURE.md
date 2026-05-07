@@ -10,10 +10,10 @@ The current codebase is a good vertical slice, not a finished foundation. Severa
 
 - Pluggable ingest via `SourceInterface`
 - **Feed-oriented** graph: `FeedRegistry`, one `FeedRuntime` per enabled feed, each with its own `PipelineManager`
-- **Two output channels:** `ApplicationCoordinator` wires an **operator** and **program** `PlaybackController`, each with its own `MultiFeedOutputRenderer` and `MainWindow` (`main.py`). NATIVE feeds (NDI) render live preview directly via d3d11videosink into each window's child surface; replay flips the QStackedLayout to the QImage layer so segment-decoder frames stay visible (slice 3.A.3 retry). Multi-feed replay is synchronized via the per-app `SessionClock`; tiles for feeds without coverage at the rewound timestamp render a clamped freeze frame and surface a "FROZEN" badge in the corner (Phase 5 + Phase 6)
+- **Two output channels:** `ApplicationCoordinator` wires a **referee** and **operator** `PlaybackController`, each with its own `MultiFeedOutputRenderer` and `MainWindow` (`main.py`). NATIVE feeds (NDI) render live preview directly via d3d11videosink into each window's child surface; replay flips the QStackedLayout to the QImage layer so segment-decoder frames stay visible (slice 3.A.3 retry). Multi-feed replay is synchronized via the per-app `SessionClock`; tiles for feeds without coverage at the rewound timestamp render a clamped freeze frame and surface a "FROZEN" badge in the corner (Phase 5 + Phase 6)
 - **Native segmented recording:** each feed’s `PipelineManager` runs a `tee → valve → videoconvert → jpegenc → splitmuxsink` branch that writes one MKV per segment under `recording/<game_NNN>/<feed_id>/segment_NNNNN.mkv`. Each press of "Start game recording" allocates a fresh `game_NNN` subdir (`find_next_game_index` picks `max+1`); `fragment_index` resets to 0 each game (Phase 7.B-ext) — per-game folder isolation makes cross-game collisions impossible. Segment metadata (PTS span, frame count, file size, session-time bounds) is persisted to a SQLite `segments` table and indexed in-memory by `SegmentIndex` (slices 4.A / 4.B / 5.A). When the source has audio, the audio tee dynamically wires `audioconvert → audioresample → opusenc → splitmuxsink.audio_%u` once an audio buffer has been observed on the source's audio tee (slice 4.F + Phase 9.C); sources without audio produce video-only segments without operator intervention.
 - **Reliable Stop/Start cycle:** `disable_file_recording` emits `splitmuxsink.split-now` while the valve is still open, sleeps briefly so the next buffer triggers the rotation (matroskamux writes the EBML trailer for the in-flight segment), then closes the valve and drops the post-split throwaway pending segment so it doesn't end up in the DB. `enable_file_recording` rebuilds the splitmuxsink element from scratch via `_rebuild_splitmuxsink_locked` whenever `_recording_was_disabled` is set — state-cycling alone (NULL→PLAYING) wasn't enough because splitmuxsink retains an internal "current file" pointer across state changes, which used to make post-Start buffers append to the previous game's last file. **Known artifact:** the rotation triggered by `split-now` opens an empty/short segment file that's then dropped from the DB; the file remains on disk and is unwatchable, but the startup recovery scan quarantines or marks it dirty on next launch
-- **Transport overlay invariants:** `PlaybackController.seconds_behind_live` advances with wall-clock at sub-segment resolution by reading `SessionClock.now_session_time_ns()` (rather than per-segment PTS spans, which only update at 4s rotation boundaries). Slow-motion buttons (`Slow 1/2x`, `Slow 1/4x`) only change playback rate — they do NOT auto-rewind. Stopping recording clears stale "behind live" / "PAUSED" overlays back to fresh-startup state via `refresh_recording_state` → `_sync_replay_state_with_recording_locked`. Both operator and program controllers' `refresh_recording_state` is called immediately after `enable_file_recording` / `disable_file_recording` so overlays update without operator interaction
+- **Transport overlay invariants:** `PlaybackController.seconds_behind_live` advances with wall-clock at sub-segment resolution by reading `SessionClock.now_session_time_ns()` (rather than per-segment PTS spans, which only update at 4s rotation boundaries). Slow-motion buttons (`Slow 1/2x`, `Slow 1/4x`) only change playback rate — they do NOT auto-rewind. Stopping recording clears stale "behind live" / "PAUSED" overlays back to fresh-startup state via `refresh_recording_state` → `_sync_replay_state_with_recording_locked`. Both referee and operator controllers' `refresh_recording_state` is called immediately after `enable_file_recording` / `disable_file_recording` so overlays update without operator interaction
 - **Crash recovery on startup (slices 4.E + §11.4 + Phase 7.D):** `app/storage/session_recovery.py` marks unfinished sessions `DIRTY` in `session.json`, walks `<session>/recording/` recursively to find every `segment_*.mkv` (both the legacy flat layout and the per-game nested `recording/<game_NNN>/<feed_id>/` layout), validates each via `cv2.VideoCapture`, quarantines corrupt segments to `<session>/quarantine/<feed_id>/`, and inserts `dirty` rows for valid in-progress files that lost their finalize step. `app/ui/recovery_dialog.py` then surfaces each dirty session in a modal **Resume / End and finalize / Discard** prompt before any new session is created. Resume is offered only on the most recent dirty session (older ones get only End-and-finalize / Discard). On Resume, `ApplicationCoordinator._setup_resume_continuation` reuses the crashed `game_NNN/` folder, rebases `SessionClock` past the latest pre-crash segment so post-resume session-time values don't collide, and seeds the per-game-feed fragment counter past existing files. Pre-crash plays whose `end_session_time_ns` is NULL are auto-closed with `auto_closed_on_crash = TRUE`.
 - **Queue-depth observability and saturation health (slices 3.B + 3.C):** preview/record queues use explicit leaky / time-bounded policies; `TelemetryHub` samples per-feed queue depths once per tick, drives `RecordingState.RECORDING_ERROR` on sustained record saturation and `FeedState.DEGRADED` on sustained preview saturation, and surfaces transitional `python_push` feeds in a diagnostics-widget banner that escalates when `[app] app_mode = "production"`.
 - **Replay query layer:** `RecordingSegmentReplayStore` (slice 4.C) wraps `SegmentIndex` and is the single eligibility / lookup contract used by `PlaybackController`. Per-game scoping (Phase 7.B-ext) — a `_current_game_start_session_time_ns` filter set by `toggle_long_session_recording` keeps replay scoped to the current game across Stop/Start cycles.
@@ -110,7 +110,7 @@ This is the only contract `PlaybackController` uses for replay eligibility. The 
 
 Represents what one output is currently showing. **Today** the closest implementation is **`PlaybackController`** (one per window) plus its private state and `AppState` for the UI.
 
-There should be one logical playback session per output window, not one for the whole app (the app already runs two `PlaybackController` instances for operator vs program).
+There should be one logical playback session per output window, not one for the whole app (the app already runs two `PlaybackController` instances for referee vs operator).
 
 Responsibilities:
 
@@ -135,8 +135,8 @@ Responsibilities:
 
 There should be at least two output renderers:
 
-- `program_output`
-- `operator_output`
+- `operator_output` (live-only)
+- `referee_output` (replay-capable)
 
 ### `ApplicationCoordinator`
 
@@ -147,10 +147,10 @@ Responsibilities:
 - Start feeds (`FeedRuntime.start` per enabled feed)
 - Drive `RecordingManager.recording_state` transitions and call each feed’s `PipelineManager.enable_file_recording` / `disable_file_recording`
 - Own the shared `SegmentIndex` and `RecordingSegmentReplayStore`, threading the index into each `PipelineManager` for segment-row inserts
-- Own program and operator `PlaybackController` instances and route long recording / clip actions
-- Keep the program controller in **live-only** mode while the operator controller handles pause/replay
+- Own referee and operator `PlaybackController` instances and route long recording / clip actions
+- Keep the operator controller in **live-only** mode while the referee controller handles pause/replay
 
-`main.py` constructs the coordinator, two `MultiFeedOutputRenderer` instances, and two `MainWindow` instances (operator vs program).
+`main.py` constructs the coordinator, two `MultiFeedOutputRenderer` instances, and two `MainWindow` instances (referee vs operator).
 
 ## Window Model
 
@@ -177,9 +177,9 @@ Instead, each window should have:
 
 With that structure:
 
-- The operator can switch between live and replay without affecting program output
-- The program window can remain continuously live
-- A second window can be added safely without breaking the first one
+- The referee can switch between live and replay without affecting the operator's live feed
+- The operator window can remain continuously live
+- A third window can be added safely without breaking either of the first two
 
 ## Multi-Camera Growth Path
 
@@ -198,11 +198,11 @@ Conclusion:
 
 ## Multi-Window Growth Path
 
-**Implemented:** two top-level windows (operator + program), two `PlaybackController` instances, two `MultiFeedOutputRenderer` instances (`main.py`).
+**Implemented:** two top-level windows (referee + operator), two `PlaybackController` instances, two `MultiFeedOutputRenderer` instances (`main.py`).
 
 Remaining refinements:
 
-- Keep program and operator semantics clear as features grow (e.g. program never shows replay)
+- Keep referee and operator semantics clear as features grow (e.g. operator window never shows replay)
 - Ensure any new global shortcuts or focus behavior do not conflate the two outputs
 
 The earlier “single shared surface swapping live/replay” limitation is **no longer** the current architecture.
@@ -238,7 +238,7 @@ Conclusion:
 3. ~~Replace the rolling JPEG buffer with native segmented muxers~~ — `splitmuxsink` recording branch + `SegmentIndex` + `RecordingSegmentReplayStore` (slices 4.A / 4.B / 4.C)
 4. ~~Wire segment-file replay into the operator output~~ — `SegmentDecoder` + PTS-ns replay clock (slice 4.C.tail)
 5. Introduce `PlaybackSession` (or factor state out of `PlaybackController`) as an explicit per-output model
-6. ~~Per-window output renderers and a second window~~ — operator + program `MainWindow` and renderers
+6. ~~Per-window output renderers and a second window~~ — referee + operator `MainWindow` and renderers
 7. ~~Extend replay to multi-feed timeline semantics~~ — Phase 5 `SessionClock` + Phase 5.B / 5.C cross-feed render loop with §8.6.1 clamping. A few transport methods still lean on the primary feed; full removal is a small follow-up.
 8. ~~Convert NDI ingest to a native GStreamer source bin~~ — Phase 3.A.2 + 3.A.3 retry
 9. ~~Re-introduce embedded audio in segments~~ — slice 4.F + Phase 7.G + Phase 9.C dynamic wiring
@@ -247,7 +247,7 @@ Conclusion:
 
 ## Architectural Verdict
 
-The project remains a **vertical slice** in terms of product maturity, but the **object graph** has already moved to **feeds**, **per-feed media stacks**, and **two outputs** (operator + program). New work should build on that — avoid reintroducing a single global source or a single shared preview as the only output path.
+The project remains a **vertical slice** in terms of product maturity, but the **object graph** has already moved to **feeds**, **per-feed media stacks**, and **two outputs** (referee + operator). New work should build on that — avoid reintroducing a single global source or a single shared preview as the only output path.
 
 **Already aligned with the long-term story:**
 

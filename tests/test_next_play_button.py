@@ -69,7 +69,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = False
-        coord.operator_controller = mock.Mock()
+        coord.referee_controller = mock.Mock()
         coord.play_manager = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.mark_next_play()
@@ -80,7 +80,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = True
-        coord.operator_controller = mock.Mock()
+        coord.referee_controller = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.session_clock.now_session_time_ns.return_value = 12_000_000_000
         next_play = mock.Mock()
@@ -89,7 +89,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord.play_manager.mark_next_play.return_value = next_play
         coord.mark_next_play()
         coord.play_manager.mark_next_play.assert_called_once_with(12_000_000_000)
-        coord.operator_controller.signals.status_message.emit.assert_called_once_with(
+        coord.referee_controller.signals.status_message.emit.assert_called_once_with(
             "Play #3 started."
         )
 
@@ -100,7 +100,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = True
-        coord.operator_controller = mock.Mock()
+        coord.referee_controller = mock.Mock()
         coord.play_manager = None
         coord.session_clock = mock.Mock()
         # Should not raise.

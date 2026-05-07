@@ -281,7 +281,7 @@ class CoordinatorPreflightIntegrationTests(unittest.TestCase):
             "cam_b": mock.Mock(feed=_feeds(2)[1]),
         }
         coord._disk_usage_fn = lambda _: FakeUsage(free=free_bytes)
-        coord.operator_controller = mock.Mock()
+        coord.referee_controller = mock.Mock()
         return coord
 
     def test_pre_flight_refuses_start_with_low_free_space(self) -> None:
@@ -293,7 +293,7 @@ class CoordinatorPreflightIntegrationTests(unittest.TestCase):
             self.assertTrue(
                 log.has_open_event(category="disk_full_blocked", feed_id=None)
             )
-            coord.operator_controller.signals.status_message.emit.assert_called_once()
+            coord.referee_controller.signals.status_message.emit.assert_called_once()
 
     def test_pre_flight_passes_with_ample_free_space(self) -> None:
         with _TestLogPatch() as log:

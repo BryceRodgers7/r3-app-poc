@@ -246,8 +246,8 @@ class AppSettings:
 
     app_name: str = "Sports Replay POC"
     window_title: str = "Sports Replay Control"
+    referee_window_title: str = "Sports Replay Referee"
     operator_window_title: str = "Sports Replay Operator"
-    program_window_title: str = "Sports Replay Program"
     base_data_dir: Path = Path(r"C:\SportsReplay")
     # §13 / slice 3.C runtime mode. "development" silences the
     # python_push transitional warning in the diagnostics widget;
@@ -372,10 +372,10 @@ class AppSettings:
             settings.app_name = str(app_config["app_name"])
         if "window_title" in app_config:
             settings.window_title = str(app_config["window_title"])
+        if "referee_window_title" in app_config:
+            settings.referee_window_title = str(app_config["referee_window_title"])
         if "operator_window_title" in app_config:
             settings.operator_window_title = str(app_config["operator_window_title"])
-        if "program_window_title" in app_config:
-            settings.program_window_title = str(app_config["program_window_title"])
         if "base_data_dir" in app_config:
             settings.base_data_dir = Path(str(app_config["base_data_dir"]))
         if "app_mode" in app_config:

@@ -37,7 +37,7 @@ class MainWindow(QMainWindow):
         *,
         window_title: str | None = None,
         show_controls: bool = True,
-        program_live_only: bool = False,
+        live_only_window: bool = False,
         application_coordinator: ApplicationCoordinator | None = None,
     ) -> None:
         super().__init__()
@@ -45,7 +45,7 @@ class MainWindow(QMainWindow):
         self._controller = controller
         self._output_renderer = output_renderer
         self._show_controls = show_controls
-        self._program_live_only = program_live_only
+        self._live_only_window = live_only_window
         self._application_coordinator = application_coordinator
 
         self.setWindowTitle(window_title or settings.window_title)
@@ -62,7 +62,7 @@ class MainWindow(QMainWindow):
         # `python_push` mode (synthetic test source) stay in the qimage
         # path. The `force_python_push_preview` setting overrides this
         # to keep everyone on the qimage path.
-        role = "program" if program_live_only else "operator"
+        role = "operator" if live_only_window else "referee"
         for feed_id, widget in self.video_panel.widgets_by_feed_id.items():
             self._output_renderer.bind_feed_widget(feed_id, widget)
             if (
@@ -103,9 +103,12 @@ class MainWindow(QMainWindow):
                 settings=settings,
             )
 
-        # Phase 10.A: foreground §11.3 health warnings on the operator
-        # window. The program window (`show_controls=False`) is the
-        # on-air pane and stays uncluttered.
+        # Phase 10.A: foreground §11.3 health warnings on the referee
+        # window today. Phase 13.C will move the banner to the operator
+        # (live-only) window since that's where the recording transport
+        # lives — the person who can act on a recording-error needs to
+        # see it. Until 13.C lands the banner stays gated on
+        # `show_controls`, which today maps to the referee window.
         self.alert_banner: AlertBanner | None = (
             AlertBanner(parent=self) if show_controls else None
         )
@@ -171,8 +174,11 @@ class MainWindow(QMainWindow):
             )
         # Phase 7.H.2: Next Play button is only meaningful while
         # recording — outside RECORDING there's no current play to
-        # advance. `controls_widget` is None on the program-live-only
-        # MainWindow so guard the call.
+        # advance. `controls_widget` is None on the operator (live-only)
+        # MainWindow so guard the call. (After Phase 13.B: this guard
+        # changes shape — `controls_role="operator"` builds a smaller
+        # ProgramControlsWidget with Next Play, and the gating moves
+        # there.)
         if self.controls_widget is not None:
             self.controls_widget.set_recording_state(state.is_recording)
         show_embedded_video = state.current_playback_mode in {
@@ -183,7 +189,7 @@ class MainWindow(QMainWindow):
         self.video_panel.set_playback_overlay(state.playback_overlay)
         self.video_panel.apply_tile_visibility(
             state.current_playback_mode,
-            program_live_only=self._program_live_only,
+            live_only_window=self._live_only_window,
         )
         self.video_panel.apply_freeze_indicators(state.feeds_in_freeze_frame)
         if not show_embedded_video:

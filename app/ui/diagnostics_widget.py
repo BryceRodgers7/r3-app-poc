@@ -109,7 +109,7 @@ class DiagnosticsWidget(QFrame):
         if coord is not None:
             app_state = coord.get_app_state().value
             recording_state = coord._recording_manager.recording_state.state.value
-            replay_sm = coord.operator_controller.replay_state
+            replay_sm = coord.referee_controller.replay_state
             replay_state = replay_sm.state.value if replay_sm is not None else "-"
             self._app_state_label.setText(
                 f"app: {app_state}  rec: {recording_state}  replay: {replay_state}"
@@ -211,7 +211,7 @@ class DiagnosticsWidget(QFrame):
         if coord is None:
             self._replay_lag_label.setText("replay lag: (no coordinator)")
             return
-        ui_state = coord.operator_controller.get_state()
+        ui_state = coord.referee_controller.get_state()
         if not ui_state.replay_available:
             self._replay_lag_label.setText("replay lag: (no segments yet)")
             return

@@ -32,8 +32,8 @@ class _ShutdownDrainTests(unittest.TestCase):
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._shutting_down = False
         coord.telemetry_hub = mock.Mock()
+        coord.referee_controller = mock.Mock()
         coord.operator_controller = mock.Mock()
-        coord.program_controller = mock.Mock()
         coord._session_manager = mock.Mock()
         coord._session_manager.get_active_session_state.return_value = None
         coord.replay_store = mock.Mock()

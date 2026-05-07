@@ -171,8 +171,8 @@ surface, a per-feed `Recorder` class, or a per-feed `ReplayStore`
 instance — the Phase 4.D removal of those was deliberate.
 
 The `PreviewOutput` / `OutputRenderer` split is also intentional: a
-feed's `PreviewOutput` is its own ingest sink, while operator and
-program windows render via `MultiFeedOutputRenderer`. They are not
+feed's `PreviewOutput` is its own ingest sink, while referee and
+operator windows render via `MultiFeedOutputRenderer`. They are not
 collapsible.
 
 ---
@@ -492,8 +492,8 @@ in this exact order:
    stay at `"stopped"` while game N+1 is actively recording, which
    is misleading for any external tool reading the manifest.
 8. **Refresh both controllers' overlays.**
-   `operator_controller.refresh_recording_state()` +
-   `program_controller.refresh_recording_state()` so the LIVE overlay
+   `referee_controller.refresh_recording_state()` +
+   `operator_controller.refresh_recording_state()` so the LIVE overlay
    updates immediately rather than waiting for the next live frame.
 
 `pipeline_manager.enable_file_recording` itself:
@@ -1183,15 +1183,17 @@ is needed — first `time_block(name)` call creates the sampler.
 
 ---
 
-## 11. Operator UI invariants
+## 11. UI invariants (referee + operator windows)
 
 ### 11.1 Two output channels
 
-Operator and program windows each have their own `PlaybackController`,
-`MultiFeedOutputRenderer`, and `MainWindow`. Program is `live_only`;
-only the operator has pause / replay / slow / jump-to-live / Replay
-Play. Long recording continues regardless of what either window is
-showing.
+Referee and operator windows each have their own `PlaybackController`,
+`MultiFeedOutputRenderer`, and `MainWindow`. The operator window is
+`live_only` (locked to LIVE, used by the operator who runs Start/Stop
++ Next Play and watches the feed continuously); only the referee
+window has pause / replay / slow / jump-to-live / Replay Play (used
+occasionally by a referee to review a play). Long recording continues
+regardless of what either window is showing.
 
 ### 11.2 Native preview path (slice 3.A.3 retry)
 
@@ -1303,7 +1305,7 @@ current behavior; on the architecture-doc "Still open" list.
 - **`app/tools/`** — post-session processor entry points
   (`post_session_processor.py`, `long_form_export.py`,
   `plays_json_export.py`).
-- **`app/ui/`** — `MainWindow` (re-used for operator + program with
+- **`app/ui/`** — `MainWindow` (re-used for referee + operator with
   flags), `controls_widget`, `multi_feed_video_panel`,
   `status_bar_widget`, `video_widget`, `diagnostics_widget`,
   `recovery_dialog`.

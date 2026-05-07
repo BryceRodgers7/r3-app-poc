@@ -93,7 +93,7 @@ class MultiFeedVideoPanel(QWidget):
         self,
         mode: PlaybackMode,
         *,
-        program_live_only: bool,
+        live_only_window: bool,
     ) -> None:
         """Toggle each tile between active preview styling and placeholder-style chrome.
 
@@ -102,7 +102,7 @@ class MultiFeedVideoPanel(QWidget):
         (REPLAY/PAUSED — replay frames arrive via `display_frame`).
         """
         show_video = True
-        if program_live_only:
+        if live_only_window:
             show_video = mode is not PlaybackMode.SOURCE_LOST
         else:
             show_video = mode in {

@@ -49,43 +49,43 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
     # never has to think about dirty manifests on disk.
     resume_session_id = _run_startup_recovery_flow(settings, metadata_db)
 
+    referee_output = MultiFeedOutputRenderer()
     operator_output = MultiFeedOutputRenderer()
-    program_output = MultiFeedOutputRenderer()
     coordinator = build_default_application_coordinator(
         settings,
         session_manager,
+        referee_renderer=referee_output,
         operator_renderer=operator_output,
-        program_renderer=program_output,
     )
     enabled_feeds = coordinator.feed_registry.get_enabled_feeds()
 
+    referee_window = MainWindow(
+        settings=settings,
+        controller=coordinator.referee_controller,
+        output_renderer=referee_output,
+        feeds=enabled_feeds,
+        window_title=settings.referee_window_title,
+        show_controls=True,
+        live_only_window=False,
+        application_coordinator=coordinator,
+    )
     operator_window = MainWindow(
         settings=settings,
         controller=coordinator.operator_controller,
         output_renderer=operator_output,
         feeds=enabled_feeds,
         window_title=settings.operator_window_title,
-        show_controls=True,
-        program_live_only=False,
-        application_coordinator=coordinator,
-    )
-    program_window = MainWindow(
-        settings=settings,
-        controller=coordinator.program_controller,
-        output_renderer=program_output,
-        feeds=enabled_feeds,
-        window_title=settings.program_window_title,
         show_controls=False,
-        program_live_only=True,
-        # Slice 3.A.3 retry: the program window also needs the coordinator
+        live_only_window=True,
+        # Slice 3.A.3 retry: the operator window also needs the coordinator
         # so its MainWindow.__init__ runs the native-preview bind path.
-        # Without this, only the operator sink got a window handle and the
-        # program sink fell back to creating its own d3d11 top-level window.
+        # Without this, only the referee sink got a window handle and the
+        # operator sink fell back to creating its own d3d11 top-level window.
         application_coordinator=coordinator,
     )
     coordinator.initialize(resume_session_id=resume_session_id)
     qt_app.aboutToQuit.connect(coordinator.shutdown)
-    return qt_app, coordinator, [operator_window, program_window]
+    return qt_app, coordinator, [referee_window, operator_window]
 
 
 def _configure_logging(settings: AppSettings) -> None:

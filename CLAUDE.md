@@ -12,9 +12,14 @@ recording, replay-from-segments). Production ingest is **NDI-only**
 dev fallback for camera-less work. Production NDI ingest is fully native
 (Phase 3.A.2 + 3.A.3 retry — d3d11videosink preview + native source
 chain); the synthetic source intentionally stays on the python_push path.
-Two top-level windows (operator + program) drive two independent
+Two top-level windows (referee + operator) drive two independent
 `PlaybackController` instances over a shared graph of per-feed
-`FeedRuntime`s.
+`FeedRuntime`s. The **referee window** hosts the replay/review
+transport (Pause, Rewind, Slow-mo, Step, Replay Play, Jump to Live)
+and is used occasionally by a referee to review a play. The
+**operator window** hosts the live-only feed and the recording
+transport (Start/Stop game, Next Play); an operator sits in front
+of it for the whole session.
 
 ## Where to find things
 
@@ -82,8 +87,8 @@ is ignored and at least one feed must have `enabled = true`. See
   `RecordingSegmentReplayStore`. See `IMPLEMENTATION.md` §2 for the
   full list of seams.
 - **The `PreviewOutput` / `OutputRenderer` split is intentional** — a
-  feed's `PreviewOutput` is its own ingest sink, while operator and
-  program windows render via `MultiFeedOutputRenderer`. Don't
+  feed's `PreviewOutput` is its own ingest sink, while referee and
+  operator windows render via `MultiFeedOutputRenderer`. Don't
   collapse them.
 - **The synthetic source in `app/media/test_source.py` is the only
   non-NDI path the app builds.** It is the dev fallback for

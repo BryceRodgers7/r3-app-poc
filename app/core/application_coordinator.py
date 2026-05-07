@@ -74,8 +74,8 @@ class ApplicationCoordinator:
         feed_runtimes: dict[str, FeedRuntime],
         recording_manager: RecordingManager,
         telemetry_hub: TelemetryHub,
+        referee_renderer: MultiFeedOutputRenderer,
         operator_renderer: MultiFeedOutputRenderer,
-        program_renderer: MultiFeedOutputRenderer,
         segment_index: SegmentIndex | None = None,
         session_clock: SessionClock | None = None,
         disk_budget: DiskBudgetAssessment | None = None,
@@ -88,8 +88,8 @@ class ApplicationCoordinator:
         self._feed_runtimes = feed_runtimes
         self._recording_manager = recording_manager
         self.telemetry_hub = telemetry_hub
+        self.referee_renderer = referee_renderer
         self.operator_renderer = operator_renderer
-        self.program_renderer = program_renderer
         # Phase 7.A: stashed for `DiagnosticsWidget` and the health
         # event emitted from `initialize()`. None when the coordinator
         # was constructed without budget validation (older test paths).
@@ -132,6 +132,18 @@ class ApplicationCoordinator:
         # runaway step delta.
         target_fps = float(settings.target_fps) if settings.target_fps > 0 else 30.0
         frame_period_ns = max(1, int(round(1_000_000_000 / target_fps)))
+        self.referee_controller = PlaybackController(
+            feed_runtimes=enabled_runtimes,
+            output_renderer=referee_renderer,
+            recording_manager=recording_manager,
+            replay_store=self.replay_store,
+            default_source_name=primary_feed.display_name,
+            session_role="referee",
+            live_only=False,
+            session_clock=self.session_clock,
+            play_manager=self.play_manager,
+            frame_period_ns=frame_period_ns,
+        )
         self.operator_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,
             output_renderer=operator_renderer,
@@ -139,18 +151,6 @@ class ApplicationCoordinator:
             replay_store=self.replay_store,
             default_source_name=primary_feed.display_name,
             session_role="operator",
-            live_only=False,
-            session_clock=self.session_clock,
-            play_manager=self.play_manager,
-            frame_period_ns=frame_period_ns,
-        )
-        self.program_controller = PlaybackController(
-            feed_runtimes=enabled_runtimes,
-            output_renderer=program_renderer,
-            recording_manager=recording_manager,
-            replay_store=self.replay_store,
-            default_source_name=primary_feed.display_name,
-            session_role="program",
             live_only=True,
             session_clock=self.session_clock,
             play_manager=self.play_manager,
@@ -179,7 +179,7 @@ class ApplicationCoordinator:
     ) -> None:
         """Bind a Qt window handle to the per-feed native preview sink.
 
-        `role` is `"operator"` or `"program"`. No-op when the feed's source
+        `role` is `"referee"` or `"operator"`. No-op when the feed's source
         runs in `python_push` mode (those sources render via the legacy
         QImage path and don't have native preview sinks to bind), or when
         the 3.A.3 `force_python_push_preview` escape hatch is on.
@@ -208,8 +208,8 @@ class ApplicationCoordinator:
             runtime.feed_state.state for runtime in self._feed_runtimes.values()
         ]
         replay_state = (
-            self.operator_controller.replay_state.state
-            if self.operator_controller.replay_state is not None
+            self.referee_controller.replay_state.state
+            if self.referee_controller.replay_state is not None
             else None
         )
         return compute_app_state(
@@ -226,7 +226,7 @@ class ApplicationCoordinator:
             return
         session_paths = self._session_manager.get_active_session_paths()
         if session_paths is None:
-            self.operator_controller.signals.status_message.emit("No active session; cannot record.")
+            self.referee_controller.signals.status_message.emit("No active session; cannot record.")
             return
         recording_sm = self._recording_manager.recording_state
         session_sm = self._session_manager.get_active_session_state()
@@ -250,9 +250,9 @@ class ApplicationCoordinator:
             self.replay_store.set_current_game_start_session_time(None)
             if session_sm is not None and session_sm.state == SessionState.RECORDING:
                 session_sm.transition_to(SessionState.STOPPED)
+            self.referee_controller.refresh_recording_state()
             self.operator_controller.refresh_recording_state()
-            self.program_controller.refresh_recording_state()
-            self.operator_controller.signals.status_message.emit("Game recording stopped.")
+            self.referee_controller.signals.status_message.emit("Game recording stopped.")
             return
         # Phase 10.C: pre-flight disk-space check before any state moves.
         # Refuses Start when free space wouldn't cover one grace window
@@ -355,9 +355,9 @@ class ApplicationCoordinator:
             SessionState.STOPPED,
         }:
             session_sm.transition_to(SessionState.RECORDING)
+        self.referee_controller.refresh_recording_state()
         self.operator_controller.refresh_recording_state()
-        self.program_controller.refresh_recording_state()
-        self.operator_controller.signals.status_message.emit("Game recording started.")
+        self.referee_controller.signals.status_message.emit("Game recording started.")
 
     def mark_next_play(self) -> None:
         """Close the currently-open play and open the next one (Phase 7.H.1).
@@ -377,7 +377,7 @@ class ApplicationCoordinator:
         if getattr(self, "_shutting_down", False):
             return
         if not self._recording_manager.is_any_recording():
-            self.operator_controller.signals.status_message.emit(
+            self.referee_controller.signals.status_message.emit(
                 "Start game recording before marking a play boundary."
             )
             return
@@ -387,7 +387,7 @@ class ApplicationCoordinator:
             self.session_clock.now_session_time_ns()
         )
         if next_play is not None:
-            self.operator_controller.signals.status_message.emit(
+            self.referee_controller.signals.status_message.emit(
                 f"Play #{next_play.play_number} started."
             )
 
@@ -431,8 +431,8 @@ class ApplicationCoordinator:
         self._emit_disk_budget_health_event()
         for runtime in self._feed_runtimes.values():
             runtime.start(session_paths)
+        self.referee_controller.initialize(session_paths.session_id)
         self.operator_controller.initialize(session_paths.session_id)
-        self.program_controller.initialize(session_paths.session_id)
         self.telemetry_hub.set_disk_path(self._settings.base_data_dir)
         self.telemetry_hub.start(_qt_periodic_registrar)
         self._session_started = True
@@ -474,7 +474,7 @@ class ApplicationCoordinator:
                     "estimated_mb_s": round(result.estimated_mb_s, 3),
                 },
             )
-        self.operator_controller.signals.status_message.emit(
+        self.referee_controller.signals.status_message.emit(
             "Cannot start recording: insufficient free disk space."
         )
         LOGGER.warning("disk preflight refused Start: %s", message)
@@ -665,8 +665,8 @@ class ApplicationCoordinator:
         """
         self._shutting_down = True
         self.telemetry_hub.stop()
+        self.referee_controller.shutdown()
         self.operator_controller.shutdown()
-        self.program_controller.shutdown()
         self._drain_active_recording_locked()
         for runtime in self._feed_runtimes.values():
             runtime.stop()
@@ -732,8 +732,8 @@ def build_default_application_coordinator(
     settings: AppSettings,
     session_manager: SessionManager,
     *,
+    referee_renderer: MultiFeedOutputRenderer,
     operator_renderer: MultiFeedOutputRenderer,
-    program_renderer: MultiFeedOutputRenderer,
 ) -> ApplicationCoordinator:
     """Build the default coordinator graph for the current app."""
     feed_registry = FeedRegistry.build_default(settings)
@@ -847,8 +847,8 @@ def build_default_application_coordinator(
         feed_runtimes=feed_runtimes,
         recording_manager=recording_manager,
         telemetry_hub=telemetry_hub,
+        referee_renderer=referee_renderer,
         operator_renderer=operator_renderer,
-        program_renderer=program_renderer,
         segment_index=segment_index,
         session_clock=session_clock,
         disk_budget=disk_budget,
