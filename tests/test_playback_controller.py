@@ -1002,5 +1002,245 @@ class MultiFeedRenderTests(unittest.TestCase):
         self.assertEqual(self.controller.get_state().feeds_in_freeze_frame, ())
 
 
+class StepFramesTests(unittest.TestCase):
+    """Phase 12.A: PlaybackController.step_frames behavior matrix.
+
+    Uses a 100 ms frame period (10 fps) so step deltas land at clean
+    100 ms boundaries within the 5×4 s segment fixture from
+    `PlaybackControllerTests` (session-time range 0..20 s).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._app = QCoreApplication.instance() or QCoreApplication([])
+
+    _FRAME_PERIOD_NS = 100_000_000  # 100 ms = 10 fps
+
+    def setUp(self) -> None:
+        self._temp_dir = TemporaryDirectory()
+        root_dir = Path(self._temp_dir.name) / "session_001"
+        recording_dir = root_dir / "recording"
+        for path in (root_dir, recording_dir):
+            path.mkdir(parents=True, exist_ok=True)
+
+        self.session_paths = SessionPaths(
+            session_id="session_001",
+            root_dir=root_dir,
+            recording_dir=recording_dir,
+        )
+        self.feed = FeedDefinition(feed_id="feed_main", display_name="Fake Source")
+        fake_source = _FakeSource(self.feed.feed_id)
+        fake_pipeline = _FakePipelineManager(self.feed.feed_id)
+        self.recording_manager = RecordingManager()
+
+        self.segment_index = SegmentIndex()
+        for i in range(5):
+            self.segment_index.add(
+                _make_segment(fragment_index=i, start_pts_ns=i * 4_000_000_000)
+            )
+        self.replay_store = RecordingSegmentReplayStore(self.segment_index)
+        self.stub_decoder = _StubSegmentDecoder(self.feed.feed_id, self.feed.display_name)
+
+        self.runtime = FeedRuntime(
+            feed=self.feed,
+            source=fake_source,
+            pipeline_manager=fake_pipeline,
+        )
+        self.runtime.start(self.session_paths)
+
+        self.renderer = _FakeRenderer()
+        self.controller = self._build_controller(live_only=False)
+        self.controller.initialize(self.session_paths.session_id)
+        self.status_messages: list[str] = []
+        self.controller.signals.status_message.connect(self.status_messages.append)
+
+    def tearDown(self) -> None:
+        self.controller.shutdown()
+        self._temp_dir.cleanup()
+
+    def _build_controller(self, *, live_only: bool) -> PlaybackController:
+        return PlaybackController(
+            feed_runtimes=[self.runtime],
+            output_renderer=self.renderer,
+            recording_manager=self.recording_manager,
+            replay_store=self.replay_store,
+            default_source_name="Fake Source",
+            session_role="operator",
+            live_only=live_only,
+            decoder_factory=lambda *_args: self.stub_decoder,
+            frame_period_ns=self._FRAME_PERIOD_NS,
+        )
+
+    def _force_recording_state(self) -> None:
+        self.recording_manager.recording_state.force(RecordingState.RECORDING)
+        self.controller.refresh_recording_state()
+
+    def _enter_paused_at(self, session_time_ns: int) -> None:
+        """Land in PAUSED at a known session-time inside the 0..20 s range."""
+        self._force_recording_state()
+        # Rewind from live, then pause — pause anchors on the operator's
+        # current playback position when in REPLAY.
+        self.controller.rewind_10_seconds()  # → 10 s, REPLAYING
+        # Move the playback cursor without going through transport so we
+        # can land at any test-chosen session-time. Mirrors the pattern
+        # other tests use for setting up a known mid-timeline position.
+        with self.controller._lock:
+            self.controller._playback_session_time_ns = session_time_ns
+        self.controller.pause_playback()
+
+    # ------------------------------------------------------------------
+    # Forward / backward arithmetic
+    # ------------------------------------------------------------------
+
+    def test_step_forward_from_paused_advances_by_n_frames(self) -> None:
+        self._enter_paused_at(10_000_000_000)
+        self.assertEqual(self.controller._playback_session_time_ns, 10_000_000_000)
+        self.controller.step_frames(5)
+        self.assertEqual(
+            self.controller._playback_session_time_ns,
+            10_000_000_000 + 5 * self._FRAME_PERIOD_NS,
+        )
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(self.controller._playback_rate, 0.0)
+        self.assertEqual(
+            self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED
+        )
+
+    def test_step_backward_from_paused_retreats_by_n_frames(self) -> None:
+        self._enter_paused_at(10_000_000_000)
+        self.controller.step_frames(-7)
+        self.assertEqual(
+            self.controller._playback_session_time_ns,
+            10_000_000_000 - 7 * self._FRAME_PERIOD_NS,
+        )
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+
+    def test_step_zero_delta_is_noop(self) -> None:
+        self._enter_paused_at(10_000_000_000)
+        before = self.controller._playback_session_time_ns
+        before_decode_count = len(self.stub_decoder.decode_calls)
+        self.status_messages.clear()
+        self.controller.step_frames(0)
+        self.assertEqual(self.controller._playback_session_time_ns, before)
+        self.assertEqual(len(self.stub_decoder.decode_calls), before_decode_count)
+        self.assertEqual(self.status_messages, [])
+
+    # ------------------------------------------------------------------
+    # FSM bouncing
+    # ------------------------------------------------------------------
+
+    def test_step_from_replaying_lands_in_paused(self) -> None:
+        self._force_recording_state()
+        self.controller.rewind_10_seconds()  # → 10 s, REPLAYING
+        self.assertEqual(self.controller.replay_state.state, ReplayState.REPLAYING)
+        self.controller.step_frames(3)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(self.controller._playback_rate, 0.0)
+        self.assertEqual(
+            self.controller._playback_session_time_ns,
+            10_000_000_000 + 3 * self._FRAME_PERIOD_NS,
+        )
+        self.assertFalse(self.controller._replay_timer.isActive())
+
+    def test_step_from_slow_motion_lands_in_paused(self) -> None:
+        self._force_recording_state()
+        self.controller.set_playback_rate(0.5)  # snaps to latest=20 s, SLOW_MOTION
+        self.assertEqual(self.controller.replay_state.state, ReplayState.SLOW_MOTION)
+        # Step backward so we don't immediately clamp at the live edge.
+        self.controller.step_frames(-4)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(
+            self.controller._playback_session_time_ns,
+            20_000_000_000 - 4 * self._FRAME_PERIOD_NS,
+        )
+
+    def test_step_from_live_while_recording_snaps_then_steps(self) -> None:
+        """First step from live anchors at latest_replayable, then applies delta."""
+        self._force_recording_state()
+        self.assertEqual(
+            self.controller.replay_state.state, ReplayState.LIVE_WHILE_RECORDING
+        )
+        self.controller.step_frames(-3)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        # latest_replayable = 20 s; delta = -3 frames = -300 ms.
+        self.assertEqual(
+            self.controller._playback_session_time_ns,
+            20_000_000_000 - 3 * self._FRAME_PERIOD_NS,
+        )
+
+    # ------------------------------------------------------------------
+    # Clamping
+    # ------------------------------------------------------------------
+
+    def test_step_beyond_live_edge_clamps_with_held_status(self) -> None:
+        # Pause near the live edge.
+        self._enter_paused_at(19_950_000_000)  # 50 ms before live
+        self.status_messages.clear()
+        self.controller.step_frames(10)  # +1 s → would land at 20.95 s
+        self.assertEqual(self.controller._playback_session_time_ns, 20_000_000_000)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertIn("Step held at live edge", self.status_messages)
+
+    def test_step_before_start_clamps_with_held_status(self) -> None:
+        self._enter_paused_at(50_000_000)  # 50 ms after session start
+        self.status_messages.clear()
+        self.controller.step_frames(-10)  # -1 s → would land at -950 ms
+        self.assertEqual(self.controller._playback_session_time_ns, 0)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertIn("Step held at start of recording", self.status_messages)
+
+    # ------------------------------------------------------------------
+    # Gating
+    # ------------------------------------------------------------------
+
+    def test_step_rejected_when_not_recording(self) -> None:
+        # No _force_recording_state — replay isn't allowed.
+        before_state = self.controller.replay_state.state
+        self.status_messages.clear()
+        self.controller.step_frames(5)
+        # Position unchanged, FSM unchanged.
+        self.assertIsNone(self.controller._playback_session_time_ns)
+        self.assertEqual(self.controller.replay_state.state, before_state)
+        self.assertTrue(
+            any("Replay unavailable" in m for m in self.status_messages),
+            f"expected 'Replay unavailable' status, got {self.status_messages}",
+        )
+
+    def test_step_rejected_on_live_only_output(self) -> None:
+        # Build a sibling live_only controller against the same fixture.
+        live_only = self._build_controller(live_only=True)
+        try:
+            live_only.initialize(self.session_paths.session_id)
+            messages: list[str] = []
+            live_only.signals.status_message.connect(messages.append)
+            self.recording_manager.recording_state.force(RecordingState.RECORDING)
+            live_only.refresh_recording_state()
+            live_only.step_frames(3)
+            # No replay state machine on a live_only controller.
+            self.assertIsNone(live_only.replay_state)
+            self.assertTrue(
+                any("locked to live" in m for m in messages),
+                f"expected 'locked to live' status, got {messages}",
+            )
+        finally:
+            live_only.shutdown()
+
+    def test_step_rejected_when_replay_degraded(self) -> None:
+        self._force_recording_state()
+        # LIVE_WHILE_RECORDING → REPLAY_DEGRADED is in _REPLAY_TRANSITIONS.
+        self.controller.replay_state.transition_to(ReplayState.REPLAY_DEGRADED)
+        self.status_messages.clear()
+        self.controller.step_frames(5)
+        # FSM stays in REPLAY_DEGRADED; no playback movement.
+        self.assertEqual(
+            self.controller.replay_state.state, ReplayState.REPLAY_DEGRADED
+        )
+        self.assertIsNone(self.controller._playback_session_time_ns)
+        self.assertEqual(
+            self.controller.get_state().error_message,
+            "Replay degraded; step unavailable.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,11 @@ LOGGER = logging.getLogger(__name__)
 # current playback position.
 _REWIND_10S_NS = 10 * 1_000_000_000
 
+# Phase 12.A default — 30 fps. The coordinator overrides this from
+# `AppSettings.target_fps` in 12.B; tests and any caller that doesn't
+# configure it fall back to the 30 fps assumption.
+_DEFAULT_FRAME_PERIOD_NS = 33_333_333
+
 
 class PlaybackController:
     """Own playback state for one output session.
@@ -69,6 +74,7 @@ class PlaybackController:
         decoder_factory: Callable[[str, str], SegmentDecoder] | None = None,
         session_clock: SessionClock | None = None,
         play_manager: "PlayManager | None" = None,
+        frame_period_ns: int = _DEFAULT_FRAME_PERIOD_NS,
     ) -> None:
         if not feed_runtimes:
             raise ValueError("PlaybackController requires at least one FeedRuntime.")
@@ -93,6 +99,11 @@ class PlaybackController:
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
+        # Phase 12.A: replay clock delta per step button press. Set once
+        # at construction (the coordinator computes from
+        # `settings.target_fps`); `step_frames` multiplies by the
+        # operator's `frame_delta`.
+        self._frame_period_ns = max(1, int(frame_period_ns))
         # Phase 10.F: set by `shutdown()` so transport methods that race
         # the teardown become no-ops instead of touching half-torn-down
         # decoders / timers.
@@ -379,6 +390,97 @@ class PlaybackController:
         if target_session_time is not None:
             self._render_at_session_time_ns(target_session_time)
         self._emit_state(f"Replay speed {self._playback_rate:.2f}x")
+
+    def step_frames(self, frame_delta: int) -> None:
+        """Phase 12.A: jog the replay clock by `frame_delta` frames.
+
+        Positive `frame_delta` advances forward; negative retreats.
+        Frame duration is `frame_period_ns` (set at construction from
+        `settings.target_fps`). Always lands in PAUSED — slow-motion is
+        a separate gesture. Targets outside the replayable range clamp
+        to the boundary and surface a "held at edge" status so the
+        operator sees why a click did nothing.
+
+        Entry behavior by current `ReplayState`:
+          - LIVE_WHILE_RECORDING: snap to `latest_replayable` (matching
+            `set_playback_rate`'s entering-from-live snap), bounce to
+            PAUSED, then apply the delta.
+          - REPLAYING / SLOW_MOTION / SEEKING: bounce to PAUSED, apply.
+          - PAUSED: stay in PAUSED (same-state transition is a no-op),
+            apply.
+          - JUMPING_TO_LIVE / REPLAY_DEGRADED: rejected — those have no
+            direct path to PAUSED in `_REPLAY_TRANSITIONS` and aren't
+            states the operator should be jogging from.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if frame_delta == 0:
+            return
+        if self._live_only:
+            self._emit_state("This output is locked to live.")
+            return
+        if not self._replay_actions_allowed():
+            self._emit_state("Replay unavailable: start game recording first.")
+            return
+        clamped_at_live_edge = False
+        clamped_at_start = False
+        with self._lock:
+            assert self.replay_state is not None
+            current_replay = self.replay_state.state
+            if current_replay in {
+                ReplayState.JUMPING_TO_LIVE,
+                ReplayState.REPLAY_DEGRADED,
+            }:
+                self._state.error_message = "Replay degraded; step unavailable."
+                self._emit_state()
+                return
+            # Anchor: from LIVE_WHILE_RECORDING (or any state without an
+            # operator playback position yet) snap to latest_replayable
+            # so the first step from live lands at "now − frame_delta
+            # frames". From any active replay state, anchor on the
+            # operator's current position so repeated step clicks
+            # accumulate.
+            if (
+                current_replay == ReplayState.LIVE_WHILE_RECORDING
+                or self._playback_session_time_ns is None
+            ):
+                _, latest = self._replay_store.available_session_time_range()
+                if latest is None:
+                    self._state.error_message = "Replay frame is not available yet."
+                    self._emit_state()
+                    return
+                anchor_session_time_ns = latest
+            else:
+                anchor_session_time_ns = self._playback_session_time_ns
+            target_session_time_ns = (
+                anchor_session_time_ns + frame_delta * self._frame_period_ns
+            )
+            earliest, latest = self._replay_store.available_session_time_range()
+            if latest is not None and target_session_time_ns > latest:
+                target_session_time_ns = latest
+                clamped_at_live_edge = True
+            if earliest is not None and target_session_time_ns < earliest:
+                target_session_time_ns = earliest
+                clamped_at_start = True
+            # Bounce the FSM to PAUSED. LIVE_WHILE_RECORDING / SEEKING /
+            # REPLAYING / SLOW_MOTION → PAUSED is allowed directly per
+            # `_REPLAY_TRANSITIONS`; PAUSED → PAUSED is a no-op handled
+            # by `StateMachine.transition_to`.
+            self.replay_state.transition_to(ReplayState.PAUSED)
+            self._playback_session_time_ns = target_session_time_ns
+            self._playback_rate = 0.0
+            self._state.current_playback_mode = PlaybackMode.PAUSED
+            self._state.error_message = None
+            self._stop_replay_clock_locked()
+            self._update_state_timestamps_locked()
+        self._render_at_session_time_ns(target_session_time_ns)
+        if clamped_at_live_edge:
+            self._emit_state("Step held at live edge")
+        elif clamped_at_start:
+            self._emit_state("Step held at start of recording")
+        else:
+            sign = "+" if frame_delta > 0 else "-"
+            self._emit_state(f"Step {sign}{abs(frame_delta)} frames")
 
     def set_source_lost(self, message: str = "Source signal lost.") -> None:
         """Reflect that the live source is no longer available."""
