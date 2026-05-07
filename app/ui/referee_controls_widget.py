@@ -1,4 +1,12 @@
-"""Touch-friendly playback controls."""
+"""Referee-window playback controls (Phase 13.A).
+
+Hosts the replay / review transport that an occasional-use referee
+operates: Pause, Rewind 10s, Replay Play, Slow 1/2x, Slow 1/4x,
+Step ◀, Step ▶, Jump to Live. The persistent operator's recording
+transport (Start/Stop game, Next Play) lives on `OperatorControlsWidget`
+in the operator (live-only) window — see `r3_app_architecture.md`
+§Phase 13.
+"""
 
 from __future__ import annotations
 
@@ -6,18 +14,14 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 
 
-class ControlsWidget(QWidget):
-    """Large buttons for pause, rewind, and jump-to-live actions."""
+class RefereeControlsWidget(QWidget):
+    """Large buttons for the referee's replay-review transport."""
 
     pause_requested = Signal()
     rewind_requested = Signal()
     live_requested = Signal()
     half_speed_requested = Signal()
     quarter_speed_requested = Signal()
-    long_recording_toggle_requested = Signal()
-    # Phase 7.H.2: was `short_segment_advance_requested` (a slice 4.D
-    # no-op stub). Now wired to `coordinator.mark_next_play`.
-    next_play_requested = Signal()
     # Phase 7.H.4: wired to `controller.replay_current_play` — seeks
     # to the currently-open play's start.
     replay_current_play_requested = Signal()
@@ -41,9 +45,6 @@ class ControlsWidget(QWidget):
         self.step_back_button = QPushButton("Step ◀", self)
         self.step_forward_button = QPushButton("Step ▶", self)
         self.live_button = QPushButton("Jump to Live", self)
-        self.long_recording_button = QPushButton("Start game recording", self)
-        # Phase 7.H.2: rebound from "Next clip" → "Next Play".
-        self.next_play_button = QPushButton("Next Play", self)
 
         for button in (
             self.pause_button,
@@ -54,8 +55,6 @@ class ControlsWidget(QWidget):
             self.step_back_button,
             self.step_forward_button,
             self.live_button,
-            self.long_recording_button,
-            self.next_play_button,
         ):
             button.setMinimumHeight(button_height)
             button.setStyleSheet("font-size: 20px; font-weight: 600; padding: 12px 18px;")
@@ -71,8 +70,6 @@ class ControlsWidget(QWidget):
         layout.addWidget(self.step_back_button)
         layout.addWidget(self.step_forward_button)
         layout.addWidget(self.live_button)
-        layout.addWidget(self.long_recording_button)
-        layout.addWidget(self.next_play_button)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
         self.rewind_button.clicked.connect(self.rewind_requested.emit)
@@ -82,29 +79,24 @@ class ControlsWidget(QWidget):
         self.step_back_button.clicked.connect(self.step_back_requested.emit)
         self.step_forward_button.clicked.connect(self.step_forward_requested.emit)
         self.live_button.clicked.connect(self.live_requested.emit)
-        self.long_recording_button.clicked.connect(self.long_recording_toggle_requested.emit)
-        self.next_play_button.clicked.connect(self.next_play_requested.emit)
 
-        self.next_play_button.setEnabled(False)
-        # Phase 7.H.4: Replay Play also only makes sense while
-        # recording (replay isn't available outside RECORDING per
-        # §10.4 / §15.2). `set_recording_state` toggles both.
+        # Phase 7.H.4 / 12.B: replay-related buttons are gated on
+        # recording state because replay isn't available outside
+        # RECORDING (§10.4 / §15.2). `set_recording_state` toggles them
+        # when MainWindow's `_render_state` fires.
         self.replay_play_button.setEnabled(False)
-        # Phase 12.B: step buttons share the recording-state gating —
-        # replay isn't available outside RECORDING.
         self.step_back_button.setEnabled(False)
         self.step_forward_button.setEnabled(False)
 
     def set_recording_state(self, is_recording: bool) -> None:
-        """Enable/disable the play-related buttons to track recording.
+        """Enable/disable the replay-only buttons to track recording.
 
-        Phase 7.H.2: Next Play is only meaningful while recording, so
-        marking a play boundary only makes sense in RECORDING state.
-        Phase 7.H.4: Replay Play is similarly gated — replay isn't
-        available outside RECORDING (§10.4 / §15.2) and there's no
-        current play to seek to anyway.
+        Replay (and its frame-step / replay-play variants) isn't available
+        outside RECORDING per §10.4 / §15.2. The continuous transport
+        controls (Pause, Rewind, Slow, Jump to Live) are always enabled
+        — they'll surface a status message if the operator presses them
+        while replay is unavailable.
         """
-        self.next_play_button.setEnabled(is_recording)
         self.replay_play_button.setEnabled(is_recording)
         self.step_back_button.setEnabled(is_recording)
         self.step_forward_button.setEnabled(is_recording)

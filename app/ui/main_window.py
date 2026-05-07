@@ -19,14 +19,31 @@ from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.ui.alert_banner import AlertBanner
-from app.ui.controls_widget import ControlsWidget
 from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
+from app.ui.operator_controls_widget import OperatorControlsWidget
+from app.ui.referee_controls_widget import RefereeControlsWidget
 from app.ui.status_bar_widget import StatusBarWidget
+
+_VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
 
 
 class MainWindow(QMainWindow):
-    """Top-level window for the sports replay proof of concept."""
+    """Top-level window for the sports replay proof of concept.
+
+    `controls_role` (Phase 13.B) selects which transport widget the
+    window builds:
+
+    - `"referee"` — `RefereeControlsWidget` with the replay/review
+      transport (Pause, Rewind, Replay Play, Slow 1/2x, Slow 1/4x,
+      Step ◀/▶, Jump to Live). Default to keep older test callers
+      that don't pass the kwarg working as before.
+    - `"operator"` — `OperatorControlsWidget` with the recording
+      transport (Start/Stop game, Next Play). Combined with
+      `live_only_window=True` it's the persistent operator's pane.
+    - `"none"` — no controls (reserved for a future "spectator"
+      window).
+    """
 
     def __init__(
         self,
@@ -36,15 +53,20 @@ class MainWindow(QMainWindow):
         feeds: list[FeedDefinition],
         *,
         window_title: str | None = None,
-        show_controls: bool = True,
+        controls_role: str = "referee",
         live_only_window: bool = False,
         application_coordinator: ApplicationCoordinator | None = None,
     ) -> None:
         super().__init__()
+        if controls_role not in _VALID_CONTROLS_ROLES:
+            raise ValueError(
+                f"controls_role must be one of {sorted(_VALID_CONTROLS_ROLES)}; "
+                f"got {controls_role!r}"
+            )
         self._settings = settings
         self._controller = controller
         self._output_renderer = output_renderer
-        self._show_controls = show_controls
+        self._controls_role = controls_role
         self._live_only_window = live_only_window
         self._application_coordinator = application_coordinator
 
@@ -81,18 +103,33 @@ class MainWindow(QMainWindow):
                     role, feed_id, handle
                 )
 
-        self.controls_widget = (
-            ControlsWidget(button_height=settings.touch_button_height, parent=self)
-            if show_controls
+        # Phase 13.A/13.B: at most one of these is non-None per window.
+        # The `controls_role` selector picks which widget is built.
+        self.referee_controls: RefereeControlsWidget | None = (
+            RefereeControlsWidget(
+                button_height=settings.touch_button_height, parent=self
+            )
+            if controls_role == "referee"
             else None
         )
+        self.operator_controls: OperatorControlsWidget | None = (
+            OperatorControlsWidget(
+                button_height=settings.touch_button_height, parent=self
+            )
+            if controls_role == "operator"
+            else None
+        )
+
         self.status_widget = StatusBarWidget(self)
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
 
+        # DiagnosticsWidget today is gated on the referee window. The
+        # eventual home for most diagnostics is the operator window
+        # (deferred to a later slice — see §Phase 13 open questions).
         self.diagnostics_widget: DiagnosticsWidget | None = None
         if (
-            show_controls
+            controls_role == "referee"
             and application_coordinator is not None
             and application_coordinator.telemetry_hub is not None
         ):
@@ -103,14 +140,15 @@ class MainWindow(QMainWindow):
                 settings=settings,
             )
 
-        # Phase 10.A: foreground §11.3 health warnings on the referee
-        # window today. Phase 13.C will move the banner to the operator
-        # (live-only) window since that's where the recording transport
-        # lives — the person who can act on a recording-error needs to
-        # see it. Until 13.C lands the banner stays gated on
-        # `show_controls`, which today maps to the referee window.
+        # Phase 10.A + 13.C: foreground §11.3 health warnings on the
+        # operator (live-only) window — that's where the recording
+        # transport (Start/Stop game, Next Play) lives, so the
+        # persistent operator who can act on a `recording_error` /
+        # `disk_low` / `feed_lost` event is the one who sees the
+        # banner. Pre-13.C the banner was on the referee window, but
+        # the referee is occasional-use and could miss the alert.
         self.alert_banner: AlertBanner | None = (
-            AlertBanner(parent=self) if show_controls else None
+            AlertBanner(parent=self) if controls_role == "operator" else None
         )
 
         central_widget = QWidget(self)
@@ -120,8 +158,10 @@ class MainWindow(QMainWindow):
         if self.alert_banner is not None:
             layout.addWidget(self.alert_banner)
         layout.addWidget(self.video_panel, stretch=1)
-        if self.controls_widget is not None:
-            layout.addWidget(self.controls_widget)
+        if self.referee_controls is not None:
+            layout.addWidget(self.referee_controls)
+        if self.operator_controls is not None:
+            layout.addWidget(self.operator_controls)
         layout.addWidget(self.status_widget)
         if self.diagnostics_widget is not None:
             layout.addWidget(self.diagnostics_widget)
@@ -131,37 +171,37 @@ class MainWindow(QMainWindow):
         self._render_state(self._controller.get_state())
 
     def _wire_events(self) -> None:
-        if self.controls_widget is not None:
-            self.controls_widget.pause_requested.connect(self._controller.pause_playback)
-            self.controls_widget.rewind_requested.connect(self._controller.rewind_10_seconds)
-            self.controls_widget.half_speed_requested.connect(lambda: self._controller.set_playback_rate(0.5))
-            self.controls_widget.quarter_speed_requested.connect(
+        if self.referee_controls is not None:
+            self.referee_controls.pause_requested.connect(self._controller.pause_playback)
+            self.referee_controls.rewind_requested.connect(self._controller.rewind_10_seconds)
+            self.referee_controls.half_speed_requested.connect(lambda: self._controller.set_playback_rate(0.5))
+            self.referee_controls.quarter_speed_requested.connect(
                 lambda: self._controller.set_playback_rate(0.25)
             )
-            self.controls_widget.live_requested.connect(self._controller.jump_to_live)
-            self.controls_widget.replay_current_play_requested.connect(
+            self.referee_controls.live_requested.connect(self._controller.jump_to_live)
+            self.referee_controls.replay_current_play_requested.connect(
                 self._controller.replay_current_play
             )
             # Phase 12.B: frame-step buttons — read the configured count
             # at click time so a future runtime knob (12.C) can update
             # `settings.replay_frame_step_count` without re-wiring.
-            self.controls_widget.step_back_requested.connect(
+            self.referee_controls.step_back_requested.connect(
                 lambda: self._controller.step_frames(
                     -self._settings.replay_frame_step_count
                 )
             )
-            self.controls_widget.step_forward_requested.connect(
+            self.referee_controls.step_forward_requested.connect(
                 lambda: self._controller.step_frames(
                     +self._settings.replay_frame_step_count
                 )
             )
-            if self._application_coordinator is not None:
-                self.controls_widget.long_recording_toggle_requested.connect(
-                    self._application_coordinator.toggle_long_session_recording
-                )
-                self.controls_widget.next_play_requested.connect(
-                    self._application_coordinator.mark_next_play
-                )
+        if self.operator_controls is not None and self._application_coordinator is not None:
+            self.operator_controls.long_recording_toggle_requested.connect(
+                self._application_coordinator.toggle_long_session_recording
+            )
+            self.operator_controls.next_play_requested.connect(
+                self._application_coordinator.mark_next_play
+            )
         self._controller.signals.state_changed.connect(self._render_state)
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
 
@@ -172,15 +212,16 @@ class MainWindow(QMainWindow):
                 self._application_coordinator.get_app_state().value,
                 self._application_coordinator._recording_manager.recording_state.state.value,
             )
-        # Phase 7.H.2: Next Play button is only meaningful while
-        # recording — outside RECORDING there's no current play to
-        # advance. `controls_widget` is None on the operator (live-only)
-        # MainWindow so guard the call. (After Phase 13.B: this guard
-        # changes shape — `controls_role="operator"` builds a smaller
-        # ProgramControlsWidget with Next Play, and the gating moves
-        # there.)
-        if self.controls_widget is not None:
-            self.controls_widget.set_recording_state(state.is_recording)
+        # Phase 13.B: each widget self-handles its recording-state
+        # gating. RefereeControlsWidget toggles replay-related buttons
+        # (Replay Play, Step ◀/▶) since replay isn't available outside
+        # RECORDING. OperatorControlsWidget toggles Next Play and flips
+        # the Start/Stop button label.
+        if self.referee_controls is not None:
+            self.referee_controls.set_recording_state(state.is_recording)
+        if self.operator_controls is not None:
+            self.operator_controls.set_recording_state(state.is_recording)
+            self.operator_controls.set_recording_label(state.is_recording)
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,
             PlaybackMode.PAUSED,
@@ -195,13 +236,6 @@ class MainWindow(QMainWindow):
         if not show_embedded_video:
             placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
             self.video_panel.set_global_placeholder(placeholder_text)
-
-        if self.controls_widget is not None:
-            # Next Play button enable/disable is handled by the
-            # `set_recording_state` call earlier in this method.
-            self.controls_widget.long_recording_button.setText(
-                "Stop game recording" if state.is_recording else "Start game recording"
-            )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release widget bindings when the window closes."""

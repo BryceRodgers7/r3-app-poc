@@ -65,7 +65,7 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
         output_renderer=referee_output,
         feeds=enabled_feeds,
         window_title=settings.referee_window_title,
-        show_controls=True,
+        controls_role="referee",
         live_only_window=False,
         application_coordinator=coordinator,
     )
@@ -75,7 +75,7 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
         output_renderer=operator_output,
         feeds=enabled_feeds,
         window_title=settings.operator_window_title,
-        show_controls=False,
+        controls_role="operator",
         live_only_window=True,
         # Slice 3.A.3 retry: the operator window also needs the coordinator
         # so its MainWindow.__init__ runs the native-preview bind path.

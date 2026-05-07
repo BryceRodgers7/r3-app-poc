@@ -7,7 +7,7 @@ from unittest import mock
 
 from PySide6.QtWidgets import QApplication
 
-from app.ui.controls_widget import ControlsWidget
+from app.ui.operator_controls_widget import OperatorControlsWidget
 
 
 class NextPlayButtonStateTests(unittest.TestCase):
@@ -19,21 +19,21 @@ class NextPlayButtonStateTests(unittest.TestCase):
         cls._app = QApplication.instance() or QApplication([])
 
     def test_button_label_is_next_play(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = OperatorControlsWidget(button_height=72)
         self.assertEqual(controls.next_play_button.text(), "Next Play")
 
     def test_button_disabled_at_construction(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = OperatorControlsWidget(button_height=72)
         self.assertFalse(controls.next_play_button.isEnabled())
 
     def test_set_recording_state_true_enables_button(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = OperatorControlsWidget(button_height=72)
         controls.set_recording_state(True)
         self.assertTrue(controls.next_play_button.isEnabled())
 
     def test_set_recording_state_false_disables_button(self) -> None:
         # Toggle on then off — button must respect the False state.
-        controls = ControlsWidget(button_height=72)
+        controls = OperatorControlsWidget(button_height=72)
         controls.set_recording_state(True)
         controls.set_recording_state(False)
         self.assertFalse(controls.next_play_button.isEnabled())
@@ -43,7 +43,7 @@ class NextPlayButtonStateTests(unittest.TestCase):
         # emitting `clicked`) raises `next_play_requested`. Use a
         # plain-function receiver — Mock + Qt signal connections can
         # hang in headless test runs.
-        controls = ControlsWidget(button_height=72)
+        controls = OperatorControlsWidget(button_height=72)
         controls.set_recording_state(True)
         emissions: list[None] = []
         controls.next_play_requested.connect(lambda: emissions.append(None))
@@ -54,7 +54,7 @@ class NextPlayButtonStateTests(unittest.TestCase):
         # Phase 7.H.2 renamed `short_segment_advance_requested`. Lock
         # in that the old name no longer exists so nothing
         # accidentally re-introduces it.
-        controls = ControlsWidget(button_height=72)
+        controls = OperatorControlsWidget(button_height=72)
         self.assertFalse(hasattr(controls, "short_segment_advance_requested"))
         self.assertFalse(hasattr(controls, "next_clip_button"))
 

@@ -6,7 +6,7 @@ import unittest
 
 from PySide6.QtWidgets import QApplication
 
-from app.ui.controls_widget import ControlsWidget
+from app.ui.referee_controls_widget import RefereeControlsWidget
 
 
 class StepButtonStateTests(unittest.TestCase):
@@ -16,30 +16,30 @@ class StepButtonStateTests(unittest.TestCase):
         cls._app = QApplication.instance() or QApplication([])
 
     def test_button_labels(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         self.assertEqual(controls.step_back_button.text(), "Step ◀")
         self.assertEqual(controls.step_forward_button.text(), "Step ▶")
 
     def test_buttons_disabled_at_construction(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         self.assertFalse(controls.step_back_button.isEnabled())
         self.assertFalse(controls.step_forward_button.isEnabled())
 
     def test_set_recording_state_true_enables_buttons(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         controls.set_recording_state(True)
         self.assertTrue(controls.step_back_button.isEnabled())
         self.assertTrue(controls.step_forward_button.isEnabled())
 
     def test_set_recording_state_false_disables_buttons(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         controls.set_recording_state(True)
         controls.set_recording_state(False)
         self.assertFalse(controls.step_back_button.isEnabled())
         self.assertFalse(controls.step_forward_button.isEnabled())
 
     def test_step_back_click_emits_step_back_signal(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         controls.set_recording_state(True)
         emissions: list[None] = []
         controls.step_back_requested.connect(lambda: emissions.append(None))
@@ -47,7 +47,7 @@ class StepButtonStateTests(unittest.TestCase):
         self.assertEqual(len(emissions), 1)
 
     def test_step_forward_click_emits_step_forward_signal(self) -> None:
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         controls.set_recording_state(True)
         emissions: list[None] = []
         controls.step_forward_requested.connect(lambda: emissions.append(None))
@@ -57,7 +57,7 @@ class StepButtonStateTests(unittest.TestCase):
     def test_step_back_and_forward_signals_are_distinct(self) -> None:
         # Locks in that one button's click doesn't accidentally fire
         # both signals — would mask an off-by-one wiring bug.
-        controls = ControlsWidget(button_height=72)
+        controls = RefereeControlsWidget(button_height=72)
         controls.set_recording_state(True)
         back_emissions: list[None] = []
         forward_emissions: list[None] = []
