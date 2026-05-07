@@ -139,6 +139,19 @@ class MainWindow(QMainWindow):
             self.controls_widget.replay_current_play_requested.connect(
                 self._controller.replay_current_play
             )
+            # Phase 12.B: frame-step buttons — read the configured count
+            # at click time so a future runtime knob (12.C) can update
+            # `settings.replay_frame_step_count` without re-wiring.
+            self.controls_widget.step_back_requested.connect(
+                lambda: self._controller.step_frames(
+                    -self._settings.replay_frame_step_count
+                )
+            )
+            self.controls_widget.step_forward_requested.connect(
+                lambda: self._controller.step_frames(
+                    +self._settings.replay_frame_step_count
+                )
+            )
             if self._application_coordinator is not None:
                 self.controls_widget.long_recording_toggle_requested.connect(
                     self._application_coordinator.toggle_long_session_recording

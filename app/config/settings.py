@@ -200,6 +200,27 @@ def _validate_encoder_settings(
                 )
 
 
+def _validate_replay(config: dict[str, Any], *, where: str) -> None:
+    """Phase 12.B: range-check the `[replay]` sub-table.
+
+    `frame_step_count` is the number of frames the operator's Step
+    buttons jog the replay clock per click. Must be a positive int;
+    rejecting 0 / negative / non-int up-front so the misconfiguration
+    surfaces at config-load instead of at PlaybackController.step_frames
+    runtime.
+    """
+    if "frame_step_count" in config:
+        raw = config["frame_step_count"]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise RuntimeError(
+                f"{where}: frame_step_count={raw!r} must be an integer."
+            )
+        if raw < 1:
+            raise RuntimeError(
+                f"{where}: frame_step_count={raw} must be >= 1."
+            )
+
+
 def _validate_codec_container(codec: str, container: str, *, where: str) -> None:
     """Phase 11.B: reject incompatible codec/container combinations.
 
@@ -323,6 +344,13 @@ class AppSettings:
     # has less than that free. 60s is enough headroom that a short
     # backup running in parallel won't tip the rig into ENOSPC.
     disk_full_grace_seconds: float = 60.0
+    # Phase 12.B: number of frames the operator's Step ◀ / Step ▶
+    # buttons jog the replay clock per click. The PlaybackController
+    # multiplies this by `frame_period_ns` (derived from `target_fps`
+    # in the coordinator builder) to compute the session-time delta.
+    # Default of 1 matches "one frame per click"; sports with faster
+    # motion can turn this up via [replay] frame_step_count = N.
+    replay_frame_step_count: int = 1
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -469,6 +497,15 @@ class AppSettings:
             settings.disk_full_grace_seconds = float(
                 recording_config["disk_full_grace_seconds"]
             )
+
+        # Phase 12.B: [replay] block — frame-step button cadence.
+        replay_config = cls._as_dict(data.get("replay"))
+        if replay_config:
+            _validate_replay(replay_config, where="[replay]")
+            if "frame_step_count" in replay_config:
+                settings.replay_frame_step_count = int(
+                    replay_config["frame_step_count"]
+                )
 
         if "feed_id" in source_config:
             settings.default_feed_id = str(source_config["feed_id"])

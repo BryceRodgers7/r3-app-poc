@@ -21,6 +21,10 @@ class ControlsWidget(QWidget):
     # Phase 7.H.4: wired to `controller.replay_current_play` — seeks
     # to the currently-open play's start.
     replay_current_play_requested = Signal()
+    # Phase 12.B: frame-step replay. Wired to
+    # `controller.step_frames(±settings.replay_frame_step_count)`.
+    step_back_requested = Signal()
+    step_forward_requested = Signal()
 
     def __init__(self, button_height: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -30,6 +34,12 @@ class ControlsWidget(QWidget):
         self.replay_play_button = QPushButton("Replay Play", self)
         self.half_speed_button = QPushButton("Slow 1/2x", self)
         self.quarter_speed_button = QPushButton("Slow 1/4x", self)
+        # Phase 12.B: frame-by-frame jog buttons. Layout sits between
+        # Slow 1/4x (slowest continuous rate) and Jump to Live so the
+        # transport row reads left-to-right from "freshest content"
+        # toward "live edge".
+        self.step_back_button = QPushButton("Step ◀", self)
+        self.step_forward_button = QPushButton("Step ▶", self)
         self.live_button = QPushButton("Jump to Live", self)
         self.long_recording_button = QPushButton("Start game recording", self)
         # Phase 7.H.2: rebound from "Next clip" → "Next Play".
@@ -41,6 +51,8 @@ class ControlsWidget(QWidget):
             self.replay_play_button,
             self.half_speed_button,
             self.quarter_speed_button,
+            self.step_back_button,
+            self.step_forward_button,
             self.live_button,
             self.long_recording_button,
             self.next_play_button,
@@ -56,6 +68,8 @@ class ControlsWidget(QWidget):
         layout.addWidget(self.replay_play_button)
         layout.addWidget(self.half_speed_button)
         layout.addWidget(self.quarter_speed_button)
+        layout.addWidget(self.step_back_button)
+        layout.addWidget(self.step_forward_button)
         layout.addWidget(self.live_button)
         layout.addWidget(self.long_recording_button)
         layout.addWidget(self.next_play_button)
@@ -65,6 +79,8 @@ class ControlsWidget(QWidget):
         self.replay_play_button.clicked.connect(self.replay_current_play_requested.emit)
         self.half_speed_button.clicked.connect(self.half_speed_requested.emit)
         self.quarter_speed_button.clicked.connect(self.quarter_speed_requested.emit)
+        self.step_back_button.clicked.connect(self.step_back_requested.emit)
+        self.step_forward_button.clicked.connect(self.step_forward_requested.emit)
         self.live_button.clicked.connect(self.live_requested.emit)
         self.long_recording_button.clicked.connect(self.long_recording_toggle_requested.emit)
         self.next_play_button.clicked.connect(self.next_play_requested.emit)
@@ -74,6 +90,10 @@ class ControlsWidget(QWidget):
         # recording (replay isn't available outside RECORDING per
         # §10.4 / §15.2). `set_recording_state` toggles both.
         self.replay_play_button.setEnabled(False)
+        # Phase 12.B: step buttons share the recording-state gating —
+        # replay isn't available outside RECORDING.
+        self.step_back_button.setEnabled(False)
+        self.step_forward_button.setEnabled(False)
 
     def set_recording_state(self, is_recording: bool) -> None:
         """Enable/disable the play-related buttons to track recording.
@@ -86,3 +106,5 @@ class ControlsWidget(QWidget):
         """
         self.next_play_button.setEnabled(is_recording)
         self.replay_play_button.setEnabled(is_recording)
+        self.step_back_button.setEnabled(is_recording)
+        self.step_forward_button.setEnabled(is_recording)

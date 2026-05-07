@@ -124,6 +124,14 @@ class ApplicationCoordinator:
         primary_feed = feed_registry.get_primary_feed()
         enabled_feeds = feed_registry.get_enabled_feeds()
         enabled_runtimes = [feed_runtimes[f.feed_id] for f in enabled_feeds]
+        # Phase 12.B: derive `frame_period_ns` from the configured
+        # target FPS so `PlaybackController.step_frames` jogs by exactly
+        # one source frame's worth of session-time per frame_delta unit.
+        # `max(1, ...)` floor protects against a misconfigured
+        # `target_fps <= 0` from sliding into a divide-by-zero or a
+        # runaway step delta.
+        target_fps = float(settings.target_fps) if settings.target_fps > 0 else 30.0
+        frame_period_ns = max(1, int(round(1_000_000_000 / target_fps)))
         self.operator_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,
             output_renderer=operator_renderer,
@@ -134,6 +142,7 @@ class ApplicationCoordinator:
             live_only=False,
             session_clock=self.session_clock,
             play_manager=self.play_manager,
+            frame_period_ns=frame_period_ns,
         )
         self.program_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,
@@ -145,6 +154,7 @@ class ApplicationCoordinator:
             live_only=True,
             session_clock=self.session_clock,
             play_manager=self.play_manager,
+            frame_period_ns=frame_period_ns,
         )
         self._session_started = False
         self._shutting_down = False

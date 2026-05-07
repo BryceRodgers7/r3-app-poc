@@ -95,6 +95,14 @@ audio_enabled = true
 # SSD; raise for NVMe, lower for spinning disks or shared volumes.
 disk_budget_mb_s = 200.0
 
+# Phase 12.B — frame-step replay cadence. The operator's Step ◀ /
+# Step ▶ buttons jog the replay clock by `frame_step_count` frames
+# per click. Default 1 (one frame per click). Sports with faster
+# motion (puck, racquet, bat-on-ball) can turn this up to 2 / 3 / 5
+# without recompile.
+# [replay]
+# frame_step_count = 1
+
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera
 # ingest was removed in Phase 2.5 — `kind = "auto"` is now an error.

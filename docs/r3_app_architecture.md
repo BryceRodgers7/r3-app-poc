@@ -2978,7 +2978,7 @@ Phase 12 closes these by way of two slices:
 
 ### Slices
 
-**12.A — Core step primitive + tests**
+**12.A — Core step primitive + tests — ✅ committed.**
 
 `PlaybackController.step_frames(frame_delta: int)` — positive forward, negative backward, magnitude is the frame count. Constructor gains `frame_period_ns: int` so the controller is the single source of truth for "how many ns is one frame" within its run. The UI computes the value from `settings.target_fps` at coordinator-build time.
 
@@ -3004,9 +3004,9 @@ Phase 12 closes these by way of two slices:
 
 **Out of scope for 12.A:** any UI surface, settings parsing, per-feed `frame_period_ns`, and runtime-adjustable step size.
 
-**12.B — UI buttons + config wiring**
+**12.B — UI buttons + config wiring — ✅ committed.**
 
-- **`[replay]` block** — new top-level section in `app_settings.toml`. Today no `[replay]` block exists; this slice adds the parsing path matching the `[recording]` / `[media]` patterns in `AppSettings.load`.
+- **`[replay]` block** — new top-level section in `app_settings.toml`, parsing path added to `AppSettings.load` matching the `[recording]` / `[media]` patterns. `_validate_replay` rejects non-int and `< 1` values up-front so the misconfiguration surfaces at config-load instead of `step_frames` runtime.
   - **`[replay] frame_step_count`** — positive int, default `1`. Validated at config-load (`int >= 1`).
   - `app_settings.toml.example` gets a `[replay]` example with the new key documented.
 - **`AppSettings.replay_frame_step_count: int = 1`** — new dataclass field; settings round-trip in `tests/test_app_settings.py`.

@@ -454,5 +454,78 @@ kind = "auto"
         self.assertFalse(synthetic_source.supports_embedded_audio())
 
 
+class ReplayBlockTests(unittest.TestCase):
+    """Phase 12.B: `[replay]` block parsing."""
+
+    def test_default_replay_frame_step_count_is_one(self) -> None:
+        settings = AppSettings()
+        self.assertEqual(settings.replay_frame_step_count, 1)
+
+    def test_load_reads_frame_step_count(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+frame_step_count = 5
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.replay_frame_step_count, 5)
+
+    def test_load_rejects_zero_frame_step_count(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+frame_step_count = 0
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("frame_step_count", str(ctx.exception))
+
+    def test_load_rejects_negative_frame_step_count(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+frame_step_count = -3
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                AppSettings.load(config_path)
+
+    def test_load_rejects_non_integer_frame_step_count(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+frame_step_count = 2.5
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                AppSettings.load(config_path)
+
+    def test_empty_replay_block_keeps_default(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.replay_frame_step_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
