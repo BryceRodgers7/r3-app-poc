@@ -70,6 +70,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = False
         coord.referee_controller = mock.Mock()
+        coord.operator_controller = mock.Mock()
         coord.clip_manager = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.mark_next_play()
@@ -81,6 +82,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = True
         coord.referee_controller = mock.Mock()
+        coord.operator_controller = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.session_clock.now_session_time_ns.return_value = 12_000_000_000
         next_clip = mock.Mock()
@@ -89,9 +91,18 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord.clip_manager.mark_next_play.return_value = next_clip
         coord.mark_next_play()
         coord.clip_manager.mark_next_play.assert_called_once_with(12_000_000_000)
+        # Phase 14.B: status message fires on BOTH controllers so the
+        # operator sees feedback in their own status bar.
         coord.referee_controller.signals.status_message.emit.assert_called_once_with(
             "Play #3 started."
         )
+        coord.operator_controller.signals.status_message.emit.assert_called_once_with(
+            "Play #3 started."
+        )
+        # Phase 14.B: both controllers refresh so the Play/Clip
+        # overlay updates within one event-loop tick of the press.
+        coord.referee_controller.refresh_recording_state.assert_called_once()
+        coord.operator_controller.refresh_recording_state.assert_called_once()
 
     def test_mark_next_play_no_op_without_clip_manager(self) -> None:
         # Older test/coordinator paths construct without a ClipManager.
@@ -101,6 +112,7 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = True
         coord.referee_controller = mock.Mock()
+        coord.operator_controller = mock.Mock()
         coord.clip_manager = None
         coord.session_clock = mock.Mock()
         # Should not raise.

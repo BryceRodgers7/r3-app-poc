@@ -855,11 +855,23 @@ class PlaybackController:
         # during a pre-game clip before the first Next Play press.
         # During timeout / challenge clips this returns the last
         # opened play's number so the overlay still shows "Play N".
-        self._state.current_play_number = (
-            self._clip_manager.current_play_number()
-            if self._clip_manager is not None
-            else None
-        )
+        if self._clip_manager is not None:
+            self._state.current_play_number = (
+                self._clip_manager.current_play_number()
+            )
+            # Phase 14.B: clip number + type drive the operator
+            # counter overlay and the operator-controls gating.
+            current_clip = self._clip_manager.current_clip()
+            self._state.current_clip_number = (
+                current_clip.clip_number if current_clip is not None else None
+            )
+            self._state.current_clip_type = (
+                current_clip.type if current_clip is not None else None
+            )
+        else:
+            self._state.current_play_number = None
+            self._state.current_clip_number = None
+            self._state.current_clip_type = None
         if latest_session_time_ns is None:
             self._state.live_lag_behind_replayable_seconds = 0.0
         elif self._session_clock is not None:

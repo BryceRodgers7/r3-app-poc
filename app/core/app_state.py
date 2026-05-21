@@ -61,5 +61,14 @@ class UiState:
     # `PlaybackController._update_state_timestamps_locked` from
     # `ClipManager.current_play_number()`.
     current_play_number: int | None = None
+    # Phase 14.A/14.B: 0-indexed monotonic clip number for the
+    # currently-open clip, and its type (one of `CLIP_TYPES`). Both
+    # are None when no clip is open (between Stop and the next Start,
+    # or in older test paths without a ClipManager). Drives the
+    # operator counter overlay and the operator-controls gating
+    # (Time-out / Challenge / Mark Play depend on the open clip's
+    # type and on whether any play has started yet).
+    current_clip_number: int | None = None
+    current_clip_type: str | None = None
 
 

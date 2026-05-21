@@ -5,8 +5,17 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QMainWindow, QStatusBar, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QCloseEvent, QResizeEvent
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QSizePolicy,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config.settings import AppSettings
 
@@ -19,9 +28,11 @@ from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.ui.alert_banner import AlertBanner
+from app.ui.camera_visibility_ribbon import CameraVisibilityRibbon
 from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
+from app.ui.operator_status_overlay import OperatorStatusOverlay
 from app.ui.referee_controls_widget import RefereeControlsWidget
 from app.ui.status_bar_widget import StatusBarWidget
 
@@ -119,6 +130,21 @@ class MainWindow(QMainWindow):
             if controls_role == "operator"
             else None
         )
+        # Phase 14.B: operator-window-only chrome — camera show/hide
+        # ribbon (bottom-left), Post-process & Exit link (bottom-right),
+        # and a free-floating Play/Clip counter overlay (top-right
+        # over the video panel). All None on the referee window.
+        self.camera_ribbon: CameraVisibilityRibbon | None = None
+        self.post_process_link: QLabel | None = None
+        self.operator_status_overlay: OperatorStatusOverlay | None = None
+        if controls_role == "operator":
+            self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
+            self.post_process_link = self._build_post_process_link()
+            # Parent the floating Play/Clip overlay to the video panel
+            # so positioning math is panel-local — avoids the QMainWindow
+            # coordinate-system gotchas that result from parenting a
+            # free-floating child to the QMainWindow itself.
+            self.operator_status_overlay = OperatorStatusOverlay(self.video_panel)
 
         self.status_widget = StatusBarWidget(self)
         self._status_bar = QStatusBar(self)
@@ -157,11 +183,37 @@ class MainWindow(QMainWindow):
         layout.setSpacing(16)
         if self.alert_banner is not None:
             layout.addWidget(self.alert_banner)
-        layout.addWidget(self.video_panel, stretch=1)
-        if self.referee_controls is not None:
-            layout.addWidget(self.referee_controls)
-        if self.operator_controls is not None:
-            layout.addWidget(self.operator_controls)
+        if controls_role == "operator":
+            # Phase 14.B operator layout:
+            #   [ video panel | OperatorControlsWidget (right column) ]
+            #   [ CameraVisibilityRibbon | stretch | Post-process link ]
+            # OperatorStatusOverlay floats top-right of the video panel
+            # area (positioned by `resizeEvent`).
+            middle_row = QHBoxLayout()
+            middle_row.setContentsMargins(0, 0, 0, 0)
+            middle_row.setSpacing(16)
+            middle_row.addWidget(self.video_panel, stretch=1)
+            assert self.operator_controls is not None  # set above
+            self.operator_controls.setSizePolicy(
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+            )
+            self.operator_controls.setMinimumWidth(220)
+            middle_row.addWidget(self.operator_controls)
+            layout.addLayout(middle_row, stretch=1)
+
+            bottom_row = QHBoxLayout()
+            bottom_row.setContentsMargins(0, 0, 0, 0)
+            bottom_row.setSpacing(16)
+            if self.camera_ribbon is not None:
+                bottom_row.addWidget(self.camera_ribbon)
+            bottom_row.addStretch(1)
+            if self.post_process_link is not None:
+                bottom_row.addWidget(self.post_process_link)
+            layout.addLayout(bottom_row)
+        else:
+            layout.addWidget(self.video_panel, stretch=1)
+            if self.referee_controls is not None:
+                layout.addWidget(self.referee_controls)
         layout.addWidget(self.status_widget)
         if self.diagnostics_widget is not None:
             layout.addWidget(self.diagnostics_widget)
@@ -202,6 +254,24 @@ class MainWindow(QMainWindow):
             self.operator_controls.next_play_requested.connect(
                 self._application_coordinator.mark_next_play
             )
+            # Phase 14.B: Time-out / Challenge / Mark Play route into
+            # the 14.A coordinator pass-throughs. Gating is enforced
+            # both client-side (button enable/disable via
+            # `set_clip_state`) and server-side (ClipManager rejects
+            # back-to-back challenges + pre-play timeouts).
+            self.operator_controls.timeout_requested.connect(
+                self._application_coordinator.mark_timeout
+            )
+            self.operator_controls.challenge_requested.connect(
+                self._application_coordinator.mark_challenge
+            )
+            self.operator_controls.mark_play_toggle_requested.connect(
+                self._application_coordinator.toggle_clip_mark
+            )
+        if self.camera_ribbon is not None:
+            self.camera_ribbon.feed_visibility_toggled.connect(
+                self.video_panel.set_tile_visible
+            )
         self._controller.signals.state_changed.connect(self._render_state)
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
 
@@ -222,6 +292,26 @@ class MainWindow(QMainWindow):
         if self.operator_controls is not None:
             self.operator_controls.set_recording_state(state.is_recording)
             self.operator_controls.set_recording_label(state.is_recording)
+            # Phase 14.B: gate Time-out / Challenge / Mark Play on
+            # whether a play has started and on the current clip type.
+            self.operator_controls.set_clip_state(
+                is_recording=state.is_recording,
+                has_play_started=state.current_play_number is not None,
+                current_clip_type=state.current_clip_type,
+            )
+        if self.operator_status_overlay is not None:
+            self.operator_status_overlay.set_counters(
+                is_recording=state.is_recording,
+                play_number=state.current_play_number,
+                clip_number=state.current_clip_number,
+            )
+            self._position_operator_status_overlay()
+        if self.camera_ribbon is not None:
+            self.camera_ribbon.set_selector_label(
+                clip_type=state.current_clip_type,
+                clip_number=state.current_clip_number,
+                play_number=state.current_play_number,
+            )
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,
             PlaybackMode.PAUSED,
@@ -237,7 +327,59 @@ class MainWindow(QMainWindow):
             placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
             self.video_panel.set_global_placeholder(placeholder_text)
 
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        # Phase 14.B: keep the free-floating Play/Clip counter
+        # overlay pinned to the upper-right of the video panel.
+        self._position_operator_status_overlay()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release widget bindings when the window closes."""
         self._output_renderer.detach_all()
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Phase 14.B helpers
+    # ------------------------------------------------------------------
+
+    def _build_post_process_link(self) -> QLabel:
+        """Bottom-right "Post-process & Exit" hyperlink (Phase 14.B).
+
+        Click handler is a placeholder in 14.B: it logs the intent
+        and emits a status-bar message. Phase 14.E swaps the handler
+        for the in-app processor + progress modal flow.
+        """
+        link = QLabel(
+            '<a href="post_process_exit" '
+            'style="color: #6daffe; font-size: 14px; font-weight: 600;">'
+            "Post-process &amp; Exit"
+            "</a>",
+            self,
+        )
+        link.setOpenExternalLinks(False)
+        link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        link.linkActivated.connect(self._on_post_process_link_clicked)
+        return link
+
+    def _on_post_process_link_clicked(self, _href: str) -> None:
+        # Placeholder until Phase 14.E wires the post-session
+        # processor + progress modal.
+        LOGGER.info("Post-process & Exit clicked (placeholder — Phase 14.E)")
+        self._status_bar.showMessage(
+            "Post-process & Exit is not wired yet (Phase 14.E).", 4000
+        )
+
+    def _position_operator_status_overlay(self) -> None:
+        if self.operator_status_overlay is None:
+            return
+        if not self.operator_status_overlay.isVisible():
+            return
+        # The overlay is a child of `self.video_panel`, so coordinates
+        # are panel-local: (0, 0) is the top-left of the panel.
+        margin = 18
+        overlay = self.operator_status_overlay
+        overlay.adjustSize()
+        x = max(0, self.video_panel.width() - overlay.width() - margin)
+        y = margin
+        overlay.move(x, y)
+        overlay.raise_()

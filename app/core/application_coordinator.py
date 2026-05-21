@@ -362,6 +362,33 @@ class ApplicationCoordinator:
         self.operator_controller.refresh_recording_state()
         self.referee_controller.signals.status_message.emit("Game recording started.")
 
+    def _emit_clip_status(self, message: str) -> None:
+        """Broadcast a status message to both windows.
+
+        The Next Play / Time-out / Challenge / Mark Play buttons live
+        on the operator window, but a referee watching the replay
+        also wants to see "Timeout started." so the two windows stay
+        in sync. Emit on both controllers' signal buses.
+        """
+        self.operator_controller.signals.status_message.emit(message)
+        self.referee_controller.signals.status_message.emit(message)
+
+    def _refresh_clip_state(self) -> None:
+        """Force both controllers to re-emit UiState immediately.
+
+        Without this, the Play/Clip overlay only refreshes when the
+        next live frame ticks through `on_new_live_frame` — fine for
+        the referee window (which runs the replay clock too), but
+        the operator's live-only controller can sit silent between
+        frames. Calling `refresh_recording_state` here re-runs
+        `_update_state_timestamps_locked` (which pulls the latest
+        `current_clip()` from ClipManager) and emits `state_changed`,
+        so the operator counter overlay updates within one event-loop
+        tick of the operator pressing the button.
+        """
+        self.operator_controller.refresh_recording_state()
+        self.referee_controller.refresh_recording_state()
+
     def mark_next_play(self) -> None:
         """Close the currently-open clip and open the next play.
 
@@ -380,7 +407,7 @@ class ApplicationCoordinator:
         if getattr(self, "_shutting_down", False):
             return
         if not self._recording_manager.is_any_recording():
-            self.referee_controller.signals.status_message.emit(
+            self._emit_clip_status(
                 "Start game recording before marking a play boundary."
             )
             return
@@ -390,9 +417,8 @@ class ApplicationCoordinator:
             self.session_clock.now_session_time_ns()
         )
         if next_clip is not None and next_clip.play_number is not None:
-            self.referee_controller.signals.status_message.emit(
-                f"Play #{next_clip.play_number} started."
-            )
+            self._emit_clip_status(f"Play #{next_clip.play_number} started.")
+        self._refresh_clip_state()
 
     def mark_timeout(self) -> None:
         """Close the currently-open clip and open a timeout clip.
@@ -404,7 +430,7 @@ class ApplicationCoordinator:
         if getattr(self, "_shutting_down", False):
             return
         if not self._recording_manager.is_any_recording():
-            self.referee_controller.signals.status_message.emit(
+            self._emit_clip_status(
                 "Start game recording before marking a timeout."
             )
             return
@@ -414,11 +440,12 @@ class ApplicationCoordinator:
             self.session_clock.now_session_time_ns()
         )
         if next_clip is not None:
-            self.referee_controller.signals.status_message.emit("Timeout started.")
+            self._emit_clip_status("Timeout started.")
         else:
-            self.referee_controller.signals.status_message.emit(
+            self._emit_clip_status(
                 "Timeout unavailable until the first play has started."
             )
+        self._refresh_clip_state()
 
     def mark_challenge(self) -> None:
         """Close the currently-open clip and open a challenge clip.
@@ -430,7 +457,7 @@ class ApplicationCoordinator:
         if getattr(self, "_shutting_down", False):
             return
         if not self._recording_manager.is_any_recording():
-            self.referee_controller.signals.status_message.emit(
+            self._emit_clip_status(
                 "Start game recording before starting a challenge."
             )
             return
@@ -440,11 +467,12 @@ class ApplicationCoordinator:
             self.session_clock.now_session_time_ns()
         )
         if next_clip is not None:
-            self.referee_controller.signals.status_message.emit("Challenge started.")
+            self._emit_clip_status("Challenge started.")
         else:
-            self.referee_controller.signals.status_message.emit(
+            self._emit_clip_status(
                 "Challenge unavailable (no play started, or already in a challenge)."
             )
+        self._refresh_clip_state()
 
     def toggle_clip_mark(self) -> None:
         """Flip the `marked` flag on the currently-open clip.
@@ -459,9 +487,8 @@ class ApplicationCoordinator:
         updated = self.clip_manager.toggle_clip_mark()
         if updated is not None:
             status = "marked" if updated.marked else "unmarked"
-            self.referee_controller.signals.status_message.emit(
-                f"Clip {status}."
-            )
+            self._emit_clip_status(f"Clip {status}.")
+        self._refresh_clip_state()
 
     def initialize(self, *, resume_session_id: str | None = None) -> None:
         """Start storage, ingest, and playback sessions.

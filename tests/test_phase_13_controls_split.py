@@ -130,15 +130,18 @@ class OperatorControlsWidgetContractTests(_QtTestCase):
         self.assertFalse(hasattr(controls, "step_forward_requested"))
 
     def test_start_stop_button_label_starts_at_start(self) -> None:
+        # Phase 14.B relabeled "Start game recording" → "Begin Game"
+        # (and the recording variant to "End Game") and color-coded
+        # green/red. See `docs/window-requirements.md`.
         controls = OperatorControlsWidget(button_height=72)
-        self.assertEqual(controls.long_recording_button.text(), "Start game recording")
+        self.assertEqual(controls.long_recording_button.text(), "Begin Game")
 
     def test_set_recording_label_flips_text(self) -> None:
         controls = OperatorControlsWidget(button_height=72)
         controls.set_recording_label(True)
-        self.assertEqual(controls.long_recording_button.text(), "Stop game recording")
+        self.assertEqual(controls.long_recording_button.text(), "End Game")
         controls.set_recording_label(False)
-        self.assertEqual(controls.long_recording_button.text(), "Start game recording")
+        self.assertEqual(controls.long_recording_button.text(), "Begin Game")
 
     def test_start_stop_always_enabled(self) -> None:
         # Pressing Start/Stop IS the toggle, so it's never disabled.
