@@ -3167,7 +3167,9 @@ Goal:
 
 Phase 14 lands in five slices. 14.A is the schema + manager refactor (everything else builds on the new vocabulary). 14.B and 14.C are independent UI slices and can land in either order; 14.D depends on 14.A + 14.B (challenge button exists) + 14.C (referee window has a place to render the lockout state). 14.E is the post-process modal — independent of 14.D and could land at any point after 14.B.
 
-**14.A — `plays` → `clips` schema + `PlayManager` → `ClipManager` refactor.**
+**Status (resume here next session):** ✅ 14.A committed. ✅ 14.B committed (with field-test follow-ups documented in the slice). ⬜ 14.C, 14.D, 14.E pending — start with **14.C** (referee window rebuild) which is parallel-safe with the others.
+
+**14.A — `plays` → `clips` schema + `PlayManager` → `ClipManager` refactor — ✅ committed.**
 
 - **Schema migration** — the old `plays` table is dropped wholesale (operator confirmed: existing data is throwaway). New table:
 
@@ -3211,7 +3213,7 @@ Phase 14 lands in five slices. 14.A is the schema + manager refactor (everything
 
 **Out of scope for 14.A:** any UI button or modal. `plays_json_export.py` (Phase 8) — defer the JSON-shape update to a follow-on slice or treat as breaking-change downstream of the post-processor; the operator confirmed the existing artifacts don't need preservation but the JSON exporter needs to know about types and `marked` if downstream tools consume it. Flag in 14.E open questions.
 
-**14.B — Operator window controls + clip/play counters + camera ribbon.**
+**14.B — Operator window controls + clip/play counters + camera ribbon — ✅ committed (with field-test follow-ups, see below).**
 
 - **New buttons on `OperatorControlsWidget`** — Time-out, Challenge, Mark Play. Stacked on the right edge per the PDF (Next Play, Time-out, Challenge as a vertical group; Mark Play below them with a gap; Begin/End Game at the bottom-right). Existing Next Play stays.
   - Signals: `timeout_requested`, `challenge_requested`, `mark_play_toggle_requested`. Coordinator wires them to `mark_timeout` / `mark_challenge` / `toggle_clip_mark`.
@@ -3224,6 +3226,14 @@ Phase 14 lands in five slices. 14.A is the schema + manager refactor (everything
 - **Tests** — `tests/test_operator_controls_widget.py` extends: new signals emit on press; gating respects `(is_recording, has_play_started, current_clip_type)`; End Game button shows confirm modal (use `QMessageBox` patch). `tests/test_main_window.py` confirms the counters update on `clip_changed`.
 
 **Out of scope for 14.B:** challenge → referee lockout wiring (14.D). Post-process modal (14.E). Scrubber slider on referee (14.C).
+
+**14.B field-test follow-ups (landed in same slice).** Three bugs surfaced during the first hands-on test of the operator window. All three are now fixed; mention here so future maintainers (and future agents) don't re-introduce them.
+
+1. **Stale UI counters after `mark_*`.** The new `mark_next_play` / `mark_timeout` / `mark_challenge` / `toggle_clip_mark` pass-throughs didn't trigger any controller emission, so the Play/Clip overlay only refreshed when the next live frame arrived through `on_new_live_frame`. The operator's `live_only` controller can sit silent between frames if frame flow stalls. Fix: added `ApplicationCoordinator._refresh_clip_state()` (calls `refresh_recording_state()` on both controllers) and invoked it at the end of every `mark_*` pass-through. The counter now updates within one event-loop tick of the press.
+2. **Status messages went to the wrong window.** All four `mark_*` pass-throughs were emitting on `referee_controller.signals.status_message` only, so the operator never saw "Timeout started." / "Challenge started." / etc. on their own status bar. Fix: added `ApplicationCoordinator._emit_clip_status()` that broadcasts on both controllers' signal buses.
+3. **Time-out / Challenge clicks were silently dropped due to a transient false-disable.** `MainWindow._render_state` was calling `set_recording_state(True)` immediately before `set_clip_state(...)`. The pre-fix `set_recording_state` internally called `set_clip_state(is_recording=True, has_play_started=False, ...)`, which disabled Time-out and Challenge for one synchronous breath. Then `set_recording_label`'s `setStyleSheet` call could pump events under some Qt styles, and any queued mouse-release on a now-disabled button was dropped by Qt — silently, with no log line and no visible disabled styling. Next Play / Mark Play don't depend on `has_play_started`, so they never flickered and worked fine; only the play-dependent buttons were affected. Fix: `set_recording_state` now owns only the buttons whose enable depends purely on recording (Next Play, Mark Play) and never touches Time-out / Challenge. Those are exclusively owned by `set_clip_state`. Docstring captures the *why* so 14.D / 14.E don't re-introduce it.
+
+**Resume marker.** Phase 14.A and 14.B are committed. Next session picks up at **14.C — Referee window transport rebuild**. No carry-over from 14.A/14.B except: the `set_recording_state` ownership split established in (3) is the model — any future widget that gates buttons on multiple synchronous signals must avoid the same flicker race.
 
 **14.C — Referee window transport rebuild + camera ribbon + play counter.**
 
