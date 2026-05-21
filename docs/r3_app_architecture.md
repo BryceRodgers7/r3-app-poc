@@ -3136,6 +3136,176 @@ Reverses one design decision documented today: the §10.A AlertBanner note says 
 
 ---
 
+## Phase 14 – Window-spec UI rebuild: clips, challenge lockout, in-app post-process
+
+Source of truth for this phase: [`docs/window-requirements.md`](window-requirements.md) (button-by-button requirements) and [`docs/window-layouts.pdf`](window-layouts.pdf) (layout mocks for both windows). Read both before implementing.
+
+Goal:
+
+- Replace the `plays`-as-only-clip-type model with a generalized `clips` model that supports four types (`pre-game`, `play`, `timeout`, `challenge`) plus a `marked` flag.
+- Rebuild the operator-window control surface to match the spec: large Begin/End Game toggle with confirmation, Next Play / Time-out / Challenge / Mark Play, clip + play counters, per-window camera show/hide ribbon, "Post-process & Exit" link that runs the existing post-session processor in-app.
+- Rebuild the referee-window transport row to match the spec: Play/Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind 5s, Step ◀ / Step ▶, scrubber-slider seek widget. Remove Replay Play and Jump to Live (the operator's Challenge button drives both behaviors now). Add per-window camera show/hide ribbon + play-number badge (bottom-left).
+- Add a **challenge lockout** to the referee window: when the operator presses Challenge, the referee window jumps to the start of the most-recent `type='play'` clip, paused, and is fenced to `[play.start, play.end]` until the operator opens a new clip (Next Play / Time-out / End Game).
+
+### State of the world entering Phase 14
+
+| Concern | Today | Phase 14 target |
+|---|---|---|
+| Per-game segmentation | `plays` table (one row per Next-Play boundary). `play_number` is 1-indexed and monotonic per game. `PlayManager` owns the in-memory pointer. | `clips` table; `play_number` derived from `WHERE type='play'`; `clip_number` is a separate 0-indexed monotonic counter that includes every clip type. `ClipManager` (renamed from `PlayManager`) owns the pointer. |
+| Clip types | Implicit — every closed slice of the timeline is a "play." | Four explicit types: `pre-game` (exactly one per game, opened by Start Game), `play` (opened by Next Play, 1-indexed), `timeout` (opened by Time-out), `challenge` (opened by Challenge). |
+| Marked clips | No surface. | `clips.marked BOOLEAN` toggled by the Mark Play button; persisted for downstream processes outside Phase 14 scope. |
+| Operator window controls | `OperatorControlsWidget`: Start/Stop game recording, Next Play. (Phase 13.A.) | + Time-out, Challenge, Mark Play, Begin/End Game color-coded toggle with confirm modal, Post-process & Exit link. Clip counter (top-right) and play counter on the window chrome. |
+| Referee window controls | `RefereeControlsWidget`: Pause, Rewind 10s, Replay Play, Slow 1/2x, Slow 1/4x, Step ◀, Step ▶, Jump to Live. (Phase 13.A.) | Play/Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind 5s, Step ◀, Step ▶, scrubber slider. Replay Play and Jump to Live are removed — the operator's Challenge button replaces "jump to last play and pause." |
+| Camera show/hide | `MultiFeedVideoPanel` always shows every enabled feed. | Per-window ribbon `[1][2][3][4]…` toggles tile visibility on that window's panel only. Hidden tiles do not affect ingest, recording, or the other window's panel. Grid reflows to fill the space. |
+| Replay-button gating | `set_recording_state` disables Replay Play / Step buttons outside RECORDING. | Same gate applies to Step ◀/▶ and Pause-related affordances. Time-out and Challenge are additionally disabled until the first Next Play press of the game (game-has-started gate). |
+| Challenge / lockout | No concept of clip-bounded replay. `_resolve_rewind_target_locked` clamps against `available_session_time_range()` (full recording extent). | New `PlaybackController.set_clip_bounds(start_ns, end_ns)` / `clear_clip_bounds()` API. While bounds are set, every seek primitive (Rewind, Step, scrubber, rate-change auto-snap) clamps to the range and snaps-to-PAUSED at either edge. Bounds drive the lockout described in `window-requirements.md` §Challenge. |
+| Replay rate > 1.0 | `set_playback_rate(2.0)` already routes to `ReplayState.REPLAYING` per the `< 1.0` check at L378. Untested on the UI side; no 2x button exists. | Wire a `Speed 2x` button. Behavior: bounce through SEEKING into REPLAYING at 2.0× (mirrors how the slow-mo buttons enter from LIVE). |
+| Post-process flow | `python -m app.tools.post_session_processor <session>` — separate CLI invocation; no UI surface. Still required as a fallback. | New "Post-process & Exit" link in the operator window. Stops recording (if running), then calls `post_session_processor.run(...)` in-process with a progress callback wired to a `QProgressDialog`. On success: closes both windows. On failure: shows the error in a modal and waits for OK before exiting. The CLI invocation continues to work for manual retry. |
+| Crash recovery | `auto_close_open_plays_for_session` closes any open play and tags it `auto_closed_on_crash`. | Same shape, generalized to clips: continue whatever clip type was open at crash time. No special handling for in-flight timeouts/challenges — they re-open as the same type. |
+
+### Slices
+
+Phase 14 lands in five slices. 14.A is the schema + manager refactor (everything else builds on the new vocabulary). 14.B and 14.C are independent UI slices and can land in either order; 14.D depends on 14.A + 14.B (challenge button exists) + 14.C (referee window has a place to render the lockout state). 14.E is the post-process modal — independent of 14.D and could land at any point after 14.B.
+
+**14.A — `plays` → `clips` schema + `PlayManager` → `ClipManager` refactor.**
+
+- **Schema migration** — the old `plays` table is dropped wholesale (operator confirmed: existing data is throwaway). New table:
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS clips (
+      clip_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      game_subdir TEXT NOT NULL,
+      clip_number INTEGER NOT NULL,           -- 0-indexed, monotonic per game, includes every type
+      type TEXT NOT NULL,                     -- one of: 'pre-game' | 'play' | 'timeout' | 'challenge'
+      play_number INTEGER,                    -- non-NULL iff type='play'; 1-indexed, monotonic per game
+      marked INTEGER NOT NULL DEFAULT 0,      -- Mark Play flag
+      start_session_time_ns INTEGER NOT NULL,
+      end_session_time_ns INTEGER,
+      created_at TEXT NOT NULL,
+      auto_closed_on_crash INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY(session_id) REFERENCES sessions(session_id),
+      UNIQUE(session_id, game_subdir, clip_number),
+      CHECK (type IN ('pre-game', 'play', 'timeout', 'challenge')),
+      CHECK ((type = 'play') = (play_number IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS clips_by_game ON clips(session_id, game_subdir, clip_number);
+  CREATE INDEX IF NOT EXISTS clips_by_play_number ON clips(session_id, game_subdir, play_number) WHERE play_number IS NOT NULL;
+  ```
+
+  Migration code in `_initialize_schema`: if `plays` exists, `DROP TABLE plays;` after creating the new `clips` table. No data carry-over (operator confirmed). Follows the destructive-migration pattern of `_migrate_segments_unique_constraint_locked` (§8).
+- **`Clip` model** — replaces `Play` in `app/core/models.py`. Fields mirror the table. `is_play` / `is_marked` convenience properties.
+- **`ClipManager`** — renamed from `PlayManager` (file rename, class rename). Repo-wide grep before declaring the rename complete (`next_clip_button`, `play_manager`, `mark_next_play`, `current_play_number`, etc.) — `feedback_rename_grep` memory applies.
+  - `start_game(...)` opens **clip #0 of type `pre-game`** (not play #1). Returns the `Clip`.
+  - `mark_next_play(now_ns)` closes the current clip and opens a new clip with `type='play'`, `play_number = max(existing where type='play') + 1`, `clip_number = current + 1`. First call after `start_game` opens play #1.
+  - `mark_timeout(now_ns)` closes the current clip and opens `type='timeout'`, `play_number=NULL`. Reject (no-op + status emit) if `current_play_number()` is None (i.e., no play has started yet).
+  - `mark_challenge(now_ns)` closes the current clip and opens `type='challenge'`, `play_number=NULL`. Reject if current clip already has `type='challenge'` (no back-to-back challenges per spec). Reject if `current_play_number()` is None.
+  - `set_marked(value: bool)` sets the `marked` flag on the in-memory current clip + the DB row. Toggle is the UI's responsibility.
+  - `stop_game(now_ns)` closes the current clip and clears the pointer (unchanged semantics, generalized).
+  - `current_play_number()` returns the play number of the most-recent `type='play'` clip in the current game (the in-memory pointer's value if its type is `play`, else the last `play` clip's number queried from the DB, else None during pre-game).
+  - `current_clip()` / `current_clip_number()` mirror the existing `current_play()` / `current_play_number()` accessors.
+  - `auto_close_open_clips_for_session(...)` — replaces `auto_close_open_plays_for_session`. Continues whatever type was open.
+- **Coordinator wiring** — `ApplicationCoordinator` swaps `self._play_manager` → `self._clip_manager` and grows three new pass-throughs: `mark_timeout()`, `mark_challenge()`, `toggle_clip_mark()`. The Start/Stop game path calls `start_game` / `stop_game` with the same session-time anchors as today.
+- **No UI in this slice** — buttons land in 14.B. The `OperatorControlsWidget` continues to expose only `long_recording_toggle_requested` and `next_play_requested`; the new signals get added in 14.B.
+- **Tests** — `tests/test_clip_manager.py` (renamed from `test_play_manager.py`): covers `start_game` → pre-game; `mark_next_play` → play 1 / 2 / 3 with correct clip_number progression; `mark_timeout` rejection during pre-game; `mark_challenge` rejection during pre-game and back-to-back; `current_play_number` returns the last play across timeouts; `set_marked` toggles cleanly; crash-recovery `auto_close_open_clips_for_session` handles every type. `tests/test_metadata_db.py` covers schema migration from a pre-Phase-14 `plays`-only DB (drops cleanly; new `clips` table is queryable).
+
+**Out of scope for 14.A:** any UI button or modal. `plays_json_export.py` (Phase 8) — defer the JSON-shape update to a follow-on slice or treat as breaking-change downstream of the post-processor; the operator confirmed the existing artifacts don't need preservation but the JSON exporter needs to know about types and `marked` if downstream tools consume it. Flag in 14.E open questions.
+
+**14.B — Operator window controls + clip/play counters + camera ribbon.**
+
+- **New buttons on `OperatorControlsWidget`** — Time-out, Challenge, Mark Play. Stacked on the right edge per the PDF (Next Play, Time-out, Challenge as a vertical group; Mark Play below them with a gap; Begin/End Game at the bottom-right). Existing Next Play stays.
+  - Signals: `timeout_requested`, `challenge_requested`, `mark_play_toggle_requested`. Coordinator wires them to `mark_timeout` / `mark_challenge` / `toggle_clip_mark`.
+  - **Begin/End Game restyle** — the existing `long_recording_button` becomes color-coded (green when not recording / "Begin Game"; red when recording / "End Game"). Pressing the red variant pops a `QMessageBox.question` "Are you sure you want to end this game?" before invoking `toggle_long_session_recording`.
+  - **Gating** — Time-out and Challenge are enabled iff `is_recording AND current_play_number() is not None` (i.e., the operator has pressed Next Play at least once). Challenge is additionally disabled if `current_clip().type == 'challenge'`. Mark Play is enabled iff `is_recording`. Wire via a new `set_clip_state(is_recording: bool, has_play_started: bool, current_clip_type: str | None)` method on the widget; coordinator emits a signal after every clip transition so the widget can re-evaluate.
+- **Clip + play counters** — new `OperatorStatusOverlay` widget (or extend the existing window chrome — see open question Q1) showing `Play NNN` and `Clip NNN` in the top-right of the operator window. Updates on every `clip_changed` signal. `Play` shows `current_play_number()` or `N/A` during pre-game. `Clip` shows the 0-indexed `current_clip_number()`.
+- **Post-process & Exit link** — `QLabel` with a clickable hyperlink-style "Post-process & Exit" at the bottom-center of the operator window. Click handler is a placeholder in 14.B (`LOGGER.info("Post-process requested")`) — actual wiring lands in 14.E.
+- **Camera show/hide ribbon** — `CameraVisibilityRibbon` widget with one `QPushButton` per feed (labeled `1` / `2` / `3` / `4` per the mock, or by `feed.display_name` if shorter — see open question Q2). Toggles emit `feed_visibility_toggled(feed_id, visible)`. `MultiFeedVideoPanel` gains a `set_tile_visible(feed_id, visible)` method that hides the cell from the grid and triggers a relayout — grid recomputes columns so remaining tiles fill the available width. The "Clip selector widget" label in the PDF mock is a future-enhancement placeholder; in Phase 14 it renders as a non-interactive label showing the current clip type/number alongside the ribbon (operator confirmed: future expansion is out of scope).
+- **MainWindow layout (operator branch)** — three new structural pieces: top-right counters overlay, right-edge button stack, bottom row with ribbon + Post-process link. Existing AlertBanner (Phase 13.C) stays at top. The two-button Phase 13 controls strip is replaced by the new operator control surface.
+- **Tests** — `tests/test_operator_controls_widget.py` extends: new signals emit on press; gating respects `(is_recording, has_play_started, current_clip_type)`; End Game button shows confirm modal (use `QMessageBox` patch). `tests/test_main_window.py` confirms the counters update on `clip_changed`.
+
+**Out of scope for 14.B:** challenge → referee lockout wiring (14.D). Post-process modal (14.E). Scrubber slider on referee (14.C).
+
+**14.C — Referee window transport rebuild + camera ribbon + play counter.**
+
+- **`RefereeControlsWidget` rebuild** — remove `replay_play_button` and `live_button`. Add:
+  - `pause_button` (existing, but label flips to `▶` / `⏸` depending on `_playback_rate`).
+  - `speed_2x_button` → `set_playback_rate(2.0)`. Goes through the existing `SEEKING → REPLAYING` bounce (the rate-routing branch at L378 already picks REPLAYING when rate ≥ 1.0).
+  - `half_speed_button`, `quarter_speed_button` (existing).
+  - `eighth_speed_button` → `set_playback_rate(0.125)`.
+  - `rewind_button` — relabel "Rewind 10s" → "Rewind 5s" and rewire the duration. **Settings change:** the existing `_REWIND_10S_NS` constant becomes `settings.replay_rewind_seconds` (new `[replay] rewind_seconds: int = 5` setting). Update `app_settings.toml.example`, `AppSettings.load`, and `_validate_replay`. Rename `rewind_10_seconds` → `rewind_seconds_configurable` on `PlaybackController` (or keep the public name and just change the magnitude — see open question Q3).
+  - `step_back_button`, `step_forward_button` (existing, unchanged; honor `settings.replay_frame_step_count`).
+- **Scrubber slider widget** — new `ScrubberSlider` (`QSlider(Qt.Horizontal)` subclass or composite). Live-updates from the controller's `_playback_session_time_ns` between user interactions; user drag emits `seek_to_session_time_requested(target_ns)` which routes to a new `PlaybackController.seek_to_session_time(ns)` primitive (extracted from the existing rewind logic — same clamp-against-bounds, same FSM bounce-to-PAUSED behavior). One scrubber per window, not per tile — the slider seeks the shared replay clock that drives all tiles.
+- **Play-number badge (bottom-left)** — `QLabel` showing `Play NNN` (or `N/A` during pre-game). Updates on the same `clip_changed` signal the operator counters listen for.
+- **Camera show/hide ribbon** — same `CameraVisibilityRibbon` widget as 14.B, owned by the referee window's `MultiFeedVideoPanel`. State is per-window (operator hiding camera 3 does not hide it on referee).
+- **Removed buttons cleanup** — `replay_current_play_requested` and `live_requested` signals + their coordinator wiring are deleted. `PlaybackController.replay_current_play()` and `request_live()` stay on the controller (used internally by challenge lockout in 14.D and by `jump_to_latest_replayable` post-lockout-clear), but no UI button exposes them directly.
+- **Tests** — `tests/test_referee_controls_widget.py` covers: new buttons emit expected signals; speed-2x routes through REPLAYING; eighth-speed routes through SLOW_MOTION; pause-button label flips with rate; scrubber emits with the right session-time. `tests/test_playback_controller.py` adds a 2.0× rate case (currently uncovered) and a `seek_to_session_time` primitive case.
+
+**Out of scope for 14.C:** challenge lockout behavior (14.D). The scrubber's behavior during a challenge is enforced by 14.D's clamping logic — the slider widget itself doesn't need to know about challenges.
+
+**14.D — Challenge lockout in `PlaybackController` + cross-window wiring.**
+
+- **New primitives on `PlaybackController`:**
+  - `set_clip_bounds(start_session_time_ns: int, end_session_time_ns: int | None)` — install a fence. `end` may be None initially (the play just closed, but if a downstream caller wants the most-recent finalized end-time, the controller queries the segment store). Stored as `self._clip_bounds: tuple[int, int | None] | None`.
+  - `clear_clip_bounds()` — remove the fence; replay resumes against the full `available_session_time_range()`.
+  - All seek-resolution helpers (`_resolve_rewind_target_locked`, the new `seek_to_session_time` from 14.C, `step_frames`, the auto-snap branches inside `set_playback_rate`) consult `_clip_bounds` first. If the requested target is outside the fence, clamp to the nearest fence edge and force `_playback_rate = 0.0` (PAUSED) before rendering. Emit a status: `"Held at start of play (challenge)"` or `"Held at end of play (challenge)"`.
+  - The replay clock tick (`_render_at_session_time_ns` called from `_advance_replay_clock`) also consults the fence — if the natural-rate advance would cross `end`, snap to `end` and PAUSE (this covers the "play forward at 1× and auto-pause at end of play" case).
+- **`replay_current_play()` is repurposed as the challenge-open hook** — public API: snap the playback clock to a given `start_session_time_ns`, install bounds `(start, end)`, bounce to PAUSED, render. The coordinator's challenge wiring calls it on the referee controller with the bounds from the just-closed play clip.
+- **Cross-window signal wiring** — `ApplicationCoordinator.mark_challenge(now_ns)`:
+  1. Reads the most-recent `type='play'` clip from `ClipManager` (or `MetadataDb.last_play_clip_for_current_game()`).
+  2. Calls `self._clip_manager.mark_challenge(now_ns)` — opens the challenge clip; rejects if back-to-back or pre-play.
+  3. On success: calls `self._referee_playback_controller.replay_current_play(play.start_session_time_ns, play.end_session_time_ns)`. (The operator controller is `live_only=True` — no fence applies.)
+  4. Emits `challenge_state_changed(active=True)` so the referee window can render a "Challenge — Play N" badge over the panel (see open question Q4 — overlay shape).
+- **Lockout clear** — `mark_next_play` / `mark_timeout` / `stop_game` all call `self._referee_playback_controller.clear_clip_bounds()` if a fence is installed, then emit `challenge_state_changed(active=False)`. After clear, the referee window stays paused at the current position (no auto-jump to live) — the referee can press Play, 2x, etc. to resume from wherever they are.
+- **End-of-fence rendering** — the existing `nearest_frame_location` clamping at segment boundaries already returns the boundary frame frozen when no coverage exists past the end. The fence reuses this — at `end_session_time_ns`, every feed shows its last covered frame, paused. No new frame-rendering code; just clamping.
+- **Tests** — `tests/test_playback_controller.py` adds: `set_clip_bounds` clamps Rewind; clamps Step; clamps `seek_to_session_time`; auto-clamps `set_playback_rate(1.0)` advance at the end edge; `clear_clip_bounds` re-exposes full range. `tests/test_application_coordinator.py` adds: Challenge press fences the referee controller with the right bounds; Next-Play / Time-out / End-Game press all clear the fence; back-to-back Challenge presses no-op on the second.
+
+**Out of scope for 14.D:** any behavior on the operator window's controller (it's `live_only`; bounds don't apply). Visual badge styling for the challenge overlay — flagged as Q4.
+
+**14.E — In-app Post-process & Exit modal.**
+
+- **`PostProcessDialog` (new)** — `QDialog` with a `QProgressBar`, a status `QLabel` ("Processing game_001 / camera_1.mp4…"), and (during success) a Close button that closes both windows; (during failure) an OK button that surfaces the error message and closes both windows on press.
+- **Wiring on the operator window's "Post-process & Exit" link:**
+  1. If `state.is_recording`, call `coordinator.toggle_long_session_recording()` to stop the game (which also closes the open clip via `ClipManager.stop_game`). Block on the recording-stopped signal — the post-processor only sees finalized segments.
+  2. Construct the run plan via `post_session_processor.build_plan(session_dir, ...)`.
+  3. Instantiate `PostProcessDialog`, show it modally.
+  4. Run `post_session_processor.run(plan, progress_callback=dialog.update_progress)` on a `QThread` (the processor shells out to ffmpeg per (game, feed) item — those subprocesses can take minutes; don't block the Qt event loop). Use the existing `app/core/segment_validator_worker.py` pattern as a model for the worker shape.
+  5. On worker `finished(success: bool, error: str | None)`:
+     - Success → close dialog → close both windows → `QApplication.quit()`.
+     - Failure → swap progress bar for error message, keep OK button enabled, wait for click, then close.
+- **Existing CLI invocation continues to work** as a manual retry path. No changes to `app/tools/post_session_processor.py` semantics; only a new callable entry point. Confirm the existing entry point already accepts a `progress_callback` parameter — if not, add one (signature: `Callable[[int processed, int total, str current_item], None]`) without changing the CLI surface.
+- **`plays_json_export.py` update** (deferred call-out from 14.A) — the exported JSON shape needs to include `type` and `marked` so downstream tools see the new fields. The CLI invocation already runs as part of the post-session processor's plan. Treat as a coupled change in 14.E unless downstream tools are out-of-tree.
+- **Tests** — `tests/test_post_process_dialog.py` (new): success path closes the dialog; failure path holds open until OK pressed. `tests/test_post_session_processor.py` (existing): add a `progress_callback` interaction test.
+
+**Out of scope for 14.E:** any retry-from-dialog behavior. Failure surfaces the error and the operator re-runs from CLI per the existing manual workflow.
+
+### Exit criteria
+
+- `clips` table replaces `plays`. Every clip has a type from {pre-game, play, timeout, challenge}, a 0-indexed monotonic `clip_number`, and a `marked` flag. Pre-Phase-14 DBs migrate cleanly (old plays data dropped — operator-confirmed).
+- Operator window: Begin Game (green) → confirm-modal End Game (red); Next Play, Time-out, Challenge, Mark Play all create / mark the right clip type with the right gating (Time-out and Challenge disabled until first Next Play; Challenge ignored back-to-back). Clip + play counters reflect ClipManager state. Camera ribbon hides/shows tiles on the operator window only.
+- Referee window: transport row has Play/Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind 5s, Step ◀, Step ▶, scrubber. Replay Play and Jump to Live are gone. Camera ribbon and play-number badge work per-window.
+- Challenge flow: pressing Challenge on operator window jumps the referee window to the start of the most-recent play, paused. Referee cannot seek before play.start or after play.end (auto-clamps to PAUSED). Lockout clears when operator presses Next Play / Time-out / End Game.
+- Post-process & Exit: pressing the link stops recording (if running), runs the post-processor in-app with a progress modal, and closes both windows on success / waits for OK on failure. CLI invocation still works as manual retry.
+- All existing replay / recovery / pipeline tests pass. New tests cover clip-type transitions, clip-bound clamping, the post-process dialog states, and the camera-ribbon visibility toggle.
+
+### Open questions to resolve before implementing
+
+1. **Counter placement on the operator window.** Spec says top-right. Implement as a free-floating `QLabel` overlay (like `MultiFeedVideoPanel`'s playback overlay), or as part of the right-edge button-stack chrome above the buttons? Overlay reads cleaner when the grid is full; chrome reads cleaner when tiles are hidden. (14.B can pick one; either way it's a small refactor later.)
+2. **Camera ribbon labels.** PDF shows numeric `[1][2][3][4]`. `FeedDefinition.display_name` is what the panel titles use today ("Camera 1", "Field cam"). Use the index, the display name, or a short alias? Numeric matches the mock; display name is more self-documenting at the cost of horizontal space.
+3. **Renaming `rewind_10_seconds` → `rewind_seconds_configurable` on the controller.** The 10-second magic is being removed; the public method name still hardcodes it. Rename for clarity, or keep the name and just change the magnitude internally (less ripple, more misleading)? Rename is the right call — `feedback_rename_grep` memory applies; do the full-repo grep.
+4. **Challenge overlay shape on the referee window.** During an active challenge, should the referee see an unambiguous on-screen indicator (e.g., a red "CHALLENGE — Play 7" pill over the panel)? Spec doesn't require it but the lockout behavior is otherwise invisible — pressing Rewind and nothing happening past play.start would look like a bug. Recommend: yes, render via `MultiFeedVideoPanel.set_playback_overlay()` augmented with a challenge-state field.
+5. **`plays_json_export.py` coupling.** Downstream tools consume the JSON. Do we control them? If yes, update them in 14.E. If they're out-of-tree, version the JSON schema and surface a `schema_version: 2` field so consumers can branch.
+
+### Phase 14 sequencing notes
+
+- **14.A blocks everything else.** The new clips vocabulary is referenced by every UI change. Land it under tests first; the rest is mechanical.
+- **14.B and 14.C are parallel-safe.** They touch different files (`operator_controls_widget.py` vs `referee_controls_widget.py`), different windows, different signals. If two people are working in parallel, split here.
+- **14.D depends on the operator's Challenge button existing (14.B) and the referee window having no Replay-Play button to confuse the lockout semantics (14.C).** Land 14.D last among the UI slices.
+- **14.E is independent of 14.D** but depends on 14.B for the Post-process link to exist. Can land between 14.B and 14.C, or after 14.D.
+- **Repo-wide rename grep is mandatory before declaring 14.A complete.** `feedback_rename_grep` memory: a partial-grep rename of a Qt signal in Phase 13 missed `next_clip_button` and crashed the app at startup. Touch every reference to `play_manager`, `mark_next_play`, `current_play_number`, `next_play_button` (where it should stay as Next Play but new clip-aware accessors are nearby), `play_id`, `play_number`, `auto_close_open_plays_for_session`.
+- **No GStreamer pipeline changes.** Phase 14 is entirely UI + state + schema. The existing recording / replay paths are unchanged.
+
+---
+
 # 19. Recommended Implementation Defaults
 
 Use these defaults unless hardware testing proves otherwise. The "shipped" column shows the current state; the "target" column shows the long-term default.
