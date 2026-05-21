@@ -1,4 +1,4 @@
-"""Phase 8.D — `plays.json` sidecar tests."""
+"""`plays.json` sidecar tests (Phase 8.D, updated for Phase 14.A clips schema)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.core.models import Play
+from app.core.models import (
+    CLIP_TYPE_CHALLENGE,
+    CLIP_TYPE_PLAY,
+    CLIP_TYPE_PRE_GAME,
+    CLIP_TYPE_TIMEOUT,
+    Clip,
+)
 from app.storage.metadata_db import MetadataDb
 from app.tools.plays_json_export import (
     PLAYS_SIDECAR_FILENAME,
@@ -26,25 +32,31 @@ def _new_db_with_session(tmp: str) -> MetadataDb:
     return db
 
 
-def _seed_play(
+def _seed_clip(
     db: MetadataDb,
     *,
     game_subdir: str,
-    play_number: int,
+    clip_number: int,
+    clip_type: str,
     start_ns: int,
     end_ns: int | None,
+    play_number: int | None = None,
+    marked: bool = False,
     auto_closed_on_crash: bool = False,
 ) -> int:
-    pid = db.insert_play(Play(
+    cid = db.insert_clip(Clip(
         session_id="session_001",
         game_subdir=game_subdir,
+        clip_number=clip_number,
+        type=clip_type,
         play_number=play_number,
+        marked=marked,
         start_session_time_ns=start_ns,
         created_at="2026-04-30T00:00:00+00:00",
     ))
     if end_ns is not None:
-        db.close_play(pid, end_ns, auto_closed_on_crash=auto_closed_on_crash)
-    return pid
+        db.close_clip(cid, end_ns, auto_closed_on_crash=auto_closed_on_crash)
+    return cid
 
 
 class PlaysSidecarShapeTests(unittest.TestCase):
@@ -61,14 +73,20 @@ class PlaysSidecarShapeTests(unittest.TestCase):
         self.db.close()
         self._temp_dir.cleanup()
 
-    def test_writes_well_formed_json_with_metadata_and_plays(self) -> None:
-        # Three plays: 0..4.5s, 4.5..7.7s, 7.7..12.0s.
-        _seed_play(self.db, game_subdir="game_001", play_number=1,
-                   start_ns=10_000_000_000, end_ns=14_500_000_000)
-        _seed_play(self.db, game_subdir="game_001", play_number=2,
-                   start_ns=14_500_000_000, end_ns=17_700_000_000)
-        _seed_play(self.db, game_subdir="game_001", play_number=3,
-                   start_ns=17_700_000_000, end_ns=22_000_000_000)
+    def test_writes_well_formed_json_with_metadata_and_clips(self) -> None:
+        # pre-game 0..0.4s, play 1 0.4..4.9s, play 2 4.9..8.1s, play 3 8.1..12.4s
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=10_000_000_000, end_ns=10_400_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=1,
+                   clip_type=CLIP_TYPE_PLAY, play_number=1,
+                   start_ns=10_400_000_000, end_ns=14_900_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=2,
+                   clip_type=CLIP_TYPE_PLAY, play_number=2,
+                   start_ns=14_900_000_000, end_ns=18_100_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=3,
+                   clip_type=CLIP_TYPE_PLAY, play_number=3,
+                   start_ns=18_100_000_000, end_ns=22_400_000_000)
 
         path = write_plays_sidecar(self.db, self.session_path, "game_001")
         self.assertTrue(path.exists())
@@ -77,60 +95,107 @@ class PlaysSidecarShapeTests(unittest.TestCase):
         payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload["session_id"], "session_001")
         self.assertEqual(payload["game_subdir"], "game_001")
+        self.assertEqual(payload["clip_count"], 4)
         self.assertEqual(payload["play_count"], 3)
-        # Game duration: last play's end (22s) − first play's start (10s) = 12s.
-        self.assertAlmostEqual(payload["game_duration_seconds"], 12.0, places=3)
-        self.assertEqual(len(payload["plays"]), 3)
-        # Game-relative seconds — first play starts at 0.0.
-        self.assertEqual(payload["plays"][0]["play_number"], 1)
-        self.assertEqual(payload["plays"][0]["start_seconds"], 0.0)
-        self.assertEqual(payload["plays"][0]["length_seconds"], 4.5)
-        self.assertEqual(payload["plays"][1]["start_seconds"], 4.5)
-        self.assertAlmostEqual(payload["plays"][1]["length_seconds"], 3.2, places=3)
-        self.assertAlmostEqual(payload["plays"][2]["start_seconds"], 7.7, places=3)
-        self.assertAlmostEqual(payload["plays"][2]["length_seconds"], 4.3, places=3)
+        # Game duration: last clip's end (22.4s) − first clip's start (10s) = 12.4s.
+        self.assertAlmostEqual(payload["game_duration_seconds"], 12.4, places=3)
+        self.assertEqual(len(payload["clips"]), 4)
+        # Game-relative seconds — first clip starts at 0.0.
+        self.assertEqual(payload["clips"][0]["clip_number"], 0)
+        self.assertEqual(payload["clips"][0]["type"], CLIP_TYPE_PRE_GAME)
+        self.assertIsNone(payload["clips"][0]["play_number"])
+        self.assertEqual(payload["clips"][0]["start_seconds"], 0.0)
+        self.assertAlmostEqual(payload["clips"][0]["length_seconds"], 0.4, places=3)
+        self.assertEqual(payload["clips"][1]["type"], CLIP_TYPE_PLAY)
+        self.assertEqual(payload["clips"][1]["play_number"], 1)
+        self.assertAlmostEqual(payload["clips"][1]["start_seconds"], 0.4, places=3)
+        self.assertAlmostEqual(payload["clips"][1]["length_seconds"], 4.5, places=3)
+        self.assertEqual(payload["clips"][3]["play_number"], 3)
 
-    def test_empty_plays_writes_plays_array_empty(self) -> None:
-        # No plays in the DB — sidecar still written with empty array.
+    def test_marked_flag_round_trips_into_payload(self) -> None:
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=1,
+                   clip_type=CLIP_TYPE_PLAY, play_number=1, marked=True,
+                   start_ns=400_000_000, end_ns=4_000_000_000)
         path = write_plays_sidecar(self.db, self.session_path, "game_001")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["plays"], [])
+        self.assertFalse(payload["clips"][0]["marked"])
+        self.assertTrue(payload["clips"][1]["marked"])
+
+    def test_timeout_and_challenge_emitted_with_null_play_number(self) -> None:
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=1,
+                   clip_type=CLIP_TYPE_PLAY, play_number=1,
+                   start_ns=400_000_000, end_ns=4_000_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=2,
+                   clip_type=CLIP_TYPE_TIMEOUT,
+                   start_ns=4_000_000_000, end_ns=4_300_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=3,
+                   clip_type=CLIP_TYPE_CHALLENGE,
+                   start_ns=4_300_000_000, end_ns=4_900_000_000)
+        path = write_plays_sidecar(self.db, self.session_path, "game_001")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        types = [c["type"] for c in payload["clips"]]
+        self.assertEqual(
+            types,
+            [CLIP_TYPE_PRE_GAME, CLIP_TYPE_PLAY, CLIP_TYPE_TIMEOUT, CLIP_TYPE_CHALLENGE],
+        )
+        self.assertIsNone(payload["clips"][2]["play_number"])
+        self.assertIsNone(payload["clips"][3]["play_number"])
+        # Only the one type='play' clip counts toward play_count.
+        self.assertEqual(payload["play_count"], 1)
+        self.assertEqual(payload["clip_count"], 4)
+
+    def test_empty_clips_writes_empty_array(self) -> None:
+        # No clips in the DB — sidecar still written with empty array.
+        path = write_plays_sidecar(self.db, self.session_path, "game_001")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["clips"], [])
+        self.assertEqual(payload["clip_count"], 0)
         self.assertEqual(payload["play_count"], 0)
         self.assertEqual(payload["game_duration_seconds"], 0.0)
 
-    def test_open_play_excluded_with_warning(self) -> None:
-        # One closed play, one open. JSON includes only the closed one.
-        _seed_play(self.db, game_subdir="game_001", play_number=1,
-                   start_ns=0, end_ns=4_000_000_000)
-        _seed_play(self.db, game_subdir="game_001", play_number=2,
-                   start_ns=4_000_000_000, end_ns=None)
+    def test_open_clip_excluded_with_warning(self) -> None:
+        # One closed clip, one open. JSON includes only the closed one.
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=1,
+                   clip_type=CLIP_TYPE_PLAY, play_number=1,
+                   start_ns=400_000_000, end_ns=None)
         with self.assertLogs(
             "app.tools.plays_json_export", level="WARNING"
         ) as captured:
             path = write_plays_sidecar(self.db, self.session_path, "game_001")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["play_count"], 1)
-        self.assertEqual(payload["plays"][0]["play_number"], 1)
-        self.assertTrue(any("open play" in msg for msg in captured.output))
+        self.assertEqual(payload["clip_count"], 1)
+        self.assertEqual(payload["clips"][0]["type"], CLIP_TYPE_PRE_GAME)
+        self.assertTrue(any("open clip" in msg for msg in captured.output))
 
-    def test_auto_closed_on_crash_plays_included_normally(self) -> None:
+    def test_auto_closed_on_crash_clips_included_normally(self) -> None:
         # The JSON contract doesn't surface the crash flag — consumers
         # don't need it. Lock that in so future changes don't leak the
         # internal field.
-        _seed_play(self.db, game_subdir="game_001", play_number=1,
-                   start_ns=0, end_ns=4_000_000_000,
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000,
                    auto_closed_on_crash=True)
         path = write_plays_sidecar(self.db, self.session_path, "game_001")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["play_count"], 1)
+        self.assertEqual(payload["clip_count"], 1)
         self.assertNotIn(
             "auto_closed_on_crash",
-            payload["plays"][0],
+            payload["clips"][0],
         )
 
     def test_sidecar_path_under_processed_game_subdir(self) -> None:
-        _seed_play(self.db, game_subdir="game_002", play_number=1,
-                   start_ns=0, end_ns=4_000_000_000)
+        _seed_clip(self.db, game_subdir="game_002", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
         path = write_plays_sidecar(self.db, self.session_path, "game_002")
         expected = (
             self.session_path / "processed" / "game_002" / PLAYS_SIDECAR_FILENAME
@@ -140,8 +205,9 @@ class PlaysSidecarShapeTests(unittest.TestCase):
     def test_idempotent_rewrite(self) -> None:
         # Writing twice produces the same output. Second call
         # overwrites without error.
-        _seed_play(self.db, game_subdir="game_001", play_number=1,
-                   start_ns=0, end_ns=4_000_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
         first = write_plays_sidecar(self.db, self.session_path, "game_001")
         first_text = first.read_text(encoding="utf-8")
         second = write_plays_sidecar(self.db, self.session_path, "game_001")
@@ -164,12 +230,15 @@ class WriteForSessionTests(unittest.TestCase):
         self._temp_dir.cleanup()
 
     def test_writes_one_sidecar_per_game(self) -> None:
-        _seed_play(self.db, game_subdir="game_001", play_number=1,
-                   start_ns=0, end_ns=4_000_000_000)
-        _seed_play(self.db, game_subdir="game_002", play_number=1,
-                   start_ns=10_000_000_000, end_ns=14_000_000_000)
-        _seed_play(self.db, game_subdir="game_002", play_number=2,
-                   start_ns=14_000_000_000, end_ns=18_000_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
+        _seed_clip(self.db, game_subdir="game_002", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=10_000_000_000, end_ns=10_400_000_000)
+        _seed_clip(self.db, game_subdir="game_002", clip_number=1,
+                   clip_type=CLIP_TYPE_PLAY, play_number=1,
+                   start_ns=10_400_000_000, end_ns=14_000_000_000)
         written = write_plays_sidecars_for_session(
             self.db, self.session_path, ["game_001", "game_002"]
         )
@@ -185,15 +254,18 @@ class WriteForSessionTests(unittest.TestCase):
             (self.session_path / "processed" / "game_002"
              / PLAYS_SIDECAR_FILENAME).read_text(encoding="utf-8")
         )
-        self.assertEqual(g1["play_count"], 1)
-        self.assertEqual(g2["play_count"], 2)
+        self.assertEqual(g1["clip_count"], 1)
+        self.assertEqual(g1["play_count"], 0)
+        self.assertEqual(g2["clip_count"], 2)
+        self.assertEqual(g2["play_count"], 1)
 
     def test_deduplicates_repeated_game_subdirs(self) -> None:
         # Caller might pass the same game multiple times (one per
         # feed in the long-form plan). We write one sidecar per
         # unique game.
-        _seed_play(self.db, game_subdir="game_001", play_number=1,
-                   start_ns=0, end_ns=4_000_000_000)
+        _seed_clip(self.db, game_subdir="game_001", clip_number=0,
+                   clip_type=CLIP_TYPE_PRE_GAME,
+                   start_ns=0, end_ns=400_000_000)
         written = write_plays_sidecars_for_session(
             self.db, self.session_path, ["game_001", "game_001", "game_001"]
         )

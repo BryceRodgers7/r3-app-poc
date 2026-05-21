@@ -70,12 +70,12 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = False
         coord.referee_controller = mock.Mock()
-        coord.play_manager = mock.Mock()
+        coord.clip_manager = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.mark_next_play()
-        coord.play_manager.mark_next_play.assert_not_called()
+        coord.clip_manager.mark_next_play.assert_not_called()
 
-    def test_mark_next_play_calls_play_manager_when_recording(self) -> None:
+    def test_mark_next_play_calls_clip_manager_when_recording(self) -> None:
         from app.core.application_coordinator import ApplicationCoordinator
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._recording_manager = mock.Mock()
@@ -83,25 +83,25 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord.referee_controller = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.session_clock.now_session_time_ns.return_value = 12_000_000_000
-        next_play = mock.Mock()
-        next_play.play_number = 3
-        coord.play_manager = mock.Mock()
-        coord.play_manager.mark_next_play.return_value = next_play
+        next_clip = mock.Mock()
+        next_clip.play_number = 3
+        coord.clip_manager = mock.Mock()
+        coord.clip_manager.mark_next_play.return_value = next_clip
         coord.mark_next_play()
-        coord.play_manager.mark_next_play.assert_called_once_with(12_000_000_000)
+        coord.clip_manager.mark_next_play.assert_called_once_with(12_000_000_000)
         coord.referee_controller.signals.status_message.emit.assert_called_once_with(
             "Play #3 started."
         )
 
-    def test_mark_next_play_no_op_without_play_manager(self) -> None:
-        # Older test/coordinator paths construct without a PlayManager.
+    def test_mark_next_play_no_op_without_clip_manager(self) -> None:
+        # Older test/coordinator paths construct without a ClipManager.
         # Method must be a clean no-op.
         from app.core.application_coordinator import ApplicationCoordinator
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._recording_manager = mock.Mock()
         coord._recording_manager.is_any_recording.return_value = True
         coord.referee_controller = mock.Mock()
-        coord.play_manager = None
+        coord.clip_manager = None
         coord.session_clock = mock.Mock()
         # Should not raise.
         coord.mark_next_play()

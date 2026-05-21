@@ -9,9 +9,10 @@ from PySide6.QtWidgets import QApplication
 
 from app.core.app_state import UiState
 from app.core.models import (
+    CLIP_TYPE_PLAY,
+    Clip,
     PlaybackMode,
     PlaybackOverlayInfo,
-    Play,
 )
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
@@ -20,10 +21,12 @@ from app.core.signals import AppSignals
 from app.ui.referee_controls_widget import RefereeControlsWidget
 
 
-def _make_play(*, play_number: int, start_ns: int) -> Play:
-    return Play(
+def _make_play_clip(*, play_number: int, start_ns: int, clip_number: int = 1) -> Clip:
+    return Clip(
         session_id="session_001",
         game_subdir="game_001",
+        clip_number=clip_number,
+        type=CLIP_TYPE_PLAY,
         play_number=play_number,
         start_session_time_ns=start_ns,
         created_at="2026-04-30T00:00:00+00:00",
@@ -33,7 +36,7 @@ def _make_play(*, play_number: int, start_ns: int) -> Play:
 def _build_pc_stub(
     *,
     is_recording: bool,
-    play_manager,
+    clip_manager,
     live_only: bool = False,
     earliest_replayable_ns: int | None = 0,
 ) -> PlaybackController:
@@ -52,7 +55,7 @@ def _build_pc_stub(
     pc._playback_session_time_ns = None
     pc._playback_rate = 1.0
     pc._session_clock = None
-    pc._play_manager = play_manager
+    pc._clip_manager = clip_manager
     pc._live_only = live_only
     pc._replay_store = mock.Mock()
     pc._replay_store.available_session_time_range.return_value = (
@@ -87,10 +90,10 @@ class ReplayCurrentPlayHappyPathTests(unittest.TestCase):
         cls._app = QApplication.instance() or QApplication([])
 
     def test_seeks_to_play_start_and_enters_replay(self) -> None:
-        play = _make_play(play_number=2, start_ns=8_000_000_000)
+        play = _make_play_clip(play_number=2, start_ns=8_000_000_000)
         pm = mock.Mock()
-        pm.current_play.return_value = play
-        pc = _build_pc_stub(is_recording=True, play_manager=pm)
+        pm.current_clip.return_value = play
+        pc = _build_pc_stub(is_recording=True, clip_manager=pm)
         pc.replay_current_play()
         # Playback session time = the play's start.
         self.assertEqual(pc._playback_session_time_ns, 8_000_000_000)
@@ -108,12 +111,12 @@ class ReplayCurrentPlayHappyPathTests(unittest.TestCase):
         # (e.g. operator pressed Start before the first segment
         # finalized). Seek should clamp to 9s; the §8.6.1 freeze-frame
         # rule would then render the first frame as a freeze.
-        play = _make_play(play_number=1, start_ns=7_000_000_000)
+        play = _make_play_clip(play_number=1, start_ns=7_000_000_000)
         pm = mock.Mock()
-        pm.current_play.return_value = play
+        pm.current_clip.return_value = play
         pc = _build_pc_stub(
             is_recording=True,
-            play_manager=pm,
+            clip_manager=pm,
             earliest_replayable_ns=9_000_000_000,
         )
         pc.replay_current_play()
@@ -121,10 +124,10 @@ class ReplayCurrentPlayHappyPathTests(unittest.TestCase):
         pc._render_at_session_time_ns.assert_called_once_with(9_000_000_000)
 
     def test_status_message_includes_play_number(self) -> None:
-        play = _make_play(play_number=5, start_ns=20_000_000_000)
+        play = _make_play_clip(play_number=5, start_ns=20_000_000_000)
         pm = mock.Mock()
-        pm.current_play.return_value = play
-        pc = _build_pc_stub(is_recording=True, play_manager=pm)
+        pm.current_clip.return_value = play
+        pc = _build_pc_stub(is_recording=True, clip_manager=pm)
         pc.replay_current_play()
         pc._emit_state.assert_called_once_with("Replaying Play #5")
 
@@ -136,8 +139,8 @@ class ReplayCurrentPlayNoOpTests(unittest.TestCase):
 
     def test_no_op_when_live_only(self) -> None:
         pm = mock.Mock()
-        pm.current_play.return_value = _make_play(play_number=1, start_ns=0)
-        pc = _build_pc_stub(is_recording=True, play_manager=pm, live_only=True)
+        pm.current_clip.return_value = _make_play_clip(play_number=1, start_ns=0)
+        pc = _build_pc_stub(is_recording=True, clip_manager=pm, live_only=True)
         pc.replay_current_play()
         pc._render_at_session_time_ns.assert_not_called()
         pc._start_replay_clock_locked.assert_not_called()
@@ -146,25 +149,45 @@ class ReplayCurrentPlayNoOpTests(unittest.TestCase):
 
     def test_no_op_when_not_recording(self) -> None:
         pm = mock.Mock()
-        pc = _build_pc_stub(is_recording=False, play_manager=pm)
+        pc = _build_pc_stub(is_recording=False, clip_manager=pm)
         pc.replay_current_play()
         pc._render_at_session_time_ns.assert_not_called()
         pc._emit_state.assert_called_once_with(
             "Replay unavailable: start game recording first."
         )
 
-    def test_no_op_when_no_play_manager(self) -> None:
-        pc = _build_pc_stub(is_recording=True, play_manager=None)
+    def test_no_op_when_no_clip_manager(self) -> None:
+        pc = _build_pc_stub(is_recording=True, clip_manager=None)
         pc.replay_current_play()
         pc._render_at_session_time_ns.assert_not_called()
         pc._emit_state.assert_not_called()
 
     def test_no_op_when_no_open_play(self) -> None:
-        # PlayManager is attached but no play is open (defensive —
+        # ClipManager is attached but no clip is open (defensive —
         # shouldn't happen during RECORDING but locked in).
         pm = mock.Mock()
-        pm.current_play.return_value = None
-        pc = _build_pc_stub(is_recording=True, play_manager=pm)
+        pm.current_clip.return_value = None
+        pc = _build_pc_stub(is_recording=True, clip_manager=pm)
+        pc.replay_current_play()
+        pc._render_at_session_time_ns.assert_not_called()
+        pc._emit_state.assert_called_once_with("No play is currently open.")
+
+    def test_no_op_when_current_clip_is_not_a_play(self) -> None:
+        # During pre-game / timeout / challenge, replay_current_play
+        # has no target play to seek to. Until 14.D extends this to
+        # the most-recent play, the current clip must be a play.
+        from app.core.models import CLIP_TYPE_PRE_GAME
+        pm = mock.Mock()
+        pm.current_clip.return_value = Clip(
+            session_id="session_001",
+            game_subdir="game_001",
+            clip_number=0,
+            type=CLIP_TYPE_PRE_GAME,
+            play_number=None,
+            start_session_time_ns=0,
+            created_at="2026-04-30T00:00:00+00:00",
+        )
+        pc = _build_pc_stub(is_recording=True, clip_manager=pm)
         pc.replay_current_play()
         pc._render_at_session_time_ns.assert_not_called()
         pc._emit_state.assert_called_once_with("No play is currently open.")

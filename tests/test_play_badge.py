@@ -16,7 +16,7 @@ from app.ui.status_bar_widget import _format_play_badge
 def _build_pc_stub(
     *,
     is_recording: bool,
-    play_manager,
+    clip_manager,
 ) -> PlaybackController:
     """Stub PlaybackController exercising `_update_state_timestamps_locked`."""
     pc = PlaybackController.__new__(PlaybackController)
@@ -28,7 +28,7 @@ def _build_pc_stub(
     pc._playback_session_time_ns = None
     pc._playback_rate = 1.0
     pc._session_clock = None
-    pc._play_manager = play_manager
+    pc._clip_manager = clip_manager  # ClipManager (Phase 14.A)
     pc._replay_store = type(
         "S", (), {"available_session_time_range": lambda self: (None, None)}
     )()
@@ -42,26 +42,27 @@ def _build_pc_stub(
 
 
 class ControllerPropagatesPlayNumberTests(unittest.TestCase):
-    def test_play_number_propagates_when_play_manager_has_open_play(self) -> None:
-        pm = mock.Mock()
-        pm.current_play_number.return_value = 3
-        pc = _build_pc_stub(is_recording=True, play_manager=pm)
+    def test_play_number_propagates_when_clip_manager_has_open_play(self) -> None:
+        cm = mock.Mock()
+        cm.current_play_number.return_value = 3
+        pc = _build_pc_stub(is_recording=True, clip_manager=cm)
         pc._update_state_timestamps_locked()
         self.assertEqual(pc._state.current_play_number, 3)
         self.assertEqual(pc._state.playback_overlay.current_play_number, 3)
 
     def test_play_number_none_when_no_open_play(self) -> None:
-        # PlayManager exists but reports no open play (between games).
-        pm = mock.Mock()
-        pm.current_play_number.return_value = None
-        pc = _build_pc_stub(is_recording=False, play_manager=pm)
+        # ClipManager exists but reports no open play (between games,
+        # or during a pre-game clip before the first Next Play press).
+        cm = mock.Mock()
+        cm.current_play_number.return_value = None
+        pc = _build_pc_stub(is_recording=False, clip_manager=cm)
         pc._update_state_timestamps_locked()
         self.assertIsNone(pc._state.current_play_number)
         self.assertIsNone(pc._state.playback_overlay.current_play_number)
 
-    def test_play_number_none_when_no_play_manager(self) -> None:
+    def test_play_number_none_when_no_clip_manager(self) -> None:
         # Older test paths construct PlaybackController without one.
-        pc = _build_pc_stub(is_recording=False, play_manager=None)
+        pc = _build_pc_stub(is_recording=False, clip_manager=None)
         pc._update_state_timestamps_locked()
         self.assertIsNone(pc._state.current_play_number)
         self.assertIsNone(pc._state.playback_overlay.current_play_number)

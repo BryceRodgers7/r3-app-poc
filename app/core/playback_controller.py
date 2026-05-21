@@ -24,7 +24,7 @@ from app.media.segment_decoder import SegmentDecoder
 from app.storage.segment_replay_store import RecordingSegmentReplayStore
 
 if TYPE_CHECKING:
-    from app.core.play_manager import PlayManager
+    from app.core.clip_manager import ClipManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ class PlaybackController:
         live_only: bool = False,
         decoder_factory: Callable[[str, str], SegmentDecoder] | None = None,
         session_clock: SessionClock | None = None,
-        play_manager: "PlayManager | None" = None,
+        clip_manager: "ClipManager | None" = None,
         frame_period_ns: int = _DEFAULT_FRAME_PERIOD_NS,
     ) -> None:
         if not feed_runtimes:
@@ -92,10 +92,10 @@ class PlaybackController:
         # quanta. Falls back to the segment-derived metric when no
         # clock is attached (test fixtures, headless tooling).
         self._session_clock = session_clock
-        # Phase 7.H.3: read-only access to the PlayManager so
+        # Phase 14.A: read-only access to the ClipManager so
         # `_update_state_timestamps_locked` can populate the
         # current play number on UiState + PlaybackOverlayInfo.
-        self._play_manager = play_manager
+        self._clip_manager = clip_manager
         self._default_source_name = default_source_name
         self._session_role = session_role
         self._live_only = live_only
@@ -237,19 +237,22 @@ class PlaybackController:
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def replay_current_play(self) -> None:
-        """Phase 7.H.4: seek to the start of the currently-open play.
+        """Seek to the start of the currently-open play.
 
-        Operator's "Replay Play" button. The currently-open play's
-        `start_session_time_ns` is the seek target — playback resumes
-        at 1.0x from there. To go further back, the operator stacks
-        Rewind 10s clicks.
+        Wired to the referee window's "Replay Play" button (kept for
+        Phase 14.A transitional behavior; Phase 14.C removes the
+        explicit button and Phase 14.D repurposes this primitive as
+        the Challenge-open hook). The currently-open play clip's
+        `start_session_time_ns` is the seek target — playback
+        resumes at 1.0x from there.
 
         No-op when:
           - this is the live-only program output
           - replay isn't available (recording not active)
-          - no PlayManager is attached (older test paths)
-          - no play is currently open (defensive — Play #1 should
-            always be open when recording is active)
+          - no ClipManager is attached (older test paths)
+          - no clip is currently open OR the current clip is not a
+            play (Phase 14.D will refine this for timeout/challenge
+            interleaving)
         """
         if getattr(self, "_shutting_down", False):
             return
@@ -259,10 +262,10 @@ class PlaybackController:
         if not self._replay_actions_allowed():
             self._emit_state("Replay unavailable: start game recording first.")
             return
-        if self._play_manager is None:
+        if self._clip_manager is None:
             return
-        current = self._play_manager.current_play()
-        if current is None:
+        current = self._clip_manager.current_clip()
+        if current is None or not current.is_play:
             self._emit_state("No play is currently open.")
             return
         target_session_time_ns = current.start_session_time_ns
@@ -285,6 +288,8 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(target_session_time_ns)
         self._emit_state(f"Replaying Play #{current.play_number}")
+        # Defensive: play_number is non-NULL by Clip's CHECK constraint
+        # when type='play', so the format above is well-defined.
 
     def jump_to_live(self) -> None:
         """Return the viewed output to the live edge."""
@@ -845,12 +850,14 @@ class PlaybackController:
         self._state.replay_available = (
             latest_session_time_ns is not None and is_recording
         )
-        # Phase 7.H.3: pull the currently-open play number from the
-        # PlayManager. None when no game is being recorded (PlayManager
-        # has no open play between Stop and the next Start).
+        # Phase 14.A: pull the most-recent play number from the
+        # ClipManager. None when no game is being recorded, OR
+        # during a pre-game clip before the first Next Play press.
+        # During timeout / challenge clips this returns the last
+        # opened play's number so the overlay still shows "Play N".
         self._state.current_play_number = (
-            self._play_manager.current_play_number()
-            if self._play_manager is not None
+            self._clip_manager.current_play_number()
+            if self._clip_manager is not None
             else None
         )
         if latest_session_time_ns is None:

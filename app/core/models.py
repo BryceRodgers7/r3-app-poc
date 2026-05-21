@@ -140,9 +140,10 @@ class PlaybackOverlayInfo:
     unavailable per §10.4 / §15.2), so showing a static "LIVE" badge
     just adds visual noise.
 
-    Phase 7.H.3 adds `current_play_number` so the overlay can show
-    `Play #N` alongside the LIVE/REPLAY/PAUSED badge while a game is
-    in progress.
+    `current_play_number` carries the most-recent play number so the
+    overlay can show `Play #N` alongside the LIVE/REPLAY/PAUSED badge
+    while a game is in progress. None during pre-game (before the
+    first Next Play press).
     """
 
     mode: PlaybackMode = PlaybackMode.SOURCE_LOST
@@ -238,30 +239,62 @@ EXPORT_STATUS_SUCCESS = "success"
 EXPORT_STATUS_FAILED = "failed"
 
 
+# Phase 14.A: clip types. Every moment of a recording belongs to
+# exactly one clip; the operator's buttons drive the transitions:
+#   - 'pre-game': opened by Start Game; exactly one per game, before
+#     the first Next Play press.
+#   - 'play': opened by Next Play; 1-indexed `play_number` per game.
+#   - 'timeout': opened by Time-out; `play_number` is NULL.
+#   - 'challenge': opened by Challenge; `play_number` is NULL.
+CLIP_TYPE_PRE_GAME = "pre-game"
+CLIP_TYPE_PLAY = "play"
+CLIP_TYPE_TIMEOUT = "timeout"
+CLIP_TYPE_CHALLENGE = "challenge"
+CLIP_TYPES: tuple[str, ...] = (
+    CLIP_TYPE_PRE_GAME,
+    CLIP_TYPE_PLAY,
+    CLIP_TYPE_TIMEOUT,
+    CLIP_TYPE_CHALLENGE,
+)
+
+
 @dataclass(slots=True, frozen=True)
-class Play:
-    """One operator-marked play within a game (Phase 7.H, §6.7).
+class Clip:
+    """One operator-marked clip within a game (Phase 14.A, §6.7).
 
-    Every moment of a recording belongs to a play — there is no
-    "between plays" state. Play #1 opens implicitly when "Start game
-    recording" fires; "Next Play" closes the currently-open play and
-    immediately opens the next one. Plays are operator-scoped (one
-    sequence per game across all feeds), not feed-scoped.
+    Replaces the pre-Phase-14 `Play` model. Every moment of a
+    recording belongs to a clip — there is no "between clips"
+    state. `clip_number` is 0-indexed and monotonic per game across
+    every type (pre-game = 0, the first play = 1, etc., regardless
+    of timeouts/challenges interleaving). `play_number` is non-NULL
+    only when `type == CLIP_TYPE_PLAY` and is 1-indexed per game so
+    operator-facing counters can ignore non-play clips.
 
-    `end_session_time_ns` is NULL while a play is currently open.
-    `auto_closed_on_crash` is True only for plays the §11.4 recovery
+    `end_session_time_ns` is NULL while a clip is currently open.
+    `auto_closed_on_crash` is True only for clips the §11.4 recovery
     scan auto-closed at the latest finalized segment's end (the
     operator never marked the close because the app crashed).
     """
 
     session_id: str
     game_subdir: str
-    play_number: int  # 1-based, unique within (session_id, game_subdir)
+    clip_number: int  # 0-indexed, unique within (session_id, game_subdir)
+    type: str  # one of CLIP_TYPES
     start_session_time_ns: int
     created_at: str
-    play_id: int | None = None  # set on insert by SQLite
+    clip_id: int | None = None  # set on insert by SQLite
+    play_number: int | None = None  # non-NULL iff type == CLIP_TYPE_PLAY
+    marked: bool = False
     end_session_time_ns: int | None = None
     auto_closed_on_crash: bool = False
+
+    @property
+    def is_play(self) -> bool:
+        return self.type == CLIP_TYPE_PLAY
+
+    @property
+    def is_open(self) -> bool:
+        return self.end_session_time_ns is None
 
 
 @dataclass(slots=True, frozen=True)

@@ -28,7 +28,7 @@ class _ShutdownDrainTests(unittest.TestCase):
     """Build a minimal coordinator with mocked dependencies and exercise
     the shutdown drain decision branches."""
 
-    def _build_coord(self, *, recording: bool, with_play_manager: bool = True):
+    def _build_coord(self, *, recording: bool, with_clip_manager: bool = True):
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._shutting_down = False
         coord.telemetry_hub = mock.Mock()
@@ -39,7 +39,7 @@ class _ShutdownDrainTests(unittest.TestCase):
         coord.replay_store = mock.Mock()
         coord.session_clock = mock.Mock()
         coord.session_clock.now_session_time_ns.return_value = 12345
-        coord.play_manager = mock.Mock() if with_play_manager else None
+        coord.clip_manager = mock.Mock() if with_clip_manager else None
         recording_manager = mock.Mock()
         recording_manager.is_any_recording.return_value = recording
         recording_manager.recording_state = make_recording_state_machine()
@@ -87,11 +87,11 @@ class _ShutdownDrainTests(unittest.TestCase):
             runtime.pipeline_manager.disable_file_recording.assert_not_called()
             runtime.stop.assert_called_once()
 
-    def test_shutdown_calls_play_manager_stop_game_when_recording(self) -> None:
+    def test_shutdown_calls_clip_manager_stop_game_when_recording(self) -> None:
         coord = self._build_coord(recording=True)
         with mock.patch("app.core.application_coordinator.default_health_log"):
             coord.shutdown()
-        coord.play_manager.stop_game.assert_called_once_with(12345)
+        coord.clip_manager.stop_game.assert_called_once_with(12345)
 
     def test_shutdown_handles_disable_file_recording_exception(self) -> None:
         coord = self._build_coord(recording=True)
@@ -159,10 +159,10 @@ class CoordinatorTransportGateTests(unittest.TestCase):
         coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
         coord._shutting_down = True
         coord._recording_manager = mock.Mock()
-        coord.play_manager = mock.Mock()
+        coord.clip_manager = mock.Mock()
         coord.mark_next_play()
         coord._recording_manager.is_any_recording.assert_not_called()
-        coord.play_manager.mark_next_play.assert_not_called()
+        coord.clip_manager.mark_next_play.assert_not_called()
 
 
 class PlaybackControllerTransportGateTests(unittest.TestCase):
@@ -174,7 +174,7 @@ class PlaybackControllerTransportGateTests(unittest.TestCase):
         pc = PlaybackController.__new__(PlaybackController)
         pc._shutting_down = True
         pc._live_only = False
-        pc._play_manager = mock.Mock()
+        pc._clip_manager = mock.Mock()
         pc._replay_store = mock.Mock()
         pc._lock = mock.MagicMock()
         pc.signals = mock.Mock()

@@ -8,7 +8,14 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
-from app.core.models import EXPORT_STATUS_SUCCESS, ExportArtifact, Play, Segment
+from app.core.models import (
+    CLIP_TYPES,
+    CLIP_TYPE_PLAY,
+    EXPORT_STATUS_SUCCESS,
+    Clip,
+    ExportArtifact,
+    Segment,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -146,32 +153,47 @@ class MetadataDb:
             "CREATE INDEX IF NOT EXISTS export_artifacts_by_session "
             "ON export_artifacts(session_id, status)"
         )
-        # Phase 7.H: per-game play markers. Every moment of a
-        # recording belongs to a play; the operator marks boundaries
-        # via the "Next Play" button. `end_session_time_ns` is NULL
-        # while a play is currently open. `auto_closed_on_crash` is
-        # True only when the §11.4 recovery scan closed the play at
-        # the latest finalized segment's end (because the app
-        # crashed before the operator marked the boundary).
+        # Phase 14.A: per-game clip markers (replaces the pre-Phase-14
+        # `plays` table). Every moment of a recording belongs to a
+        # clip; the operator marks boundaries via the Next Play /
+        # Time-out / Challenge / End Game buttons. `clip_number` is
+        # 0-indexed and monotonic per game across every type;
+        # `play_number` is non-NULL only when `type='play'` and is
+        # 1-indexed per game. `end_session_time_ns` is NULL while a
+        # clip is currently open. `auto_closed_on_crash` is True
+        # only when the §11.4 recovery scan closed the clip at the
+        # latest finalized segment's end (the app crashed before the
+        # operator marked the boundary).
+        self._migrate_drop_legacy_plays_table_locked(connection)
         connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plays (
-                play_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            f"""
+            CREATE TABLE IF NOT EXISTS clips (
+                clip_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 game_subdir TEXT NOT NULL,
-                play_number INTEGER NOT NULL,
+                clip_number INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                play_number INTEGER,
+                marked INTEGER NOT NULL DEFAULT 0,
                 start_session_time_ns INTEGER NOT NULL,
                 end_session_time_ns INTEGER,
                 created_at TEXT NOT NULL,
                 auto_closed_on_crash INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(session_id) REFERENCES sessions(session_id),
-                UNIQUE(session_id, game_subdir, play_number)
+                UNIQUE(session_id, game_subdir, clip_number),
+                CHECK (type IN ({", ".join(repr(t) for t in CLIP_TYPES)})),
+                CHECK ((type = '{CLIP_TYPE_PLAY}') = (play_number IS NOT NULL))
             )
             """
         )
         connection.execute(
-            "CREATE INDEX IF NOT EXISTS plays_by_game "
-            "ON plays(session_id, game_subdir, play_number)"
+            "CREATE INDEX IF NOT EXISTS clips_by_game "
+            "ON clips(session_id, game_subdir, clip_number)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS clips_by_play_number "
+            "ON clips(session_id, game_subdir, play_number) "
+            "WHERE play_number IS NOT NULL"
         )
         connection.commit()
 
@@ -229,6 +251,28 @@ class MetadataDb:
             connection.rollback()
             raise
         LOGGER.info("segments table migration complete")
+
+    def _migrate_drop_legacy_plays_table_locked(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Phase 14.A: drop the legacy `plays` table if present.
+
+        Operator-confirmed: pre-Phase-14 plays data is throwaway, so no
+        copy-into-clips migration is needed. The new `clips` table is
+        created fresh by `_initialize_schema` immediately after this
+        call returns.
+        """
+        row = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='plays'"
+        ).fetchone()
+        if row is None:
+            return
+        LOGGER.info(
+            "dropping legacy `plays` table (Phase 14.A schema migration)"
+        )
+        connection.execute("DROP INDEX IF EXISTS plays_by_game")
+        connection.execute("DROP TABLE plays")
 
     def create_session(self, session_id: str, source_name: str, started_at: str) -> None:
         """Insert a session row into the metadata database."""
@@ -431,86 +475,104 @@ class MetadataDb:
         }
 
     # ----------------------------------------------------------------
-    # Phase 7.H: plays table CRUD
+    # Phase 14.A: clips table CRUD
     # ----------------------------------------------------------------
 
-    def insert_play(self, play: Play) -> int:
-        """Insert a `Play` row and return its `play_id`."""
+    def insert_clip(self, clip: Clip) -> int:
+        """Insert a `Clip` row and return its `clip_id`."""
         connection = self.connect()
         with self._write_lock:
             cursor = connection.execute(
                 """
-                INSERT INTO plays (
-                    session_id, game_subdir, play_number,
+                INSERT INTO clips (
+                    session_id, game_subdir, clip_number, type,
+                    play_number, marked,
                     start_session_time_ns, end_session_time_ns,
                     created_at, auto_closed_on_crash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    play.session_id,
-                    play.game_subdir,
-                    play.play_number,
-                    play.start_session_time_ns,
-                    play.end_session_time_ns,
-                    play.created_at,
-                    1 if play.auto_closed_on_crash else 0,
+                    clip.session_id,
+                    clip.game_subdir,
+                    clip.clip_number,
+                    clip.type,
+                    clip.play_number,
+                    1 if clip.marked else 0,
+                    clip.start_session_time_ns,
+                    clip.end_session_time_ns,
+                    clip.created_at,
+                    1 if clip.auto_closed_on_crash else 0,
                 ),
             )
             connection.commit()
             return int(cursor.lastrowid)
 
-    def close_play(
+    def close_clip(
         self,
-        play_id: int,
+        clip_id: int,
         end_session_time_ns: int,
         *,
         auto_closed_on_crash: bool = False,
     ) -> None:
-        """Set `end_session_time_ns` (and optionally the
-        `auto_closed_on_crash` flag) on an existing play row.
+        """Set `end_session_time_ns` (and optionally `auto_closed_on_crash`)
+        on an existing clip row.
 
-        Used by both the operator path (Next Play, Stop game recording)
-        and the §11.4 recovery scan path.
+        Used by the operator path (Next Play / Time-out / Challenge /
+        Stop game recording) and the §11.4 recovery scan path.
         """
         connection = self.connect()
         with self._write_lock:
             connection.execute(
                 """
-                UPDATE plays
+                UPDATE clips
                 SET end_session_time_ns = ?,
                     auto_closed_on_crash = ?
-                WHERE play_id = ?
+                WHERE clip_id = ?
                 """,
                 (
                     end_session_time_ns,
                     1 if auto_closed_on_crash else 0,
-                    play_id,
+                    clip_id,
                 ),
             )
             connection.commit()
 
-    def plays_for_game(
+    def set_clip_marked(self, clip_id: int, marked: bool) -> None:
+        """Toggle the `marked` flag on an existing clip row.
+
+        Driven by the operator's Mark Play button. Any clip type may
+        be marked; downstream consumers filter as needed.
+        """
+        connection = self.connect()
+        with self._write_lock:
+            connection.execute(
+                "UPDATE clips SET marked = ? WHERE clip_id = ?",
+                (1 if marked else 0, clip_id),
+            )
+            connection.commit()
+
+    def clips_for_game(
         self, session_id: str, game_subdir: str
-    ) -> list[Play]:
-        """Return every play for `(session_id, game_subdir)`,
-        ordered by `play_number`."""
+    ) -> list[Clip]:
+        """Return every clip for `(session_id, game_subdir)`,
+        ordered by `clip_number`."""
         connection = self.connect()
         with self._write_lock:
             rows = connection.execute(
                 """
-                SELECT * FROM plays
+                SELECT * FROM clips
                 WHERE session_id = ? AND game_subdir = ?
-                ORDER BY play_number
+                ORDER BY clip_number
                 """,
                 (session_id, game_subdir),
             ).fetchall()
-        return [_row_to_play(row) for row in rows]
+        return [_row_to_clip(row) for row in rows]
 
-    def open_plays_for_session(self, session_id: str) -> list[Play]:
-        """Return every play in `session_id` whose `end_session_time_ns`
+    def open_clips_for_session(self, session_id: str) -> list[Clip]:
+        """Return every clip in `session_id` whose `end_session_time_ns`
         is NULL (still open).
 
-        Used by the §11.4 recovery scan to identify plays that need
+        Used by the §11.4 recovery scan to identify clips that need
         to be auto-closed because the app crashed before the operator
         marked their end.
         """
@@ -518,13 +580,13 @@ class MetadataDb:
         with self._write_lock:
             rows = connection.execute(
                 """
-                SELECT * FROM plays
+                SELECT * FROM clips
                 WHERE session_id = ? AND end_session_time_ns IS NULL
-                ORDER BY game_subdir, play_number
+                ORDER BY game_subdir, clip_number
                 """,
                 (session_id,),
             ).fetchall()
-        return [_row_to_play(row) for row in rows]
+        return [_row_to_clip(row) for row in rows]
 
     def close(self) -> None:
         """Close the active database connection."""
@@ -575,14 +637,17 @@ def _row_to_export_artifact(row: sqlite3.Row) -> ExportArtifact:
     )
 
 
-def _row_to_play(row: sqlite3.Row) -> Play:
-    return Play(
-        play_id=int(row["play_id"]),
+def _row_to_clip(row: sqlite3.Row) -> Clip:
+    return Clip(
         session_id=str(row["session_id"]),
         game_subdir=str(row["game_subdir"]),
-        play_number=int(row["play_number"]),
+        clip_number=int(row["clip_number"]),
+        type=str(row["type"]),
         start_session_time_ns=int(row["start_session_time_ns"]),
-        end_session_time_ns=row["end_session_time_ns"],
         created_at=str(row["created_at"]),
+        clip_id=int(row["clip_id"]),
+        play_number=row["play_number"],
+        marked=bool(row["marked"]),
+        end_session_time_ns=row["end_session_time_ns"],
         auto_closed_on_crash=bool(row["auto_closed_on_crash"]),
     )

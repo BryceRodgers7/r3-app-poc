@@ -76,7 +76,7 @@ class ControllerPropagatesIsRecordingTests(unittest.TestCase):
         controller._playback_session_time_ns = None
         controller._playback_rate = 1.0
         controller._session_clock = None
-        controller._play_manager = None
+        controller._clip_manager = None
         controller._replay_store = type(
             "S", (), {
                 "available_session_time_range": lambda self: (None, None),
@@ -108,7 +108,7 @@ class ControllerPropagatesIsRecordingTests(unittest.TestCase):
         controller._playback_session_time_ns = None
         controller._playback_rate = 1.0
         controller._session_clock = None
-        controller._play_manager = None
+        controller._clip_manager = None
         controller._replay_store = type(
             "S", (), {
                 "available_session_time_range": lambda self: (None, None),

@@ -54,10 +54,12 @@ class UiState:
     latest_replayable_session_time_ns: int | None = None
     live_lag_behind_replayable_seconds: float = 0.0
     replay_available: bool = False
-    # Phase 7.H.3: currently-open play number, scoped per game.
-    # None when no game is being recorded. Populated by
+    # Most-recent play number, scoped per game. None when no game is
+    # being recorded OR during a pre-game clip before the first
+    # Next Play press. During timeout / challenge clips this carries
+    # the last opened play's number. Populated by
     # `PlaybackController._update_state_timestamps_locked` from
-    # `PlayManager.current_play_number()`.
+    # `ClipManager.current_play_number()`.
     current_play_number: int | None = None
 
 

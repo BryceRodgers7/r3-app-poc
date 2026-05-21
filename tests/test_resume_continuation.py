@@ -93,10 +93,10 @@ def _build_coordinator_stub(
     coord.session_clock = session_clock
     coord.replay_store = RecordingSegmentReplayStore(segment_index)
     coord._resume_continuation = None
-    # Phase 7.H.1: `_setup_resume_continuation` calls
-    # `play_manager.auto_close_open_plays_for_session` if present.
-    # None disables that path — these tests don't seed any plays.
-    coord.play_manager = None
+    # Phase 14.A: `_setup_resume_continuation` calls
+    # `clip_manager.auto_close_open_clips_for_session` if present.
+    # None disables that path — these tests don't seed any clips.
+    coord.clip_manager = None
     return coord
 
 

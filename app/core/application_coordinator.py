@@ -31,6 +31,7 @@ class _ResumeContinuation:
     game_subdir: str
     game_start_session_time_ns: int
 from app.core.application_state import AppState, compute_app_state
+from app.core.clip_manager import ClipManager
 from app.core.disk_budget import (
     BudgetVerdict,
     DiskBudgetAssessment,
@@ -40,7 +41,6 @@ from app.core.disk_budget import (
 from app.core.feed_registry import FeedRegistry
 from app.core.feed_state import make_feed_state_machine
 from app.core.health_events import HealthSeverity, default_log as default_health_log
-from app.core.play_manager import PlayManager
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
 from app.core.session_state import SessionState
@@ -79,7 +79,7 @@ class ApplicationCoordinator:
         segment_index: SegmentIndex | None = None,
         session_clock: SessionClock | None = None,
         disk_budget: DiskBudgetAssessment | None = None,
-        play_manager: PlayManager | None = None,
+        clip_manager: ClipManager | None = None,
         disk_usage_fn: Callable[[Any], Any] | None = None,
     ) -> None:
         self._settings = settings
@@ -114,12 +114,12 @@ class ApplicationCoordinator:
         # math is anchored to the same monotonic origin as the segment
         # rows it queries.
         self.session_clock = session_clock if session_clock is not None else SessionClock()
-        # Phase 7.H.1: per-game play boundary tracker. None when the
-        # coordinator was constructed without one (older test paths
-        # that bypass `build_default_application_coordinator`). Must
-        # be set BEFORE the PlaybackControllers below so they can
-        # read it.
-        self.play_manager = play_manager
+        # Phase 14.A: per-game clip boundary tracker (replaces the
+        # pre-Phase-14 `play_manager`). None when the coordinator
+        # was constructed without one (older test paths that bypass
+        # `build_default_application_coordinator`). Must be set
+        # BEFORE the PlaybackControllers below so they can read it.
+        self.clip_manager = clip_manager
 
         primary_feed = feed_registry.get_primary_feed()
         enabled_feeds = feed_registry.get_enabled_feeds()
@@ -141,7 +141,7 @@ class ApplicationCoordinator:
             session_role="referee",
             live_only=False,
             session_clock=self.session_clock,
-            play_manager=self.play_manager,
+            clip_manager=self.clip_manager,
             frame_period_ns=frame_period_ns,
         )
         self.operator_controller = PlaybackController(
@@ -153,7 +153,7 @@ class ApplicationCoordinator:
             session_role="operator",
             live_only=True,
             session_clock=self.session_clock,
-            play_manager=self.play_manager,
+            clip_manager=self.clip_manager,
             frame_period_ns=frame_period_ns,
         )
         self._session_started = False
@@ -236,11 +236,12 @@ class ApplicationCoordinator:
                 runtime.pipeline_manager.disable_file_recording()
             recording_sm.transition_to(RecordingState.FINALIZING)
             recording_sm.transition_to(RecordingState.NOT_RECORDING)
-            # Phase 7.H.1: close the currently-open play. Captured
-            # AFTER recording stops so the play's end aligns with the
-            # last frame the operator saw recorded.
-            if self.play_manager is not None and self.session_clock is not None:
-                self.play_manager.stop_game(
+            # Phase 14.A: close the currently-open clip (whatever
+            # type). Captured AFTER recording stops so the clip's
+            # end aligns with the last frame the operator saw
+            # recorded.
+            if self.clip_manager is not None and self.session_clock is not None:
+                self.clip_manager.stop_game(
                     self.session_clock.now_session_time_ns()
                 )
             # Phase 7.B-ext: clear the per-game replay scope so a future
@@ -318,27 +319,29 @@ class ApplicationCoordinator:
             self.replay_store.set_current_game_start_session_time(
                 game_start_session_time_ns
             )
-        # Phase 7.H.1: open the next play of this game. For a fresh
-        # game that's Play #1; for a Phase 7.D resume continuation
-        # (where the crashed game's pre-existing plays were
-        # auto-closed by `_setup_resume_continuation`) it's
-        # `max(existing) + 1`. The play's start session_time is the
-        # NOW reading (game_start_session_time_ns is the crashed
-        # game's earliest in resume; for a fresh game both align).
+        # Phase 14.A: open the first clip of this game. For a fresh
+        # game ClipManager opens the pre-game clip (clip_number=0,
+        # type='pre-game'); for a Phase 7.D resume continuation it
+        # picks up where the crashed game left off (same type as
+        # most-recently-closed clip, next clip_number, next
+        # play_number when the matched type is 'play'). The clip's
+        # start session_time is the NOW reading
+        # (`game_start_session_time_ns` is the crashed game's
+        # earliest in resume; for a fresh game both align).
         if (
-            self.play_manager is not None
+            self.clip_manager is not None
             and self.session_clock is not None
         ):
-            play_start_ns = (
+            clip_start_ns = (
                 self.session_clock.now_session_time_ns()
                 if continuation is not None
                 else game_start_session_time_ns
             )
-            if play_start_ns is not None:
-                self.play_manager.start_game(
+            if clip_start_ns is not None:
+                self.clip_manager.start_game(
                     session_id=session_paths.session_id,
                     game_subdir=game_subdir,
-                    start_session_time_ns=play_start_ns,
+                    start_session_time_ns=clip_start_ns,
                 )
         recording_sm.transition_to(RecordingState.RECORDING)
         # Phase 10.C: a successful Start clears any prior preflight
@@ -360,16 +363,16 @@ class ApplicationCoordinator:
         self.referee_controller.signals.status_message.emit("Game recording started.")
 
     def mark_next_play(self) -> None:
-        """Close the currently-open play and open the next one (Phase 7.H.1).
+        """Close the currently-open clip and open the next play.
 
-        The eventual "Next Play" operator button is wired to this in
-        Phase 7.H.2. Captures `session_clock.now_session_time_ns()` at
-        the press moment so the play boundary aligns with what the
-        operator just saw on screen.
+        Wired to the operator's Next Play button. Captures
+        `session_clock.now_session_time_ns()` at the press moment so
+        the clip boundary aligns with what the operator just saw on
+        screen.
 
         No-op when:
-          - recording isn't active (no current play to advance)
-          - the coordinator was constructed without a `PlayManager`
+          - recording isn't active (no current clip to advance)
+          - the coordinator was constructed without a `ClipManager`
             (older test paths)
           - `session_clock` isn't attached
         """
@@ -381,14 +384,83 @@ class ApplicationCoordinator:
                 "Start game recording before marking a play boundary."
             )
             return
-        if self.play_manager is None or self.session_clock is None:
+        if self.clip_manager is None or self.session_clock is None:
             return
-        next_play = self.play_manager.mark_next_play(
+        next_clip = self.clip_manager.mark_next_play(
             self.session_clock.now_session_time_ns()
         )
-        if next_play is not None:
+        if next_clip is not None and next_clip.play_number is not None:
             self.referee_controller.signals.status_message.emit(
-                f"Play #{next_play.play_number} started."
+                f"Play #{next_clip.play_number} started."
+            )
+
+    def mark_timeout(self) -> None:
+        """Close the currently-open clip and open a timeout clip.
+
+        Wired to the operator's Time-out button. Rejected before
+        the first Next Play press of the game (ClipManager surfaces
+        the rejection as a returned None).
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if not self._recording_manager.is_any_recording():
+            self.referee_controller.signals.status_message.emit(
+                "Start game recording before marking a timeout."
+            )
+            return
+        if self.clip_manager is None or self.session_clock is None:
+            return
+        next_clip = self.clip_manager.mark_timeout(
+            self.session_clock.now_session_time_ns()
+        )
+        if next_clip is not None:
+            self.referee_controller.signals.status_message.emit("Timeout started.")
+        else:
+            self.referee_controller.signals.status_message.emit(
+                "Timeout unavailable until the first play has started."
+            )
+
+    def mark_challenge(self) -> None:
+        """Close the currently-open clip and open a challenge clip.
+
+        Wired to the operator's Challenge button. Rejected before
+        the first Next Play press AND when the current clip is
+        already a challenge (no back-to-back challenges per spec).
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if not self._recording_manager.is_any_recording():
+            self.referee_controller.signals.status_message.emit(
+                "Start game recording before starting a challenge."
+            )
+            return
+        if self.clip_manager is None or self.session_clock is None:
+            return
+        next_clip = self.clip_manager.mark_challenge(
+            self.session_clock.now_session_time_ns()
+        )
+        if next_clip is not None:
+            self.referee_controller.signals.status_message.emit("Challenge started.")
+        else:
+            self.referee_controller.signals.status_message.emit(
+                "Challenge unavailable (no play started, or already in a challenge)."
+            )
+
+    def toggle_clip_mark(self) -> None:
+        """Flip the `marked` flag on the currently-open clip.
+
+        Wired to the operator's Mark Play button. The flag is
+        consumed by downstream tooling outside Phase 14 scope.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if self.clip_manager is None:
+            return
+        updated = self.clip_manager.toggle_clip_mark()
+        if updated is not None:
+            status = "marked" if updated.marked else "unmarked"
+            self.referee_controller.signals.status_message.emit(
+                f"Clip {status}."
             )
 
     def initialize(self, *, resume_session_id: str | None = None) -> None:
@@ -585,14 +657,14 @@ class ApplicationCoordinator:
             game_subdir=crashed_game_subdir,
             game_start_session_time_ns=game_start_ns,
         )
-        # Phase 7.H.1: auto-close any play whose end_session_time_ns
+        # Phase 14.A: auto-close any clip whose end_session_time_ns
         # is NULL (the operator never marked the close because the
         # app crashed). Use the latest finalized segment's end as
         # the fallback. This must run BEFORE the next `start_game`
-        # so the UNIQUE(session_id, game_subdir, play_number) check
-        # has a clean view.
-        if self.play_manager is not None:
-            self.play_manager.auto_close_open_plays_for_session(
+        # so ClipManager can read the most-recently-closed clip to
+        # decide what type to continue with on resume.
+        if self.clip_manager is not None:
+            self.clip_manager.auto_close_open_clips_for_session(
                 session_id=session_paths.session_id,
                 fallback_end_session_time_ns=game_end_ns,
             )
@@ -697,15 +769,15 @@ class ApplicationCoordinator:
             LOGGER.exception(
                 "shutdown drain: FINALIZING/NOT_RECORDING transitions raised"
             )
-        # Phase 7.H.1 parity with operator Stop: close any open play
+        # Phase 14.A parity with operator Stop: close any open clip
         # so its end-time is captured before the session manifest closes.
-        if self.play_manager is not None and self.session_clock is not None:
+        if self.clip_manager is not None and self.session_clock is not None:
             try:
-                self.play_manager.stop_game(
+                self.clip_manager.stop_game(
                     self.session_clock.now_session_time_ns()
                 )
             except Exception:
-                LOGGER.exception("shutdown drain: play_manager.stop_game raised")
+                LOGGER.exception("shutdown drain: clip_manager.stop_game raised")
         # Drop the per-game replay scope so any future read-back from
         # the persisted state doesn't carry a stale anchor.
         try:
@@ -755,10 +827,10 @@ def build_default_application_coordinator(
     # finalized segments so the replay layer can resolve session-time
     # to a per-feed `(segment, offset)` pair.
     session_clock = SessionClock()
-    # Phase 7.H.1: per-game play boundary tracker. Owns the
-    # currently-open play and persists boundary transitions to the
-    # `plays` table.
-    play_manager = PlayManager(session_manager.get_metadata_db())
+    # Phase 14.A: per-game clip boundary tracker. Owns the
+    # currently-open clip and persists boundary transitions to the
+    # `clips` table.
+    clip_manager = ClipManager(session_manager.get_metadata_db())
     feed_runtimes: dict[str, FeedRuntime] = {}
 
     # Slice 3.B: tell the telemetry hub how to drive saturation-based
@@ -852,7 +924,7 @@ def build_default_application_coordinator(
         segment_index=segment_index,
         session_clock=session_clock,
         disk_budget=disk_budget,
-        play_manager=play_manager,
+        clip_manager=clip_manager,
     )
 
 

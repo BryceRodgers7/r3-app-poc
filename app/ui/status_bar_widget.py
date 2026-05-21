@@ -95,12 +95,12 @@ class StatusBarWidget(QFrame):
 
 
 def _format_play_badge(state: UiState) -> str:
-    """Phase 7.H.3 status-bar Play row.
+    """Status-bar Play row.
 
-    Shows `Play #N` when a play is currently open. Outside of
-    recording (or before PlayManager has any state) reads "—" so the
-    operator can scan the status bar without scrolling past a
-    stale-looking number.
+    Shows `Play #N` when a play has been opened in the current game
+    (most-recent play number; carries through timeouts / challenges
+    so the badge doesn't flicker). Reads "—" outside of recording
+    and during pre-game (before the first Next Play press).
     """
     if state.current_play_number is None:
         return "—"
