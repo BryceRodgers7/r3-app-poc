@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         controls_role: str = "referee",
         live_only_window: bool = False,
         application_coordinator: ApplicationCoordinator | None = None,
+        show_diagnostics: bool | None = None,
     ) -> None:
         super().__init__()
         if controls_role not in _VALID_CONTROLS_ROLES:
@@ -81,6 +82,13 @@ class MainWindow(QMainWindow):
         self._controller = controller
         self._output_renderer = output_renderer
         self._controls_role = controls_role
+        # Phase 14.F: gate the legacy diagnostic chrome
+        # (StatusBarWidget + DiagnosticsWidget). When None, inherit
+        # from `settings.ui_show_diagnostics`; explicit True/False
+        # overrides for tests.
+        self._show_diagnostics = (
+            settings.ui_show_diagnostics if show_diagnostics is None else show_diagnostics
+        )
         self._live_only_window = live_only_window
         self._application_coordinator = application_coordinator
 
@@ -161,16 +169,25 @@ class MainWindow(QMainWindow):
             # coordinate reason as `operator_status_overlay`.
             self.referee_play_badge = RefereePlayBadge(self.video_panel)
 
-        self.status_widget = StatusBarWidget(self)
+        # Phase 14.F: StatusBarWidget is the legacy diagnostic strip
+        # (recording state / source name / behind-live counter). The
+        # production windows hide it; developers can flip
+        # `[ui] show_diagnostics = true` to bring it back.
+        self.status_widget: StatusBarWidget | None = (
+            StatusBarWidget(self) if self._show_diagnostics else None
+        )
+        # The Qt QStatusBar is always present — it's the only sink for
+        # transient transport messages (rewind status, post-process
+        # placeholder, "Held at end of play (challenge)", etc.).
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
 
-        # DiagnosticsWidget today is gated on the referee window. The
-        # eventual home for most diagnostics is the operator window
-        # (deferred to a later slice — see §Phase 13 open questions).
+        # DiagnosticsWidget is referee-only (telemetry / health-event
+        # panel). Also gated by Phase 14.F's diagnostics-chrome flag.
         self.diagnostics_widget: DiagnosticsWidget | None = None
         if (
-            controls_role == "referee"
+            self._show_diagnostics
+            and controls_role == "referee"
             and application_coordinator is not None
             and application_coordinator.telemetry_hub is not None
         ):
@@ -240,7 +257,8 @@ class MainWindow(QMainWindow):
                 layout.addWidget(self.referee_controls)
             if self.camera_ribbon is not None:
                 layout.addWidget(self.camera_ribbon)
-        layout.addWidget(self.status_widget)
+        if self.status_widget is not None:
+            layout.addWidget(self.status_widget)
         if self.diagnostics_widget is not None:
             layout.addWidget(self.diagnostics_widget)
         self.setCentralWidget(central_widget)
@@ -328,12 +346,13 @@ class MainWindow(QMainWindow):
         self._controller.signals.status_message.connect(self._status_bar.showMessage)
 
     def _render_state(self, state: UiState) -> None:
-        self.status_widget.update_state(state)
-        if self._application_coordinator is not None:
-            self.status_widget.set_app_state_summary(
-                self._application_coordinator.get_app_state().value,
-                self._application_coordinator._recording_manager.recording_state.state.value,
-            )
+        if self.status_widget is not None:
+            self.status_widget.update_state(state)
+            if self._application_coordinator is not None:
+                self.status_widget.set_app_state_summary(
+                    self._application_coordinator.get_app_state().value,
+                    self._application_coordinator._recording_manager.recording_state.state.value,
+                )
         # Phase 13.B: each widget self-handles its recording-state
         # gating. RefereeControlsWidget toggles replay-related buttons
         # (Step ◀/▶) since replay isn't available outside RECORDING.

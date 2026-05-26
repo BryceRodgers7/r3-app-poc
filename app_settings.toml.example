@@ -105,6 +105,15 @@ disk_budget_mb_s = 200.0
 # frame_step_count = 1
 # rewind_seconds = 5
 
+# Phase 14.F — diagnostic chrome toggle. Off by default so the
+# production windows match `docs/window-layouts.pdf` (just the
+# buttons + video panel). Flip to true to surface the legacy
+# `StatusBarWidget` strip (fps / behind-live counter / source name)
+# and the referee window's `DiagnosticsWidget` telemetry panel.
+# The operator AlertBanner and the Qt status bar are always shown.
+# [ui]
+# show_diagnostics = false
+
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera
 # ingest was removed in Phase 2.5 — `kind = "auto"` is now an error.

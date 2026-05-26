@@ -372,6 +372,16 @@ class AppSettings:
     # was hardcoded to 10s; the spec ships at 5s. Operators can override
     # via `[replay] rewind_seconds = N`.
     replay_rewind_seconds: int = 5
+    # Phase 14.F: render the legacy diagnostic chrome — the
+    # `StatusBarWidget` strip above the Qt status bar, and the
+    # referee window's `DiagnosticsWidget` telemetry panel. Off by
+    # default so the production windows match `docs/window-layouts.pdf`;
+    # developers flip to true via `[ui] show_diagnostics = true` when
+    # they need the running fps / queue depth / health-event surface.
+    # Note: the operator AlertBanner and the Qt status bar itself are
+    # always built — they're the only path for disk_low / recording_error
+    # warnings and for transient transport messages.
+    ui_show_diagnostics: bool = False
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -518,6 +528,11 @@ class AppSettings:
             settings.disk_full_grace_seconds = float(
                 recording_config["disk_full_grace_seconds"]
             )
+
+        # Phase 14.F: [ui] block — diagnostic chrome toggle.
+        ui_config = cls._as_dict(data.get("ui"))
+        if "show_diagnostics" in ui_config:
+            settings.ui_show_diagnostics = bool(ui_config["show_diagnostics"])
 
         # Phase 12.B / 14.C: [replay] block — frame-step button
         # cadence and rewind-button duration.
