@@ -95,13 +95,15 @@ audio_enabled = true
 # SSD; raise for NVMe, lower for spinning disks or shared volumes.
 disk_budget_mb_s = 200.0
 
-# Phase 12.B — frame-step replay cadence. The operator's Step ◀ /
-# Step ▶ buttons jog the replay clock by `frame_step_count` frames
-# per click. Default 1 (one frame per click). Sports with faster
-# motion (puck, racquet, bat-on-ball) can turn this up to 2 / 3 / 5
-# without recompile.
+# Phase 12.B / 14.C — replay transport tuning. `frame_step_count`
+# is the number of frames Step ◀ / Step ▶ jogs per click (default 1).
+# `rewind_seconds` is the duration the referee window's Rewind button
+# jogs back (default 5). The Rewind button label is built from this
+# setting at construction time, so changing it is config-only — no
+# code change required.
 # [replay]
 # frame_step_count = 1
+# rewind_seconds = 5
 
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera

@@ -1,11 +1,23 @@
-"""Referee-window playback controls (Phase 13.A).
+"""Referee-window playback controls (Phase 14.C rebuild).
 
-Hosts the replay / review transport that an occasional-use referee
-operates: Pause, Rewind 10s, Replay Play, Slow 1/2x, Slow 1/4x,
-Step ◀, Step ▶, Jump to Live. The persistent operator's recording
-transport (Start/Stop game, Next Play) lives on `OperatorControlsWidget`
-in the operator (live-only) window — see `r3_app_architecture.md`
-§Phase 13.
+Spec source: `docs/window-requirements.md`. The replay/review
+transport an occasional-use referee operates:
+
+    Play/Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind Ns, Step ◀, Step ▶
+
+Phase 13.A's `Replay Play` and `Jump to Live` buttons are gone —
+the operator's Challenge button (14.B) drives the jump-to-play
+behavior now, and there's no explicit live-return UI on the
+referee window (the referee just resumes playback from wherever
+they are after a lockout clear).
+
+The Rewind button's duration is config-driven
+(`settings.replay_rewind_seconds`, default 5s). Label is built from
+the setting at construction time so future tweaks are settings-only.
+
+The pause button's label flips between `⏸` (rate > 0) and `▶`
+(rate == 0) via `set_playback_rate` — same Qt-signal-driven path
+the recording-state gating uses.
 """
 
 from __future__ import annotations
@@ -14,47 +26,52 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 
 
+_PAUSE_LABEL = "⏸ Pause"
+_PLAY_LABEL = "▶ Play"
+
+
 class RefereeControlsWidget(QWidget):
     """Large buttons for the referee's replay-review transport."""
 
     pause_requested = Signal()
     rewind_requested = Signal()
-    live_requested = Signal()
+    speed_2x_requested = Signal()
     half_speed_requested = Signal()
     quarter_speed_requested = Signal()
-    # Phase 7.H.4: wired to `controller.replay_current_play` — seeks
-    # to the currently-open play's start.
-    replay_current_play_requested = Signal()
+    eighth_speed_requested = Signal()
     # Phase 12.B: frame-step replay. Wired to
     # `controller.step_frames(±settings.replay_frame_step_count)`.
     step_back_requested = Signal()
     step_forward_requested = Signal()
 
-    def __init__(self, button_height: int, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        button_height: int,
+        *,
+        rewind_seconds: int = 5,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.pause_button = QPushButton("Pause", self)
-        self.rewind_button = QPushButton("Rewind 10s", self)
-        # Phase 7.H.4: seeks to the start of the currently-open play.
-        self.replay_play_button = QPushButton("Replay Play", self)
-        self.half_speed_button = QPushButton("Slow 1/2x", self)
-        self.quarter_speed_button = QPushButton("Slow 1/4x", self)
-        # Phase 12.B: frame-by-frame jog buttons. Layout sits between
-        # Slow 1/4x (slowest continuous rate) and Jump to Live so the
-        # transport row reads left-to-right from "freshest content"
-        # toward "live edge".
+        self._rewind_seconds = max(1, int(rewind_seconds))
+
+        self.pause_button = QPushButton(_PAUSE_LABEL, self)
+        self.speed_2x_button = QPushButton("2x", self)
+        self.half_speed_button = QPushButton("1/2x", self)
+        self.quarter_speed_button = QPushButton("1/4x", self)
+        self.eighth_speed_button = QPushButton("1/8x", self)
+        self.rewind_button = QPushButton(f"Rewind {self._rewind_seconds}s", self)
         self.step_back_button = QPushButton("Step ◀", self)
         self.step_forward_button = QPushButton("Step ▶", self)
-        self.live_button = QPushButton("Jump to Live", self)
 
         for button in (
             self.pause_button,
-            self.rewind_button,
-            self.replay_play_button,
+            self.speed_2x_button,
             self.half_speed_button,
             self.quarter_speed_button,
+            self.eighth_speed_button,
+            self.rewind_button,
             self.step_back_button,
             self.step_forward_button,
-            self.live_button,
         ):
             button.setMinimumHeight(button_height)
             button.setStyleSheet("font-size: 20px; font-weight: 600; padding: 12px 18px;")
@@ -63,40 +80,50 @@ class RefereeControlsWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
         layout.addWidget(self.pause_button)
-        layout.addWidget(self.rewind_button)
-        layout.addWidget(self.replay_play_button)
+        layout.addWidget(self.speed_2x_button)
         layout.addWidget(self.half_speed_button)
         layout.addWidget(self.quarter_speed_button)
+        layout.addWidget(self.eighth_speed_button)
+        layout.addWidget(self.rewind_button)
         layout.addWidget(self.step_back_button)
         layout.addWidget(self.step_forward_button)
-        layout.addWidget(self.live_button)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
-        self.rewind_button.clicked.connect(self.rewind_requested.emit)
-        self.replay_play_button.clicked.connect(self.replay_current_play_requested.emit)
+        self.speed_2x_button.clicked.connect(self.speed_2x_requested.emit)
         self.half_speed_button.clicked.connect(self.half_speed_requested.emit)
         self.quarter_speed_button.clicked.connect(self.quarter_speed_requested.emit)
+        self.eighth_speed_button.clicked.connect(self.eighth_speed_requested.emit)
+        self.rewind_button.clicked.connect(self.rewind_requested.emit)
         self.step_back_button.clicked.connect(self.step_back_requested.emit)
         self.step_forward_button.clicked.connect(self.step_forward_requested.emit)
-        self.live_button.clicked.connect(self.live_requested.emit)
 
-        # Phase 7.H.4 / 12.B: replay-related buttons are gated on
-        # recording state because replay isn't available outside
-        # RECORDING (§10.4 / §15.2). `set_recording_state` toggles them
-        # when MainWindow's `_render_state` fires.
-        self.replay_play_button.setEnabled(False)
+        # Phase 12.B: frame-step buttons are gated on recording state
+        # because replay isn't available outside RECORDING (§10.4 /
+        # §15.2). The continuous transport controls (Pause, Rewind,
+        # speeds) stay enabled — they surface a status message if the
+        # operator presses them while replay is unavailable.
         self.step_back_button.setEnabled(False)
         self.step_forward_button.setEnabled(False)
 
     def set_recording_state(self, is_recording: bool) -> None:
         """Enable/disable the replay-only buttons to track recording.
 
-        Replay (and its frame-step / replay-play variants) isn't available
-        outside RECORDING per §10.4 / §15.2. The continuous transport
-        controls (Pause, Rewind, Slow, Jump to Live) are always enabled
-        — they'll surface a status message if the operator presses them
-        while replay is unavailable.
+        Step buttons require finalized segments (which only exist while
+        recording). Pause / Rewind / speeds stay enabled and surface a
+        status if pressed pre-recording.
         """
-        self.replay_play_button.setEnabled(is_recording)
         self.step_back_button.setEnabled(is_recording)
         self.step_forward_button.setEnabled(is_recording)
+
+    def set_pause_label_for_rate(self, playback_rate: float) -> None:
+        """Flip Pause/Play label by playback rate.
+
+        Rate 0.0 means the replay clock is stopped — the button now
+        acts as "Play" (resume at 1.0×); any non-zero rate means
+        playback is advancing, so the button is "Pause." The handler
+        wired in MainWindow inspects this when the click fires.
+        """
+        if playback_rate <= 0.0:
+            self.pause_button.setText(_PLAY_LABEL)
+        else:
+            self.pause_button.setText(_PAUSE_LABEL)

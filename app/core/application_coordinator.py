@@ -143,6 +143,7 @@ class ApplicationCoordinator:
             session_clock=self.session_clock,
             clip_manager=self.clip_manager,
             frame_period_ns=frame_period_ns,
+            rewind_seconds=int(settings.replay_rewind_seconds),
         )
         self.operator_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,
@@ -155,6 +156,7 @@ class ApplicationCoordinator:
             session_clock=self.session_clock,
             clip_manager=self.clip_manager,
             frame_period_ns=frame_period_ns,
+            rewind_seconds=int(settings.replay_rewind_seconds),
         )
         self._session_started = False
         self._shutting_down = False

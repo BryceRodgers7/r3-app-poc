@@ -28,10 +28,11 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Instant-replay shortcut from §19. Slice 5.C: the 30s button was
-# removed in favor of repeated 10s clicks accumulating from the
-# current playback position.
-_REWIND_10S_NS = 10 * 1_000_000_000
+# Phase 14.C default — referee window's Rewind button duration in
+# seconds. Pre-14.C this was hardcoded at 10s; the spec ships at 5s.
+# Coordinator overrides via `settings.replay_rewind_seconds`; tests
+# and any caller that doesn't configure it fall back to this default.
+_DEFAULT_REWIND_SECONDS = 5
 
 # Phase 12.A default — 30 fps. The coordinator overrides this from
 # `AppSettings.target_fps` in 12.B; tests and any caller that doesn't
@@ -75,6 +76,7 @@ class PlaybackController:
         session_clock: SessionClock | None = None,
         clip_manager: "ClipManager | None" = None,
         frame_period_ns: int = _DEFAULT_FRAME_PERIOD_NS,
+        rewind_seconds: int = _DEFAULT_REWIND_SECONDS,
     ) -> None:
         if not feed_runtimes:
             raise ValueError("PlaybackController requires at least one FeedRuntime.")
@@ -104,6 +106,11 @@ class PlaybackController:
         # `settings.target_fps`); `step_frames` multiplies by the
         # operator's `frame_delta`.
         self._frame_period_ns = max(1, int(frame_period_ns))
+        # Phase 14.C: rewind-button duration in session-time-ns. Set
+        # once at construction from `settings.replay_rewind_seconds`
+        # (see `application_coordinator`). Tests / older callers fall
+        # back to the module default.
+        self._rewind_ns = max(1, int(rewind_seconds)) * 1_000_000_000
         # Phase 10.F: set by `shutdown()` so transport methods that race
         # the teardown become no-ops instead of touching half-torn-down
         # decoders / timers.
@@ -199,16 +206,20 @@ class PlaybackController:
         self._render_at_session_time_ns(base_pts_ns)
         self._emit_state("Playback paused")
 
-    def rewind_10_seconds(self) -> None:
-        """Rewind 10s in session-time (slice 5.C).
+    def rewind_configured_seconds(self) -> None:
+        """Rewind by `settings.replay_rewind_seconds` in session-time.
+
+        Phase 14.C rename from `rewind_10_seconds`. The duration is
+        config-driven (`[replay] rewind_seconds`, default 5s) so
+        operators can retune without code changes.
 
         From LIVE/SOURCE_LOST: anchor on `latest_replayable_session_time`
         across all feeds. The first click from live always lands at
-        `now − 10s`.
+        `now − Ns`.
 
         From REPLAY/PAUSED: anchor on the operator's current
         `_playback_session_time_ns`. Repeated clicks accumulate —
-        click twice for `−20s` from live, three times for `−30s`, etc.
+        click twice for `−2Ns` from live, three times for `−3Ns`, etc.
         """
         if getattr(self, "_shutting_down", False):
             return
@@ -219,7 +230,7 @@ class PlaybackController:
             self._emit_state("Replay unavailable: start game recording first.")
             return
         with self._lock:
-            target_session_time_ns = self._resolve_rewind_target_locked(_REWIND_10S_NS)
+            target_session_time_ns = self._resolve_rewind_target_locked(self._rewind_ns)
             if target_session_time_ns is None:
                 self._state.error_message = "Replay frame is not available yet."
                 self._emit_state()
@@ -235,6 +246,44 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(target_session_time_ns)
         self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
+
+    def seek_to_session_time(self, target_session_time_ns: int) -> None:
+        """Phase 14.C: seek the replay clock to an absolute session-time.
+
+        Drives the referee window's scrubber slider. Clamps the target
+        against the replayable range (same rule as
+        `_resolve_rewind_target_locked`), bounces through SEEKING and
+        lands in PAUSED. The operator can then press Play to resume.
+
+        Same gating as the other replay primitives — live-only outputs
+        and pre-recording state both no-op with a status message.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if self._live_only:
+            self._emit_state("This output is locked to live.")
+            return
+        if not self._replay_actions_allowed():
+            self._emit_state("Replay unavailable: start game recording first.")
+            return
+        with self._lock:
+            earliest, latest = self._replay_store.available_session_time_range()
+            if earliest is None or latest is None:
+                self._state.error_message = "Replay frame is not available yet."
+                self._emit_state()
+                return
+            clamped = max(earliest, min(latest, int(target_session_time_ns)))
+            assert self.replay_state is not None
+            self.replay_state.transition_to(ReplayState.SEEKING)
+            self.replay_state.transition_to(ReplayState.PAUSED)
+            self._stop_replay_clock_locked()
+            self._playback_session_time_ns = clamped
+            self._playback_rate = 0.0
+            self._state.current_playback_mode = PlaybackMode.PAUSED
+            self._state.error_message = None
+            self._update_state_timestamps_locked()
+        self._render_at_session_time_ns(clamped)
+        self._emit_state("Scrubbed")
 
     def replay_current_play(self) -> None:
         """Seek to the start of the currently-open play.
@@ -369,7 +418,7 @@ class PlaybackController:
             # path to SLOW_MOTION). When entering from live, bounce
             # through SEEKING → REPLAYING first so the final transition
             # to SLOW_MOTION/PAUSED is valid. Matches the path
-            # rewind_10_seconds takes.
+            # rewind_configured_seconds takes.
             if entering_from_live and self.replay_state.state == ReplayState.LIVE_WHILE_RECORDING:
                 self.replay_state.transition_to(ReplayState.SEEKING)
                 self.replay_state.transition_to(ReplayState.REPLAYING)
@@ -540,6 +589,25 @@ class PlaybackController:
         """Return the frame the UI should currently display (primary feed)."""
         with self._lock:
             return self._latest_live_frame
+
+    def available_session_time_range(self) -> tuple[int | None, int | None]:
+        """Phase 14.C: pass through the replay store's available range.
+
+        The referee window's scrubber slider needs both endpoints to
+        size its track; exposing this here avoids MainWindow having to
+        reach through `controller._replay_store`.
+        """
+        return self._replay_store.available_session_time_range()
+
+    def get_playback_session_time_ns(self) -> int | None:
+        """Phase 14.C: current replay clock position in session-time.
+
+        None when on the live edge (`_playback_session_time_ns` is None
+        outside REPLAY/PAUSED). MainWindow uses this to drive the
+        scrubber handle.
+        """
+        with self._lock:
+            return self._playback_session_time_ns
 
     def shutdown(self) -> None:
         """Stop timers owned by this output session and close per-feed decoders.

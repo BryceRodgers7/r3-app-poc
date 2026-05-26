@@ -12,7 +12,7 @@ Two concerns locked in here:
    exact case the operator UI sees during recording: the in-progress
    segment overlaps the live edge.
 
-2. Transport methods (`rewind_10_seconds`, `pause_playback`,
+2. Transport methods (`rewind_configured_seconds`, `pause_playback`,
    `set_playback_rate`, `jump_to_live`, `_on_replay_timer_tick`,
    `_render_at_session_time_ns`) NEVER mutate the filesystem or DB.
    Replay reads from completed segments; it never deletes, renames, or
@@ -350,8 +350,8 @@ class TransportMethodsAreReadOnlyTests(unittest.TestCase):
         # Advance clock to 24s so the operator is "behind live" by 4s.
         self.fake_clock_fn.advance_ns(24_000_000_000)
 
-    def test_rewind_10_seconds_does_not_mutate(self) -> None:
-        self.controller.rewind_10_seconds()
+    def test_rewind_configured_seconds_does_not_mutate(self) -> None:
+        self.controller.rewind_configured_seconds()
         self.assertEqual(self.db.write_calls, [])
 
     def test_pause_playback_does_not_mutate(self) -> None:
@@ -364,14 +364,14 @@ class TransportMethodsAreReadOnlyTests(unittest.TestCase):
 
     def test_jump_to_live_does_not_mutate(self) -> None:
         # Drop into REPLAY first so jump_to_live has something to undo.
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.db.write_calls.clear()
         self.controller.jump_to_live()
         self.assertEqual(self.db.write_calls, [])
 
     def test_replay_timer_tick_does_not_mutate(self) -> None:
         # Enter REPLAY mode so the timer-tick path is meaningful.
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.db.write_calls.clear()
         self.controller._on_replay_timer_tick()
         self.assertEqual(self.db.write_calls, [])

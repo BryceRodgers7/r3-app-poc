@@ -8,7 +8,7 @@ Two layers covered:
    are logged but don't deadlock shutdown.
 
 2. Transport methods (`PlaybackController.pause_playback`,
-   `rewind_10_seconds`, `replay_current_play`, `jump_to_live`,
+   `rewind_configured_seconds`, `replay_current_play`, `jump_to_live`,
    `set_playback_rate`) and coordinator actions
    (`toggle_long_session_recording`, `mark_next_play`) become
    no-ops once `_shutting_down` is set.
@@ -192,11 +192,11 @@ class PlaybackControllerTransportGateTests(unittest.TestCase):
         pc._replay_actions_allowed.assert_not_called()
         pc.signals.state_changed.emit.assert_not_called()
 
-    def test_rewind_10_seconds_short_circuits(self) -> None:
+    def test_rewind_configured_seconds_short_circuits(self) -> None:
         from app.core.playback_controller import PlaybackController
 
         pc = self._build_pc_stub()
-        PlaybackController.rewind_10_seconds(pc)
+        PlaybackController.rewind_configured_seconds(pc)
         pc._replay_actions_allowed.assert_not_called()
 
     def test_replay_current_play_short_circuits(self) -> None:

@@ -236,6 +236,7 @@ class PlaybackControllerTests(unittest.TestCase):
             session_role="operator",
             live_only=False,
             decoder_factory=lambda *_args: self.stub_decoder,
+            rewind_seconds=10,
         )
         self.controller.initialize(self.session_paths.session_id)
 
@@ -249,7 +250,7 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def test_rewind_enters_replay_and_renders_segment_frame(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
         self.assertTrue(self.controller._replay_timer.isActive())
         # Latest replayable session_time = 20s; rewind 10s → target = 10s.
@@ -269,10 +270,10 @@ class PlaybackControllerTests(unittest.TestCase):
         position (10s), so target = 0s.
         """
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         first_target = self.controller._playback_session_time_ns
         self.assertEqual(first_target, 10_000_000_000)
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         second_target = self.controller._playback_session_time_ns
         self.assertEqual(second_target, 0)
         # Last decode should be at session_time=0 → segment 0, offset 0.
@@ -288,7 +289,7 @@ class PlaybackControllerTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 15_000_000_000  # 15s
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         # Anchor on 15s, rewind 10s → target = 5s.
         self.assertEqual(self.controller._playback_session_time_ns, 5_000_000_000)
 
@@ -299,7 +300,7 @@ class PlaybackControllerTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.PAUSED
             self.controller._playback_session_time_ns = 12_000_000_000  # 12s
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.assertEqual(self.controller._playback_session_time_ns, 2_000_000_000)
 
     def test_rewind_clamps_at_earliest_session_time(self) -> None:
@@ -308,12 +309,12 @@ class PlaybackControllerTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 5_000_000_000
-        self.controller.rewind_10_seconds()  # 5s − 10s = -5s, clamps to 0.
+        self.controller.rewind_configured_seconds()  # 5s − 10s = -5s, clamps to 0.
         self.assertEqual(self.controller._playback_session_time_ns, 0)
 
     def test_pause_freezes_replay_clock_and_renders_freeze_frame(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         rewind_decode_count = len(self.stub_decoder.decode_calls)
         self.controller.pause_playback()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
@@ -335,17 +336,64 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def test_set_playback_rate_half_speed_keeps_decoder_rate_agnostic(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.controller.set_playback_rate(0.5)
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
         self.assertEqual(self.controller.replay_state.state, ReplayState.SLOW_MOTION)
 
     def test_set_playback_rate_zero_pauses(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.controller.set_playback_rate(0.0)
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
         self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+
+    def test_set_playback_rate_2x_routes_through_replaying(self) -> None:
+        """Phase 14.C: the 2x speed button routes through REPLAYING
+        (rate >= 1.0) — the SLOW_MOTION state is reserved for rates
+        below 1.0. The rate-routing branch in `set_playback_rate`
+        already picks REPLAYING for rate >= 1.0; this case was
+        previously uncovered because no UI button surfaced it."""
+        self._force_recording_state()
+        self.controller.rewind_configured_seconds()
+        self.controller.set_playback_rate(2.0)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.REPLAYING)
+        self.assertEqual(self.controller._playback_rate, 2.0)
+
+    def test_set_playback_rate_eighth_routes_through_slow_motion(self) -> None:
+        """Phase 14.C: 1/8x is just another < 1.0 rate — SLOW_MOTION
+        like the existing 1/2x and 1/4x."""
+        self._force_recording_state()
+        self.controller.rewind_configured_seconds()
+        self.controller.set_playback_rate(0.125)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.SLOW_MOTION)
+        self.assertEqual(self.controller._playback_rate, 0.125)
+
+    def test_seek_to_session_time_lands_paused_inside_range(self) -> None:
+        """Phase 14.C: scrubber drives `seek_to_session_time`. Lands
+        in PAUSED at the requested session-time and renders the frame."""
+        self._force_recording_state()
+        self.controller.seek_to_session_time(7_500_000_000)
+        self.assertEqual(self.controller._playback_session_time_ns, 7_500_000_000)
+        self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.PAUSED)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertFalse(self.controller._replay_timer.isActive())
+
+    def test_seek_to_session_time_clamps_to_replayable_range(self) -> None:
+        """Phase 14.C: a target past `latest` clamps to latest; a
+        target before `earliest` clamps to earliest. Same clamp rule
+        as `_resolve_rewind_target_locked`."""
+        self._force_recording_state()
+        self.controller.seek_to_session_time(50_000_000_000)
+        self.assertEqual(self.controller._playback_session_time_ns, 20_000_000_000)
+        self.controller.seek_to_session_time(-5_000_000_000)
+        self.assertEqual(self.controller._playback_session_time_ns, 0)
+
+    def test_seek_to_session_time_rejected_when_recording_not_active(self) -> None:
+        before_mode = self.controller.get_state().current_playback_mode
+        self.controller.seek_to_session_time(5_000_000_000)
+        self.assertEqual(self.controller.get_state().current_playback_mode, before_mode)
+        self.assertEqual(self.stub_decoder.decode_calls, [])
 
     def test_set_playback_rate_from_live_lands_in_slow_motion_state(self) -> None:
         """Bug fix: the replay state machine doesn't allow direct
@@ -398,7 +446,7 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertIsNone(after.playback_timestamp)
 
     def test_set_playback_rate_from_live_does_not_rewind(self) -> None:
-        """Bug fix: Slow 1/2 from LIVE used to call `rewind_10_seconds`
+        """Bug fix: Slow 1/2 from LIVE used to call `rewind_configured_seconds`
         as a side effect, dropping playback to `latest − 10s`. The new
         behavior snaps to `latest_replayable_session_time` (the leading
         edge of replay coverage) without any rewind, so the operator
@@ -424,7 +472,7 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def test_jump_to_live_clears_playback_session_time_and_returns_to_live(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.assertIsNotNone(self.controller._playback_session_time_ns)
         self.controller.jump_to_live()
         self.assertIsNone(self.controller._playback_session_time_ns)
@@ -467,7 +515,7 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def test_rewind_rejected_when_recording_not_active(self) -> None:
         before_mode = self.controller.get_state().current_playback_mode
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.assertEqual(self.controller.get_state().current_playback_mode, before_mode)
         self.assertEqual(self.stub_decoder.decode_calls, [])
 
@@ -478,7 +526,7 @@ class PlaybackControllerTests(unittest.TestCase):
 
     def test_recording_stop_mid_replay_snaps_back_to_live(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()
+        self.controller.rewind_configured_seconds()
         self.assertEqual(self.controller.get_state().current_playback_mode, PlaybackMode.REPLAY)
         self.recording_manager.recording_state.force(RecordingState.NOT_RECORDING)
         self.controller.refresh_recording_state()
@@ -591,6 +639,7 @@ class SecondsBehindLiveSmoothnessTests(unittest.TestCase):
             live_only=False,
             decoder_factory=lambda *_args: self.stub_decoder,
             session_clock=self.session_clock,
+            rewind_seconds=10,
         )
         self.controller.initialize(self.session_paths.session_id)
         self.recording_manager.recording_state.force(RecordingState.RECORDING)
@@ -699,6 +748,7 @@ class LatestReplayableSurfaceTests(unittest.TestCase):
                 self.feed.feed_id, self.feed.display_name
             ),
             session_clock=self.session_clock,
+            rewind_seconds=10,
         )
         self.controller.initialize(self.session_paths.session_id)
         self.recording_manager.recording_state.force(RecordingState.RECORDING)
@@ -890,6 +940,7 @@ class MultiFeedRenderTests(unittest.TestCase):
             session_role="operator",
             live_only=False,
             decoder_factory=lambda *_args: self.stub_decoder,
+            rewind_seconds=10,
         )
         self.controller.initialize(self.session_paths.session_id)
 
@@ -914,7 +965,7 @@ class MultiFeedRenderTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 12_000_000_000
-        self.controller.rewind_10_seconds()  # → 2s
+        self.controller.rewind_configured_seconds()  # → 2s
         self.assertEqual(self.controller._playback_session_time_ns, 2_000_000_000)
 
         a_calls = self._decode_calls_for_feed("ndi_a")
@@ -937,7 +988,7 @@ class MultiFeedRenderTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 15_000_000_000
-        self.controller.rewind_10_seconds()  # → 5s
+        self.controller.rewind_configured_seconds()  # → 5s
         self.assertEqual(self.controller._playback_session_time_ns, 5_000_000_000)
 
         a_calls = self._decode_calls_for_feed("ndi_a")
@@ -962,7 +1013,7 @@ class MultiFeedRenderTests(unittest.TestCase):
         on every render tick (when nearest_frame_location returns
         non-None for it)."""
         self._force_recording_state()
-        self.controller.rewind_10_seconds()  # session_time=10
+        self.controller.rewind_configured_seconds()  # session_time=10
         feeds_seen = {c[2] for c in self.stub_decoder.decode_calls}
         self.assertEqual(feeds_seen, {"ndi_a", "ndi_b"})
 
@@ -975,7 +1026,7 @@ class MultiFeedRenderTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 12_000_000_000
-        self.controller.rewind_10_seconds()  # → 2s
+        self.controller.rewind_configured_seconds()  # → 2s
         state = self.controller.get_state()
         self.assertEqual(state.feeds_in_freeze_frame, ("ndi_b",))
 
@@ -985,7 +1036,7 @@ class MultiFeedRenderTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 15_000_000_000
-        self.controller.rewind_10_seconds()  # → 5s — both feeds in coverage
+        self.controller.rewind_configured_seconds()  # → 5s — both feeds in coverage
         state = self.controller.get_state()
         self.assertEqual(state.feeds_in_freeze_frame, ())
 
@@ -996,7 +1047,7 @@ class MultiFeedRenderTests(unittest.TestCase):
         with self.controller._lock:
             self.controller._state.current_playback_mode = PlaybackMode.REPLAY
             self.controller._playback_session_time_ns = 12_000_000_000
-        self.controller.rewind_10_seconds()  # → 2s, feed B should freeze
+        self.controller.rewind_configured_seconds()  # → 2s, feed B should freeze
         self.assertEqual(self.controller.get_state().feeds_in_freeze_frame, ("ndi_b",))
         self.controller.jump_to_live()
         self.assertEqual(self.controller.get_state().feeds_in_freeze_frame, ())
@@ -1069,6 +1120,7 @@ class StepFramesTests(unittest.TestCase):
             live_only=live_only,
             decoder_factory=lambda *_args: self.stub_decoder,
             frame_period_ns=self._FRAME_PERIOD_NS,
+            rewind_seconds=10,
         )
 
     def _force_recording_state(self) -> None:
@@ -1080,7 +1132,7 @@ class StepFramesTests(unittest.TestCase):
         self._force_recording_state()
         # Rewind from live, then pause — pause anchors on the operator's
         # current playback position when in REPLAY.
-        self.controller.rewind_10_seconds()  # → 10 s, REPLAYING
+        self.controller.rewind_configured_seconds()  # → 10 s, REPLAYING
         # Move the playback cursor without going through transport so we
         # can land at any test-chosen session-time. Mirrors the pattern
         # other tests use for setting up a known mid-timeline position.
@@ -1131,7 +1183,7 @@ class StepFramesTests(unittest.TestCase):
 
     def test_step_from_replaying_lands_in_paused(self) -> None:
         self._force_recording_state()
-        self.controller.rewind_10_seconds()  # → 10 s, REPLAYING
+        self.controller.rewind_configured_seconds()  # → 10 s, REPLAYING
         self.assertEqual(self.controller.replay_state.state, ReplayState.REPLAYING)
         self.controller.step_frames(3)
         self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)

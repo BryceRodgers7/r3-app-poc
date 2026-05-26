@@ -1,4 +1,11 @@
-"""Phase 7.H.4: `replay_current_play` transport + Replay Play button."""
+"""Phase 7.H.4 / 14.C: `replay_current_play` controller primitive.
+
+Phase 14.C removed the explicit Replay Play UI button; the primitive
+stays on the controller and is repurposed by Phase 14.D as the
+challenge-open hook (snap to a play's start, install bounds, pause).
+These tests pin the no-op + happy-path behavior the 14.D wiring
+relies on.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +25,6 @@ from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
 from app.core.replay_state import ReplayState, make_replay_state_machine
 from app.core.signals import AppSignals
-from app.ui.referee_controls_widget import RefereeControlsWidget
 
 
 def _make_play_clip(*, play_number: int, start_ns: int, clip_number: int = 1) -> Clip:
@@ -191,38 +197,6 @@ class ReplayCurrentPlayNoOpTests(unittest.TestCase):
         pc.replay_current_play()
         pc._render_at_session_time_ns.assert_not_called()
         pc._emit_state.assert_called_once_with("No play is currently open.")
-
-
-class ReplayPlayButtonStateTests(unittest.TestCase):
-    """Same pattern as Next Play (Phase 7.H.2): button is disabled
-    until set_recording_state(True) flips it on."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls._app = QApplication.instance() or QApplication([])
-
-    def test_button_label(self) -> None:
-        controls = RefereeControlsWidget(button_height=72)
-        self.assertEqual(controls.replay_play_button.text(), "Replay Play")
-
-    def test_button_disabled_at_construction(self) -> None:
-        controls = RefereeControlsWidget(button_height=72)
-        self.assertFalse(controls.replay_play_button.isEnabled())
-
-    def test_set_recording_state_toggles_replay_play_button(self) -> None:
-        controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
-        self.assertTrue(controls.replay_play_button.isEnabled())
-        controls.set_recording_state(False)
-        self.assertFalse(controls.replay_play_button.isEnabled())
-
-    def test_button_click_emits_replay_current_play_signal(self) -> None:
-        controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
-        emissions: list[None] = []
-        controls.replay_current_play_requested.connect(lambda: emissions.append(None))
-        controls.replay_play_button.clicked.emit()
-        self.assertEqual(len(emissions), 1)
 
 
 if __name__ == "__main__":

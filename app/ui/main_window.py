@@ -34,6 +34,8 @@ from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
 from app.ui.operator_status_overlay import OperatorStatusOverlay
 from app.ui.referee_controls_widget import RefereeControlsWidget
+from app.ui.referee_play_badge import RefereePlayBadge
+from app.ui.scrubber_slider import ScrubberSlider
 from app.ui.status_bar_widget import StatusBarWidget
 
 _VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
@@ -46,9 +48,10 @@ class MainWindow(QMainWindow):
     window builds:
 
     - `"referee"` — `RefereeControlsWidget` with the replay/review
-      transport (Pause, Rewind, Replay Play, Slow 1/2x, Slow 1/4x,
-      Step ◀/▶, Jump to Live). Default to keep older test callers
-      that don't pass the kwarg working as before.
+      transport (Phase 14.C: Play/Pause, 2x, 1/2x, 1/4x, 1/8x,
+      Rewind Ns, Step ◀/▶ + a scrubber slider and play-number badge).
+      Default to keep older test callers that don't pass the kwarg
+      working as before.
     - `"operator"` — `OperatorControlsWidget` with the recording
       transport (Start/Stop game, Next Play). Combined with
       `live_only_window=True` it's the persistent operator's pane.
@@ -118,7 +121,9 @@ class MainWindow(QMainWindow):
         # The `controls_role` selector picks which widget is built.
         self.referee_controls: RefereeControlsWidget | None = (
             RefereeControlsWidget(
-                button_height=settings.touch_button_height, parent=self
+                button_height=settings.touch_button_height,
+                rewind_seconds=int(settings.replay_rewind_seconds),
+                parent=self,
             )
             if controls_role == "referee"
             else None
@@ -130,13 +135,17 @@ class MainWindow(QMainWindow):
             if controls_role == "operator"
             else None
         )
-        # Phase 14.B: operator-window-only chrome — camera show/hide
-        # ribbon (bottom-left), Post-process & Exit link (bottom-right),
-        # and a free-floating Play/Clip counter overlay (top-right
-        # over the video panel). All None on the referee window.
+        # Phase 14.B/14.C: per-window chrome. Both windows get their
+        # own CameraVisibilityRibbon — per-spec, hiding a feed on one
+        # window does NOT hide it on the other. The operator window
+        # adds a Post-process & Exit link + a free-floating Play/Clip
+        # counter overlay; the referee window adds a scrubber slider
+        # and a play-number badge.
         self.camera_ribbon: CameraVisibilityRibbon | None = None
         self.post_process_link: QLabel | None = None
         self.operator_status_overlay: OperatorStatusOverlay | None = None
+        self.scrubber: ScrubberSlider | None = None
+        self.referee_play_badge: RefereePlayBadge | None = None
         if controls_role == "operator":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.post_process_link = self._build_post_process_link()
@@ -145,6 +154,12 @@ class MainWindow(QMainWindow):
             # coordinate-system gotchas that result from parenting a
             # free-floating child to the QMainWindow itself.
             self.operator_status_overlay = OperatorStatusOverlay(self.video_panel)
+        elif controls_role == "referee":
+            self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
+            self.scrubber = ScrubberSlider(self)
+            # Parented to the video panel for the same panel-local
+            # coordinate reason as `operator_status_overlay`.
+            self.referee_play_badge = RefereePlayBadge(self.video_panel)
 
         self.status_widget = StatusBarWidget(self)
         self._status_bar = QStatusBar(self)
@@ -211,9 +226,20 @@ class MainWindow(QMainWindow):
                 bottom_row.addWidget(self.post_process_link)
             layout.addLayout(bottom_row)
         else:
+            # Phase 14.C referee layout:
+            #   [ video panel                                   ]
+            #   [ scrubber slider                               ]
+            #   [ RefereeControlsWidget transport row           ]
+            #   [ CameraVisibilityRibbon                        ]
+            # RefereePlayBadge floats bottom-left of the video panel
+            # (positioned by `resizeEvent`).
             layout.addWidget(self.video_panel, stretch=1)
+            if self.scrubber is not None:
+                layout.addWidget(self.scrubber)
             if self.referee_controls is not None:
                 layout.addWidget(self.referee_controls)
+            if self.camera_ribbon is not None:
+                layout.addWidget(self.camera_ribbon)
         layout.addWidget(self.status_widget)
         if self.diagnostics_widget is not None:
             layout.addWidget(self.diagnostics_widget)
@@ -224,15 +250,25 @@ class MainWindow(QMainWindow):
 
     def _wire_events(self) -> None:
         if self.referee_controls is not None:
-            self.referee_controls.pause_requested.connect(self._controller.pause_playback)
-            self.referee_controls.rewind_requested.connect(self._controller.rewind_10_seconds)
-            self.referee_controls.half_speed_requested.connect(lambda: self._controller.set_playback_rate(0.5))
+            # Phase 14.C: Pause button is a toggle — from a paused/live
+            # position press = "Play" (resume at 1×); from active
+            # replay press = "Pause" at current position. Branch on
+            # current `current_playback_mode` (set by `_render_state`).
+            self.referee_controls.pause_requested.connect(self._on_pause_button_pressed)
+            self.referee_controls.rewind_requested.connect(
+                self._controller.rewind_configured_seconds
+            )
+            self.referee_controls.speed_2x_requested.connect(
+                lambda: self._controller.set_playback_rate(2.0)
+            )
+            self.referee_controls.half_speed_requested.connect(
+                lambda: self._controller.set_playback_rate(0.5)
+            )
             self.referee_controls.quarter_speed_requested.connect(
                 lambda: self._controller.set_playback_rate(0.25)
             )
-            self.referee_controls.live_requested.connect(self._controller.jump_to_live)
-            self.referee_controls.replay_current_play_requested.connect(
-                self._controller.replay_current_play
+            self.referee_controls.eighth_speed_requested.connect(
+                lambda: self._controller.set_playback_rate(0.125)
             )
             # Phase 12.B: frame-step buttons — read the configured count
             # at click time so a future runtime knob (12.C) can update
@@ -246,6 +282,10 @@ class MainWindow(QMainWindow):
                 lambda: self._controller.step_frames(
                     +self._settings.replay_frame_step_count
                 )
+            )
+        if self.scrubber is not None:
+            self.scrubber.seek_to_session_time_requested.connect(
+                self._controller.seek_to_session_time
             )
         if self.operator_controls is not None and self._application_coordinator is not None:
             self.operator_controls.long_recording_toggle_requested.connect(
@@ -284,11 +324,14 @@ class MainWindow(QMainWindow):
             )
         # Phase 13.B: each widget self-handles its recording-state
         # gating. RefereeControlsWidget toggles replay-related buttons
-        # (Replay Play, Step ◀/▶) since replay isn't available outside
-        # RECORDING. OperatorControlsWidget toggles Next Play and flips
-        # the Start/Stop button label.
+        # (Step ◀/▶) since replay isn't available outside RECORDING.
+        # OperatorControlsWidget toggles Next Play and flips the
+        # Start/Stop button label.
         if self.referee_controls is not None:
             self.referee_controls.set_recording_state(state.is_recording)
+            self.referee_controls.set_pause_label_for_rate(
+                state.playback_overlay.playback_rate
+            )
         if self.operator_controls is not None:
             self.operator_controls.set_recording_state(state.is_recording)
             self.operator_controls.set_recording_label(state.is_recording)
@@ -312,6 +355,18 @@ class MainWindow(QMainWindow):
                 clip_number=state.current_clip_number,
                 play_number=state.current_play_number,
             )
+        if self.scrubber is not None:
+            earliest, latest = self._controller.available_session_time_range()
+            self.scrubber.update_position(
+                earliest_ns=earliest,
+                latest_ns=latest,
+                current_ns=self._controller.get_playback_session_time_ns(),
+            )
+        if self.referee_play_badge is not None:
+            self.referee_play_badge.set_play_state(
+                play_number=state.current_play_number,
+            )
+            self._position_referee_play_badge()
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,
             PlaybackMode.PAUSED,
@@ -332,6 +387,9 @@ class MainWindow(QMainWindow):
         # Phase 14.B: keep the free-floating Play/Clip counter
         # overlay pinned to the upper-right of the video panel.
         self._position_operator_status_overlay()
+        # Phase 14.C: keep the play-number badge pinned to the
+        # bottom-left of the video panel on the referee window.
+        self._position_referee_play_badge()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release widget bindings when the window closes."""
@@ -368,6 +426,36 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(
             "Post-process & Exit is not wired yet (Phase 14.E).", 4000
         )
+
+    def _on_pause_button_pressed(self) -> None:
+        """Phase 14.C: Play/Pause toggle handler.
+
+        From PAUSED (rate==0): resume at 1.0×. From REPLAY/LIVE: pause
+        at the current playback position. Routes through the existing
+        controller primitives; the controller's gating handles the
+        live-only / pre-recording cases.
+        """
+        state = self._controller.get_state()
+        if state.playback_overlay.playback_rate <= 0.0:
+            self._controller.set_playback_rate(1.0)
+        else:
+            self._controller.pause_playback()
+
+    def _position_referee_play_badge(self) -> None:
+        if self.referee_play_badge is None:
+            return
+        if not self.referee_play_badge.isVisible():
+            return
+        badge = self.referee_play_badge
+        badge.adjustSize()
+        margin = 18
+        # Panel-local coordinates: (0, 0) is top-left of the video
+        # panel; bottom-left places the badge near the playback
+        # surface without crowding the transport row below.
+        x = margin
+        y = max(0, self.video_panel.height() - badge.height() - margin)
+        badge.move(x, y)
+        badge.raise_()
 
     def _position_operator_status_overlay(self) -> None:
         if self.operator_status_overlay is None:

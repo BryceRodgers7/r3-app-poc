@@ -1,10 +1,11 @@
-"""Phase 13.A / 13.B: split ControlsWidget into per-window widgets.
+"""Phase 13.A / 13.B / 14.C: split ControlsWidget into per-window widgets.
 
-These tests lock in the new contract:
+These tests lock in the contract:
 
-- `RefereeControlsWidget` owns the replay/review transport (Pause,
-  Rewind, Replay Play, Slow 1/2x, Slow 1/4x, Step ◀/▶, Jump to Live)
-  and does NOT have the recording transport.
+- `RefereeControlsWidget` owns the replay/review transport. Phase 14.C
+  rebuilt the button set to: Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind,
+  Step ◀/▶. Replay Play and Jump to Live were removed — the operator's
+  Challenge button drives the jump-to-play behavior now.
 - `OperatorControlsWidget` owns the recording transport (Start/Stop
   game, Next Play) and does NOT have the replay transport.
 - `MainWindow.controls_role` selects which widget is built; the other
@@ -13,7 +14,7 @@ These tests lock in the new contract:
 
 Together they replace the pre-Phase-13 `ControlsWidget` that combined
 both roles on the referee window. See `r3_app_architecture.md`
-§Phase 13.
+§Phase 13 + §Phase 14.
 """
 
 from __future__ import annotations
@@ -41,14 +42,24 @@ class RefereeControlsWidgetContractTests(_QtTestCase):
         for attr in (
             "pause_button",
             "rewind_button",
-            "replay_play_button",
+            "speed_2x_button",
             "half_speed_button",
             "quarter_speed_button",
+            "eighth_speed_button",
             "step_back_button",
             "step_forward_button",
-            "live_button",
         ):
             self.assertTrue(hasattr(controls, attr), f"missing {attr}")
+
+    def test_removed_buttons_absent(self) -> None:
+        # Phase 14.C removed Replay Play and Jump to Live — the
+        # operator's Challenge button drives jump-to-play now and the
+        # referee has no explicit live-return UI.
+        controls = RefereeControlsWidget(button_height=72)
+        self.assertFalse(hasattr(controls, "replay_play_button"))
+        self.assertFalse(hasattr(controls, "live_button"))
+        self.assertFalse(hasattr(controls, "replay_current_play_requested"))
+        self.assertFalse(hasattr(controls, "live_requested"))
 
     def test_recording_buttons_absent(self) -> None:
         # The recording transport moved to OperatorControlsWidget in
@@ -64,36 +75,36 @@ class RefereeControlsWidgetContractTests(_QtTestCase):
         self.assertFalse(hasattr(controls, "long_recording_toggle_requested"))
         self.assertFalse(hasattr(controls, "next_play_requested"))
 
-    def test_replay_buttons_disabled_until_recording(self) -> None:
-        # Replay (and frame-step / replay-play) isn't available outside
-        # RECORDING per §10.4 / §15.2.
+    def test_step_buttons_disabled_until_recording(self) -> None:
+        # Phase 14.C: only Step ◀/▶ are gated. Pause / Rewind / speed
+        # buttons stay enabled and surface a status when pressed
+        # pre-recording — same idea as 13.A but the gated set is
+        # smaller now that Replay Play is gone.
         controls = RefereeControlsWidget(button_height=72)
-        self.assertFalse(controls.replay_play_button.isEnabled())
         self.assertFalse(controls.step_back_button.isEnabled())
         self.assertFalse(controls.step_forward_button.isEnabled())
 
-    def test_set_recording_state_toggles_replay_buttons(self) -> None:
+    def test_set_recording_state_toggles_step_buttons(self) -> None:
         controls = RefereeControlsWidget(button_height=72)
         controls.set_recording_state(True)
-        self.assertTrue(controls.replay_play_button.isEnabled())
         self.assertTrue(controls.step_back_button.isEnabled())
         self.assertTrue(controls.step_forward_button.isEnabled())
         controls.set_recording_state(False)
-        self.assertFalse(controls.replay_play_button.isEnabled())
         self.assertFalse(controls.step_back_button.isEnabled())
         self.assertFalse(controls.step_forward_button.isEnabled())
 
     def test_continuous_transport_buttons_always_enabled(self) -> None:
-        # Pause / Rewind / Slow / Jump to Live aren't gated — they
-        # surface a status message if pressed when replay is unavailable
-        # but the buttons themselves are always clickable.
+        # Pause / Rewind / speeds aren't gated — they surface a status
+        # message if pressed when replay is unavailable but the
+        # buttons themselves are always clickable.
         controls = RefereeControlsWidget(button_height=72)
         for button in (
             controls.pause_button,
             controls.rewind_button,
+            controls.speed_2x_button,
             controls.half_speed_button,
             controls.quarter_speed_button,
-            controls.live_button,
+            controls.eighth_speed_button,
         ):
             self.assertTrue(button.isEnabled())
 
@@ -112,12 +123,12 @@ class OperatorControlsWidgetContractTests(_QtTestCase):
         for attr in (
             "pause_button",
             "rewind_button",
-            "replay_play_button",
+            "speed_2x_button",
             "half_speed_button",
             "quarter_speed_button",
+            "eighth_speed_button",
             "step_back_button",
             "step_forward_button",
-            "live_button",
         ):
             self.assertFalse(hasattr(controls, attr), f"unexpected {attr}")
 
@@ -125,7 +136,8 @@ class OperatorControlsWidgetContractTests(_QtTestCase):
         controls = OperatorControlsWidget(button_height=72)
         self.assertFalse(hasattr(controls, "pause_requested"))
         self.assertFalse(hasattr(controls, "rewind_requested"))
-        self.assertFalse(hasattr(controls, "replay_current_play_requested"))
+        self.assertFalse(hasattr(controls, "speed_2x_requested"))
+        self.assertFalse(hasattr(controls, "eighth_speed_requested"))
         self.assertFalse(hasattr(controls, "step_back_requested"))
         self.assertFalse(hasattr(controls, "step_forward_requested"))
 

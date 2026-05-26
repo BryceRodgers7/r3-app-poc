@@ -201,13 +201,18 @@ def _validate_encoder_settings(
 
 
 def _validate_replay(config: dict[str, Any], *, where: str) -> None:
-    """Phase 12.B: range-check the `[replay]` sub-table.
+    """Phase 12.B / 14.C: range-check the `[replay]` sub-table.
 
     `frame_step_count` is the number of frames the operator's Step
     buttons jog the replay clock per click. Must be a positive int;
     rejecting 0 / negative / non-int up-front so the misconfiguration
     surfaces at config-load instead of at PlaybackController.step_frames
     runtime.
+
+    `rewind_seconds` (Phase 14.C) is the duration the referee
+    window's Rewind button jogs the replay clock back. Same int-only
+    / positive validation — the duration drives both UI button label
+    and `PlaybackController.rewind_configured_seconds()`.
     """
     if "frame_step_count" in config:
         raw = config["frame_step_count"]
@@ -218,6 +223,16 @@ def _validate_replay(config: dict[str, Any], *, where: str) -> None:
         if raw < 1:
             raise RuntimeError(
                 f"{where}: frame_step_count={raw} must be >= 1."
+            )
+    if "rewind_seconds" in config:
+        raw = config["rewind_seconds"]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise RuntimeError(
+                f"{where}: rewind_seconds={raw!r} must be an integer."
+            )
+        if raw < 1:
+            raise RuntimeError(
+                f"{where}: rewind_seconds={raw} must be >= 1."
             )
 
 
@@ -351,6 +366,12 @@ class AppSettings:
     # Default of 1 matches "one frame per click"; sports with faster
     # motion can turn this up via [replay] frame_step_count = N.
     replay_frame_step_count: int = 1
+    # Phase 14.C: rewind-button duration on the referee window. Drives
+    # both the button label ("Rewind Ns") and the seek delta in
+    # `PlaybackController.rewind_configured_seconds()`. Pre-14.C this
+    # was hardcoded to 10s; the spec ships at 5s. Operators can override
+    # via `[replay] rewind_seconds = N`.
+    replay_rewind_seconds: int = 5
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -498,13 +519,18 @@ class AppSettings:
                 recording_config["disk_full_grace_seconds"]
             )
 
-        # Phase 12.B: [replay] block — frame-step button cadence.
+        # Phase 12.B / 14.C: [replay] block — frame-step button
+        # cadence and rewind-button duration.
         replay_config = cls._as_dict(data.get("replay"))
         if replay_config:
             _validate_replay(replay_config, where="[replay]")
             if "frame_step_count" in replay_config:
                 settings.replay_frame_step_count = int(
                     replay_config["frame_step_count"]
+                )
+            if "rewind_seconds" in replay_config:
+                settings.replay_rewind_seconds = int(
+                    replay_config["rewind_seconds"]
                 )
 
         if "feed_id" in source_config:
