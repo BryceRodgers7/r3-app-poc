@@ -1,4 +1,4 @@
-"""`plays.json` sidecar per game (Phase 8.D, updated in Phase 14.A).
+"""`plays.json` sidecar per game (Phase 8.D, updated in 14.A/14.E).
 
 For each game in a finalized session, write a single
 `<session>/processed/<game_subdir>/plays.json` describing the
@@ -7,10 +7,12 @@ to seek inside the matching `<feed>.mp4` produced by Phase 8.B.
 
 Phase 14.A: the data source is the new `clips` table. Every clip
 type is emitted (pre-game, play, timeout, challenge) along with the
-`marked` flag so downstream tooling can filter as needed. Phase
-14.E will rename this file to `clips_json_export.py` to match the
-vocabulary; the on-disk sidecar filename and CLI surface stay
-backwards-compatible with downstream consumers in this repo.
+`marked` flag so downstream tooling can filter as needed.
+
+Phase 14.E: the Python module was renamed `plays_json_export` →
+`clips_json_export` to match the new vocabulary. The on-disk
+sidecar filename stays `plays.json` so downstream consumers don't
+need a coordinated cut-over.
 
 Shape::
 

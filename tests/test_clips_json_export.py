@@ -1,4 +1,4 @@
-"""`plays.json` sidecar tests (Phase 8.D, updated for Phase 14.A clips schema)."""
+"""`plays.json` sidecar tests (Phase 8.D, 14.A clips schema, 14.E rename)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from app.core.models import (
     Clip,
 )
 from app.storage.metadata_db import MetadataDb
-from app.tools.plays_json_export import (
+from app.tools.clips_json_export import (
     PLAYS_SIDECAR_FILENAME,
     write_plays_sidecar,
     write_plays_sidecars_for_session,
@@ -168,7 +168,7 @@ class PlaysSidecarShapeTests(unittest.TestCase):
                    clip_type=CLIP_TYPE_PLAY, play_number=1,
                    start_ns=400_000_000, end_ns=None)
         with self.assertLogs(
-            "app.tools.plays_json_export", level="WARNING"
+            "app.tools.clips_json_export", level="WARNING"
         ) as captured:
             path = write_plays_sidecar(self.db, self.session_path, "game_001")
         payload = json.loads(path.read_text(encoding="utf-8"))

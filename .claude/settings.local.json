@@ -164,7 +164,8 @@
       "Bash(C:/msys64/ucrt64/bin/ffprobe.exe -v error -select_streams a -show_entries stream=nb_read_frames,start_time,duration -count_frames -of default C:/SportsReplay/sessions/session_178/recording/game_002/ndi_1/segment_00000.mkv)",
       "Bash(C:/msys64/ucrt64/bin/ffprobe.exe -v error -select_streams v -show_entries packet=pts_time -of csv=p=0 C:/SportsReplay/sessions/session_178/recording/game_002/ndi_1/segment_00000.mkv)",
       "Bash(C:/msys64/ucrt64/bin/ffprobe.exe -v error -select_streams a -show_entries packet=pts_time -of csv=p=0 C:/SportsReplay/sessions/session_177/recording/game_002/ndi_1/segment_00000.mkv)",
-      "Bash(grep -A 20 \"dependencies\\\\|optional-dependencies\\\\|\\\\\\\\[media\\\\\\\\]\\\\|PySide6\" pyproject.toml)"
+      "Bash(grep -A 20 \"dependencies\\\\|optional-dependencies\\\\|\\\\\\\\[media\\\\\\\\]\\\\|PySide6\" pyproject.toml)",
+      "Bash(git mv *)"
     ]
   }
 }

@@ -432,12 +432,50 @@ class MainWindow(QMainWindow):
         return link
 
     def _on_post_process_link_clicked(self, _href: str) -> None:
-        # Placeholder until Phase 14.E wires the post-session
-        # processor + progress modal.
-        LOGGER.info("Post-process & Exit clicked (placeholder — Phase 14.E)")
-        self._status_bar.showMessage(
-            "Post-process & Exit is not wired yet (Phase 14.E).", 4000
+        """Phase 14.E: stop recording (if active) and run the in-app
+        post-session processor in a modal progress dialog.
+
+        On success: the dialog's "Close" button quits the app via
+        `QApplication.quit()` (which closes both windows and routes
+        through `aboutToQuit → coordinator.shutdown`). On failure:
+        the operator sees the error message and clicks "OK"; the app
+        still quits — they re-run from the CLI per the existing
+        manual workflow.
+        """
+        from app.ui.post_process_dialog import PostProcessDialog
+
+        coord = self._application_coordinator
+        if coord is None:
+            LOGGER.warning(
+                "Post-process & Exit clicked with no coordinator attached"
+            )
+            return
+        # Stop recording synchronously if a game is in flight. Phase
+        # 14.E spec: "Block on the recording-stopped signal — the
+        # post-processor only sees finalized segments."
+        # toggle_long_session_recording runs the full stop sequence
+        # synchronously (disable_file_recording → ClipManager.stop_game
+        # → state transitions) before returning, so a single call is
+        # enough — no explicit signal wait needed.
+        if coord._recording_manager.is_any_recording():
+            LOGGER.info("Post-process & Exit: stopping recording first")
+            coord.toggle_long_session_recording()
+        session_paths = coord._session_manager.get_active_session_paths()
+        if session_paths is None:
+            LOGGER.warning(
+                "Post-process & Exit: no active session — nothing to process"
+            )
+            self._status_bar.showMessage(
+                "No active session to process.", 4000
+            )
+            return
+        dialog = PostProcessDialog(
+            session_path=session_paths.root_dir,
+            metadata_db_path=self._settings.metadata_db_path,
+            parent=self,
         )
+        dialog.start()
+        dialog.exec()
 
     def _on_pause_button_pressed(self) -> None:
         """Phase 14.C: Play/Pause toggle handler.

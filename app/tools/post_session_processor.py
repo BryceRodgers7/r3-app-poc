@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from app.core.models import SEGMENT_STATE_COMPLETE, Segment
 from app.core.session_state import SESSION_MANIFEST_FILENAME, SessionState
@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
                 # one per game in the plan. Independent of MP4
                 # encoding success — a play-marker file is useful
                 # forensically even if some encodes failed.
-                from app.tools.plays_json_export import (
+                from app.tools.clips_json_export import (
                     write_plays_sidecars_for_session,
                 )
                 game_subdirs = [item.game_subdir for item in plan.long_form]
@@ -337,6 +337,127 @@ def print_plan(plan: ProcessingPlan) -> None:
             f"{item.segment_count} segments, "
             f"{duration_s:6.1f}s  ->  {item.output_path}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PostProcessRunResult:
+    """Outcome of a single in-app post-processing run.
+
+    Phase 14.E: the `PostProcessDialog` shows `error_message` on
+    failure and quits the app on success. `succeeded`/`failed`/`skipped`
+    counts populate the dialog's final status text; an empty plan
+    counts as success.
+    """
+
+    success: bool
+    error_message: str | None
+    succeeded: int
+    failed: int
+    skipped: int
+
+
+def run_post_process(
+    session_path: Path,
+    *,
+    metadata_db_path: Path | None = None,
+    ffmpeg_path: Path | None = None,
+    force: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> PostProcessRunResult:
+    """Phase 14.E: non-CLI entry point for the in-app modal.
+
+    Same flow as `main()` minus argparse / logging.basicConfig / stdout
+    plan-printing. Returns a `PostProcessRunResult` instead of an exit
+    code so the dialog can render the outcome.
+
+    `progress_callback` is forwarded into `export_all` and fires once
+    per plan item. The callback receives `(processed, total, current)`
+    where `current` is `"<game_subdir>/<feed_id>"`.
+
+    Pre-flight validation:
+      - metadata DB must exist
+      - ffmpeg binary must resolve
+      - no other processing run holds the session lock
+
+    Note that the in-app path **does not** require the session
+    manifest to be in `FINALIZED` state — the operator is running
+    this from within the live app, so the session is still
+    `STOPPED` (recording just ended) or `RECORDING`. The CLI's
+    `main()` enforces FINALIZED for the post-shutdown retry path;
+    the live app trusts that `toggle_long_session_recording()` has
+    finalized all segments before this entry point runs.
+
+    Errors are returned as `success=False, error_message=str` rather
+    than raised — the dialog displays the message verbatim.
+    """
+    session_path = session_path.resolve()
+    db_path = (
+        metadata_db_path or _default_metadata_db_path(session_path)
+    ).resolve()
+    if not db_path.exists():
+        return PostProcessRunResult(
+            False, f"metadata database not found at {db_path}", 0, 0, 0
+        )
+
+    # Import here to mirror the CLI's lazy resolution — keeps a missing
+    # ffmpeg binary from breaking module import for unrelated callers.
+    from app.tools.long_form_export import (
+        FfmpegNotFoundError,
+        LongFormExporter,
+        export_all,
+    )
+    from app.tools.clips_json_export import write_plays_sidecars_for_session
+
+    try:
+        exporter = LongFormExporter(ffmpeg_path=ffmpeg_path)
+    except FfmpegNotFoundError as exc:
+        return PostProcessRunResult(False, str(exc), 0, 0, 0)
+
+    try:
+        with acquire_lock(session_path):
+            db = MetadataDb(db_path)
+            try:
+                plan = build_plan(db, session_path)
+                if not plan.long_form:
+                    # No artifacts to encode — sidecar pass still runs
+                    # against any existing clips, but with no games in
+                    # the plan there's nothing to write.
+                    return PostProcessRunResult(True, None, 0, 0, 0)
+                results = export_all(
+                    exporter,
+                    plan.long_form,
+                    segment_paths_for=lambda item: list(item.segment_paths),
+                    db=db,
+                    session_id=plan.session_id,
+                    force=force,
+                    progress_callback=progress_callback,
+                )
+                game_subdirs = [item.game_subdir for item in plan.long_form]
+                write_plays_sidecars_for_session(db, session_path, game_subdirs)
+            finally:
+                db.close()
+    except ValidationError as exc:
+        return PostProcessRunResult(False, str(exc), 0, 0, 0)
+    except Exception as exc:
+        LOGGER.exception("run_post_process: unexpected failure")
+        return PostProcessRunResult(False, repr(exc), 0, 0, 0)
+
+    succeeded = sum(1 for r in results if r.status == "success")
+    failed = sum(1 for r in results if r.status == "failed")
+    skipped = sum(1 for r in results if r.status == "skipped")
+    if failed:
+        first_error = next(
+            (r.error_message for r in results if r.status == "failed"),
+            "one or more artifacts failed to encode",
+        )
+        return PostProcessRunResult(
+            False,
+            first_error or "one or more artifacts failed to encode",
+            succeeded,
+            failed,
+            skipped,
+        )
+    return PostProcessRunResult(True, None, succeeded, failed, skipped)
 
 
 # --------------------------------------------------------------------

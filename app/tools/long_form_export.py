@@ -30,7 +30,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from app.core.models import (
     EXPORT_KIND_LONG_FORM,
@@ -328,6 +328,7 @@ def export_all(
     db: MetadataDb | None = None,
     session_id: str | None = None,
     force: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[ExportResult]:
     """Run `exporter.export` for every plan item, collecting results.
 
@@ -350,8 +351,16 @@ def export_all(
     `db` and `session_id` are optional so existing callers / tests
     that only need the encode-and-collect-results flow keep working
     without DB plumbing.
+
+    Phase 14.E: `progress_callback(processed, total, current_item)`
+    fires once per plan item after the encode attempt (success,
+    failure, or skip). `current_item` is `"<game_subdir>/<feed_id>"`.
+    `processed` counts from 1; `total` is `len(plan_items)`. The
+    in-app PostProcessDialog routes this onto its progress bar +
+    status label; the CLI path passes None and behavior is unchanged.
     """
     plan_items_list = list(plan_items)
+    total = len(plan_items_list)
     persist = db is not None and session_id is not None
     if persist and not force:
         already_done = db.successful_artifact_keys(session_id)
@@ -359,7 +368,7 @@ def export_all(
         already_done = set()
 
     results: list[ExportResult] = []
-    for plan_item in plan_items_list:
+    for index, plan_item in enumerate(plan_items_list, start=1):
         artifact_key = (
             EXPORT_KIND_LONG_FORM,
             plan_item.game_subdir,
@@ -379,14 +388,25 @@ def export_all(
                     output_path=plan_item.output_path,
                 )
             )
-            continue
-        segment_paths = segment_paths_for(plan_item)
-        result = exporter.export(plan_item, segment_paths)
-        results.append(result)
-        if persist:
-            _persist_result_locked(
-                db, session_id, plan_item, result
-            )
+        else:
+            segment_paths = segment_paths_for(plan_item)
+            result = exporter.export(plan_item, segment_paths)
+            results.append(result)
+            if persist:
+                _persist_result_locked(
+                    db, session_id, plan_item, result
+                )
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    index,
+                    total,
+                    f"{plan_item.game_subdir}/{plan_item.feed_id}",
+                )
+            except Exception:
+                # A buggy callback (e.g. dialog torn down mid-run)
+                # must not abort the export loop — log and continue.
+                LOGGER.exception("progress_callback raised")
     return results
 
 
