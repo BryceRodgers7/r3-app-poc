@@ -287,6 +287,18 @@ class MainWindow(QMainWindow):
             self.scrubber.seek_to_session_time_requested.connect(
                 self._controller.seek_to_session_time
             )
+        # Phase 14.D: flip the referee play badge red while a
+        # challenge lockout is active. The coordinator owns the
+        # state (one challenge across both windows), so the signal
+        # lives on the coordinator's bus, not on the per-controller
+        # AppSignals.
+        if (
+            self.referee_play_badge is not None
+            and self._application_coordinator is not None
+        ):
+            self._application_coordinator.signals.challenge_state_changed.connect(
+                self.referee_play_badge.set_challenge_active
+            )
         if self.operator_controls is not None and self._application_coordinator is not None:
             self.operator_controls.long_recording_toggle_requested.connect(
                 self._application_coordinator.toggle_long_session_recording

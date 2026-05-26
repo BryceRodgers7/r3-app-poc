@@ -67,6 +67,12 @@ class ClipManager:
         # non-play clip (timeout / challenge) without a DB query each
         # overlay tick. Reset on `start_game` / `stop_game`.
         self._last_play_number: int | None = None
+        # Phase 14.D: most-recent closed play clip's bounds
+        # `(start_session_time_ns, end_session_time_ns)`, cached so
+        # `last_play_bounds()` can answer without a DB query on the
+        # Challenge hot path. Set when a play is closed via
+        # `_open_next_clip_locked`. Reset on `start_game` / `stop_game`.
+        self._last_play_bounds: tuple[int, int] | None = None
 
     # ----------------------------------------------------------------
     # Lifecycle hooks
@@ -122,6 +128,7 @@ class ClipManager:
                 clip_type = CLIP_TYPE_PRE_GAME
                 play_number: int | None = None
                 self._last_play_number = None
+                self._last_play_bounds = None
             else:
                 most_recent = max(existing, key=lambda c: c.clip_number)
                 clip_type = most_recent.type
@@ -261,6 +268,16 @@ class ClipManager:
                 )
                 return None
             self._db.close_clip(current.clip_id, now_session_time_ns)
+            # Phase 14.D: cache the just-closed play's bounds for
+            # the Challenge hot path. Only updated when a play
+            # closes — timeout/challenge transitions leave the
+            # cached bounds pointing at the prior play, which is
+            # exactly what the next Challenge press needs.
+            if current.type == CLIP_TYPE_PLAY:
+                self._last_play_bounds = (
+                    current.start_session_time_ns,
+                    now_session_time_ns,
+                )
             if new_type == CLIP_TYPE_PLAY:
                 next_play_number = (
                     self._last_play_number + 1
@@ -359,8 +376,19 @@ class ClipManager:
                 current.type,
                 end_session_time_ns,
             )
+            # Phase 14.D: if the clip we just closed is a play,
+            # capture its bounds so an immediately-following
+            # Challenge press (after stop_game returns) has access
+            # to them. End Game also clears the cache below; the
+            # ordering here is just defensive.
+            if current.type == CLIP_TYPE_PLAY:
+                self._last_play_bounds = (
+                    current.start_session_time_ns,
+                    end_session_time_ns,
+                )
             self._current = None
             self._last_play_number = None
+            self._last_play_bounds = None
 
     # ----------------------------------------------------------------
     # Read accessors
@@ -370,6 +398,18 @@ class ClipManager:
         """Return a snapshot of the currently-open clip, or None."""
         with self._lock:
             return self._current
+
+    def last_play_bounds(self) -> tuple[int, int] | None:
+        """Phase 14.D: bounds of the most-recently-closed play clip.
+
+        Returns `(start_session_time_ns, end_session_time_ns)` of the
+        prior play in this game, or None if no play has been opened
+        yet OR `stop_game` has reset the cache. The Challenge hot
+        path uses this to install a `PlaybackController` fence
+        without a DB round-trip.
+        """
+        with self._lock:
+            return self._last_play_bounds
 
     def current_clip_number(self) -> int | None:
         """Convenience for the operator-window clip counter."""

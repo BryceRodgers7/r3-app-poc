@@ -203,7 +203,7 @@ class PlaybackControllerTransportGateTests(unittest.TestCase):
         from app.core.playback_controller import PlaybackController
 
         pc = self._build_pc_stub()
-        PlaybackController.replay_current_play(pc)
+        PlaybackController.replay_current_play(pc, 0, None)
         pc._replay_actions_allowed.assert_not_called()
 
     def test_jump_to_live_short_circuits(self) -> None:

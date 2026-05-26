@@ -111,6 +111,14 @@ class PlaybackController:
         # (see `application_coordinator`). Tests / older callers fall
         # back to the module default.
         self._rewind_ns = max(1, int(rewind_seconds)) * 1_000_000_000
+        # Phase 14.D: challenge-lockout fence. When set, all replay
+        # primitives clamp their target session-time to this range
+        # and force PAUSED on out-of-bounds. `end` may be None when
+        # the play just closed but `end_session_time_ns` hasn't been
+        # finalized yet — the helper treats None as "use the segment
+        # store's `latest` as the upper edge", which absorbs the brief
+        # window before the close-clip write lands.
+        self._clip_bounds: tuple[int, int | None] | None = None
         # Phase 10.F: set by `shutdown()` so transport methods that race
         # the teardown become no-ops instead of touching half-torn-down
         # decoders / timers.
@@ -236,16 +244,36 @@ class PlaybackController:
                 self._emit_state()
                 return
             assert self.replay_state is not None
+            # Phase 14.D: if the rewind crosses the challenge fence,
+            # clamp to the fence edge and bounce to PAUSED instead of
+            # REPLAYING.
+            (
+                target_session_time_ns,
+                fence_low,
+                fence_high,
+            ) = self._apply_clip_bounds_locked(target_session_time_ns)
             self.replay_state.transition_to(ReplayState.SEEKING)
-            self.replay_state.transition_to(ReplayState.REPLAYING)
-            self._playback_session_time_ns = target_session_time_ns
-            self._playback_rate = 1.0
-            self._state.current_playback_mode = PlaybackMode.REPLAY
+            if fence_low or fence_high:
+                self.replay_state.transition_to(ReplayState.PAUSED)
+                self._stop_replay_clock_locked()
+                self._playback_session_time_ns = target_session_time_ns
+                self._playback_rate = 0.0
+                self._state.current_playback_mode = PlaybackMode.PAUSED
+            else:
+                self.replay_state.transition_to(ReplayState.REPLAYING)
+                self._playback_session_time_ns = target_session_time_ns
+                self._playback_rate = 1.0
+                self._state.current_playback_mode = PlaybackMode.REPLAY
+                self._start_replay_clock_locked(target_session_time_ns)
             self._state.error_message = None
-            self._start_replay_clock_locked(target_session_time_ns)
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(target_session_time_ns)
-        self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
+        if fence_low:
+            self._emit_state("Held at start of play (challenge)")
+        elif fence_high:
+            self._emit_state("Held at end of play (challenge)")
+        else:
+            self._emit_state(f"Replay -{self._state.seconds_behind_live:.0f}s")
 
     def seek_to_session_time(self, target_session_time_ns: int) -> None:
         """Phase 14.C: seek the replay clock to an absolute session-time.
@@ -273,6 +301,11 @@ class PlaybackController:
                 self._emit_state()
                 return
             clamped = max(earliest, min(latest, int(target_session_time_ns)))
+            # Phase 14.D: fence clamp follows range clamp. seek_to_session_time
+            # already lands in PAUSED, so the fence-clamp doesn't change
+            # the FSM target — but the status message differentiates a
+            # plain scrub from one that hit the fence.
+            clamped, fence_low, fence_high = self._apply_clip_bounds_locked(clamped)
             assert self.replay_state is not None
             self.replay_state.transition_to(ReplayState.SEEKING)
             self.replay_state.transition_to(ReplayState.PAUSED)
@@ -283,25 +316,62 @@ class PlaybackController:
             self._state.error_message = None
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(clamped)
-        self._emit_state("Scrubbed")
+        if fence_low:
+            self._emit_state("Held at start of play (challenge)")
+        elif fence_high:
+            self._emit_state("Held at end of play (challenge)")
+        else:
+            self._emit_state("Scrubbed")
 
-    def replay_current_play(self) -> None:
-        """Seek to the start of the currently-open play.
+    def set_clip_bounds(
+        self,
+        start_session_time_ns: int,
+        end_session_time_ns: int | None,
+    ) -> None:
+        """Phase 14.D: install a replay fence (challenge lockout).
 
-        Wired to the referee window's "Replay Play" button (kept for
-        Phase 14.A transitional behavior; Phase 14.C removes the
-        explicit button and Phase 14.D repurposes this primitive as
-        the Challenge-open hook). The currently-open play clip's
-        `start_session_time_ns` is the seek target — playback
-        resumes at 1.0x from there.
+        While bounds are installed, every replay primitive clamps its
+        target session-time to `[start, end]` and forces PAUSED on
+        out-of-bounds. `end` may be None initially — the close-clip
+        write hasn't landed yet — in which case the upper edge falls
+        back to the segment store's `latest` until a later
+        `set_clip_bounds` updates it.
+
+        Idempotent; replaces any existing fence.
+        """
+        with self._lock:
+            self._clip_bounds = (
+                int(start_session_time_ns),
+                None if end_session_time_ns is None else int(end_session_time_ns),
+            )
+
+    def clear_clip_bounds(self) -> None:
+        """Phase 14.D: remove the replay fence; full range available again."""
+        with self._lock:
+            self._clip_bounds = None
+
+    def replay_current_play(
+        self,
+        start_session_time_ns: int,
+        end_session_time_ns: int | None,
+    ) -> None:
+        """Phase 14.D challenge-open hook (repurposed from Phase 7.H.4).
+
+        Snap the playback clock to `start_session_time_ns`, install
+        bounds `(start, end)`, bounce to PAUSED, and render. The
+        coordinator calls this on the referee controller with the
+        bounds of the just-closed play clip when the operator presses
+        Challenge.
+
+        Pre-14.D this primitive took no args and resumed at 1.0× from
+        the currently-open play's start. The new contract:
+          - explicit bounds (caller already looked up the play)
+          - lands in PAUSED so the referee chooses when to resume
+          - installs the fence the rest of the controller respects
 
         No-op when:
           - this is the live-only program output
           - replay isn't available (recording not active)
-          - no ClipManager is attached (older test paths)
-          - no clip is currently open OR the current clip is not a
-            play (Phase 14.D will refine this for timeout/challenge
-            interleaving)
         """
         if getattr(self, "_shutting_down", False):
             return
@@ -311,34 +381,30 @@ class PlaybackController:
         if not self._replay_actions_allowed():
             self._emit_state("Replay unavailable: start game recording first.")
             return
-        if self._clip_manager is None:
-            return
-        current = self._clip_manager.current_clip()
-        if current is None or not current.is_play:
-            self._emit_state("No play is currently open.")
-            return
-        target_session_time_ns = current.start_session_time_ns
         # Defensive clamp to the per-game replay scope's earliest, in
         # case the play marker drifted slightly before the first
         # finalized segment of the game (Phase 5.C / §8.6.1 handles
         # the freeze-frame fallback if we end up before any coverage).
         earliest, _ = self._replay_store.available_session_time_range()
+        target_session_time_ns = int(start_session_time_ns)
         if earliest is not None and target_session_time_ns < earliest:
             target_session_time_ns = earliest
         with self._lock:
             assert self.replay_state is not None
+            self._clip_bounds = (
+                int(start_session_time_ns),
+                None if end_session_time_ns is None else int(end_session_time_ns),
+            )
             self.replay_state.transition_to(ReplayState.SEEKING)
-            self.replay_state.transition_to(ReplayState.REPLAYING)
+            self.replay_state.transition_to(ReplayState.PAUSED)
+            self._stop_replay_clock_locked()
             self._playback_session_time_ns = target_session_time_ns
-            self._playback_rate = 1.0
-            self._state.current_playback_mode = PlaybackMode.REPLAY
+            self._playback_rate = 0.0
+            self._state.current_playback_mode = PlaybackMode.PAUSED
             self._state.error_message = None
-            self._start_replay_clock_locked(target_session_time_ns)
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(target_session_time_ns)
-        self._emit_state(f"Replaying Play #{current.play_number}")
-        # Defensive: play_number is non-NULL by Clip's CHECK constraint
-        # when type='play', so the format above is well-defined.
+        self._emit_state("Reviewing play (challenge)")
 
     def jump_to_live(self) -> None:
         """Return the viewed output to the live edge."""
@@ -411,7 +477,27 @@ class PlaybackController:
                     self._state.error_message = "Replay frame is not available yet."
                     self._emit_state()
                     return
-                self._playback_session_time_ns = latest
+                # Phase 14.D: a challenge fence overrides the live-edge
+                # snap. During a lockout, "Play from live" doesn't make
+                # sense — start at the fence's lower edge so the
+                # referee watches the play from its beginning.
+                if self._clip_bounds is not None:
+                    self._playback_session_time_ns = self._clip_bounds[0]
+                else:
+                    self._playback_session_time_ns = latest
+            # Phase 14.D: also fence-clamp the current playback
+            # position. If the operator's last replay position is
+            # outside the fence (only possible if bounds were just
+            # installed), snap back inside before applying the rate.
+            (
+                clamped_target,
+                fence_low,
+                fence_high,
+            ) = self._apply_clip_bounds_locked(
+                self._playback_session_time_ns or 0
+            )
+            if (fence_low or fence_high) and self._playback_session_time_ns is not None:
+                self._playback_session_time_ns = clamped_target
             self._playback_rate = max(0.0, playback_rate)
             # The replay state machine only allows direct entry to
             # PAUSED/REPLAYING from LIVE_WHILE_RECORDING (no direct
@@ -516,6 +602,15 @@ class PlaybackController:
             if earliest is not None and target_session_time_ns < earliest:
                 target_session_time_ns = earliest
                 clamped_at_start = True
+            # Phase 14.D: fence-clamp after the range clamp. Step
+            # already lands in PAUSED, so the only change is the
+            # status string differentiating a fence hit from a
+            # boundary hit.
+            (
+                target_session_time_ns,
+                fence_low,
+                fence_high,
+            ) = self._apply_clip_bounds_locked(target_session_time_ns)
             # Bounce the FSM to PAUSED. LIVE_WHILE_RECORDING / SEEKING /
             # REPLAYING / SLOW_MOTION → PAUSED is allowed directly per
             # `_REPLAY_TRANSITIONS`; PAUSED → PAUSED is a no-op handled
@@ -528,7 +623,11 @@ class PlaybackController:
             self._stop_replay_clock_locked()
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(target_session_time_ns)
-        if clamped_at_live_edge:
+        if fence_low:
+            self._emit_state("Held at start of play (challenge)")
+        elif fence_high:
+            self._emit_state("Held at end of play (challenge)")
+        elif clamped_at_live_edge:
             self._emit_state("Step held at live edge")
         elif clamped_at_start:
             self._emit_state("Step held at start of recording")
@@ -671,6 +770,35 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._emit_state()
 
+    def _apply_clip_bounds_locked(
+        self, target_session_time_ns: int
+    ) -> tuple[int, bool, bool]:
+        """Phase 14.D: clamp `target` to the active fence, if any.
+
+        Returns `(clamped_target_ns, was_clamped_low, was_clamped_high)`.
+        Callers use the `was_clamped_*` flags to decide whether to force
+        PAUSED and emit a "held at" status. When no fence is installed
+        the input is returned unchanged with both flags False.
+
+        `_clip_bounds.end` is None during the brief window after Next
+        Play opens a clip but before its close-clip write lands; in
+        that case we fall back to the segment store's `latest` so the
+        fence still bounds the upper edge.
+        """
+        if self._clip_bounds is None:
+            return target_session_time_ns, False, False
+        start_ns, end_ns = self._clip_bounds
+        if end_ns is None:
+            _, latest = self._replay_store.available_session_time_range()
+            end_ns = latest if latest is not None else start_ns
+        clamped_low = target_session_time_ns < start_ns
+        clamped_high = target_session_time_ns > end_ns
+        if clamped_low:
+            return start_ns, True, False
+        if clamped_high:
+            return end_ns, False, True
+        return target_session_time_ns, False, False
+
     def _resolve_pause_anchor_locked(self) -> int | None:
         """Pick a session-time to freeze on when the operator presses Pause.
 
@@ -698,7 +826,9 @@ class PlaybackController:
 
         Result is clamped to the earliest replayable session time so
         a long rewind from a short recording lands at the start of
-        the timeline rather than going negative.
+        the timeline rather than going negative. Phase 14.D adds the
+        challenge-fence clamp at the end so a Rewind that would cross
+        the play boundary lands at the boundary instead.
         """
         if (
             self._state.current_playback_mode in {PlaybackMode.REPLAY, PlaybackMode.PAUSED}
@@ -822,11 +952,29 @@ class PlaybackController:
         with self._lock:
             if self._state.current_playback_mode != PlaybackMode.REPLAY:
                 return
+            # Phase 14.D: if the natural-rate advance crossed the
+            # challenge fence's upper edge, snap to the edge and
+            # PAUSE. The lower edge isn't reachable from a forward
+            # advance — we entered the fence inside its range and
+            # natural playback moves forward.
+            (
+                target_session_time_ns,
+                _fence_low,
+                fence_high,
+            ) = self._apply_clip_bounds_locked(target_session_time_ns)
             self._playback_session_time_ns = target_session_time_ns
             self._state.error_message = None
+            if fence_high and self.replay_state is not None:
+                self.replay_state.transition_to(ReplayState.PAUSED)
+                self._playback_rate = 0.0
+                self._state.current_playback_mode = PlaybackMode.PAUSED
+                self._stop_replay_clock_locked()
             self._update_state_timestamps_locked()
         self._render_at_session_time_ns(target_session_time_ns)
-        self._emit_state()
+        if fence_high:
+            self._emit_state("Held at end of play (challenge)")
+        else:
+            self._emit_state()
 
     def _on_overlay_timer_tick(self) -> None:
         with self._lock:

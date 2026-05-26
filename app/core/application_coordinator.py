@@ -10,8 +10,22 @@ from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 
+from PySide6.QtCore import QObject, Signal
+
 from app.config.settings import AppSettings
 from app.core.session_clock import SessionClock
+
+
+class _CoordinatorSignals(QObject):
+    """Phase 14.D: cross-cutting Qt signals fired by the coordinator.
+
+    Lives separately from `AppSignals` (per-controller) because these
+    are coordinator-level events that don't belong to either
+    PlaybackController's UiState bus. Today: just the challenge
+    lockout state — wired by the referee MainWindow to the play badge.
+    """
+
+    challenge_state_changed = Signal(bool)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -164,6 +178,12 @@ class ApplicationCoordinator:
         # AND a viable crashed game exists; consumed by the first
         # toggle_long_session_recording start path.
         self._resume_continuation: _ResumeContinuation | None = None
+        # Phase 14.D: coordinator-level signals (challenge lockout).
+        self.signals = _CoordinatorSignals()
+        # Tracks whether a challenge fence is currently installed on
+        # the referee controller, so the lockout-clear paths only
+        # emit when state actually changes.
+        self._challenge_active = False
 
     def get_feed_pipeline_mode(self, feed_id: str) -> PipelineMode:
         """Return the configured ingest pipeline mode for `feed_id`.
@@ -246,6 +266,11 @@ class ApplicationCoordinator:
                 self.clip_manager.stop_game(
                     self.session_clock.now_session_time_ns()
                 )
+            # Phase 14.D: End Game clears any active challenge lockout
+            # (mirrors Next Play / Time-out). Done after stop_game so
+            # the referee badge flips back to its neutral color before
+            # the next-game UI state lands.
+            self._clear_challenge_lockout()
             # Phase 7.B-ext: clear the per-game replay scope so a future
             # Start re-captures it. (The recording-state gate already
             # idles replay queries during the gap, but clearing avoids
@@ -420,6 +445,10 @@ class ApplicationCoordinator:
         )
         if next_clip is not None and next_clip.play_number is not None:
             self._emit_clip_status(f"Play #{next_clip.play_number} started.")
+            # Phase 14.D: opening a new play clears any active
+            # challenge lockout. Per spec, the referee window stays
+            # paused at the current position — no auto-jump to live.
+            self._clear_challenge_lockout()
         self._refresh_clip_state()
 
     def mark_timeout(self) -> None:
@@ -443,6 +472,9 @@ class ApplicationCoordinator:
         )
         if next_clip is not None:
             self._emit_clip_status("Timeout started.")
+            # Phase 14.D: time-out clears the challenge lockout
+            # (same rule as Next Play). The referee stays paused.
+            self._clear_challenge_lockout()
         else:
             self._emit_clip_status(
                 "Timeout unavailable until the first play has started."
@@ -455,6 +487,12 @@ class ApplicationCoordinator:
         Wired to the operator's Challenge button. Rejected before
         the first Next Play press AND when the current clip is
         already a challenge (no back-to-back challenges per spec).
+
+        Phase 14.D: on success, also installs the challenge lockout
+        fence on the referee controller. The fence pins the referee
+        window to `[play.start, play.end]` until a later
+        `mark_next_play` / `mark_timeout` / `stop_game` clears it.
+        The operator controller is `live_only` so no fence applies.
         """
         if getattr(self, "_shutting_down", False):
             return
@@ -470,11 +508,38 @@ class ApplicationCoordinator:
         )
         if next_clip is not None:
             self._emit_clip_status("Challenge started.")
+            # Phase 14.D: fence the referee at the just-closed play's
+            # bounds and notify the play badge to flip red. The
+            # bounds come from ClipManager's in-memory cache so
+            # this is hot-path cheap.
+            bounds = self.clip_manager.last_play_bounds()
+            if bounds is not None:
+                start_ns, end_ns = bounds
+                self.referee_controller.replay_current_play(start_ns, end_ns)
+                self._challenge_active = True
+                self.signals.challenge_state_changed.emit(True)
         else:
             self._emit_clip_status(
                 "Challenge unavailable (no play started, or already in a challenge)."
             )
         self._refresh_clip_state()
+
+    def _clear_challenge_lockout(self) -> None:
+        """Phase 14.D: drop the challenge fence if one is installed.
+
+        Called from every lockout-clear path: `mark_next_play`,
+        `mark_timeout`, and the stop branch of
+        `toggle_long_session_recording`. Idempotent — safe to call
+        when no fence is active. The `getattr` defaults absorb test
+        stubs that bypass `__init__` via `__new__`.
+        """
+        if not getattr(self, "_challenge_active", False):
+            return
+        self.referee_controller.clear_clip_bounds()
+        self._challenge_active = False
+        signals = getattr(self, "signals", None)
+        if signals is not None:
+            signals.challenge_state_changed.emit(False)
 
     def toggle_clip_mark(self) -> None:
         """Flip the `marked` flag on the currently-open clip.
