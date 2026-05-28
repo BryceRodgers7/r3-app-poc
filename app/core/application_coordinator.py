@@ -532,10 +532,19 @@ class ApplicationCoordinator:
         `toggle_long_session_recording`. Idempotent — safe to call
         when no fence is active. The `getattr` defaults absorb test
         stubs that bypass `__init__` via `__new__`.
+
+        Phase 14.F.1: after dropping the fence, snap the referee
+        controller back to the live edge. The referee window's
+        purpose is to watch live by default and only review on demand
+        during a challenge; once the challenge ends, the natural
+        state is live again. Without this, the referee was left
+        paused at the end of the just-reviewed play and had to
+        manually return — confusing during a fast-moving game.
         """
         if not getattr(self, "_challenge_active", False):
             return
         self.referee_controller.clear_clip_bounds()
+        self.referee_controller.jump_to_live()
         self._challenge_active = False
         signals = getattr(self, "signals", None)
         if signals is not None:

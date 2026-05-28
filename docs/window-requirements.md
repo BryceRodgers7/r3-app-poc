@@ -51,10 +51,11 @@ Referee Review Screen
   * Display a ribbon of buttons, one for each video feed.  
     * When a button is clicked its video feed is hidden/restored on the video panel.  
     * The video panel should be responsive to maximize the size of the remaining video feeds.   
-* When the ‘challenge’ button on the operator screen is pressed, the video feeds on the referee window will jump to the beginning of the last play, and will be paused there.  
-  * During a challenge, the video feeds will show the last play. When the end of play-clip is reached, it will automatically pause, the feeds cannot go beyond that point until the challenge is over.   
-  * During a challenge, the video feed cannot rewind to any point earlier than the start of the most recent play (the challenged play). If the referee tries to rewind back further, it will automatically pause at the start of the play.   
-  * The challenge is over when the operator presses a button to start a new clip (such as ‘Next Play’ or ‘Time Out’).   
+* When the ‘challenge’ button on the operator screen is pressed, the video feeds on the referee window will jump to the beginning of the last play, and will be paused there.
+  * During a challenge, the video feeds will show the last play. When the end of play-clip is reached, it will automatically pause, the feeds cannot go beyond that point until the challenge is over.
+  * During a challenge, the video feed cannot rewind to any point earlier than the start of the most recent play (the challenged play). If the referee tries to rewind back further, it will automatically pause at the start of the play.
+  * The challenge is over when the operator presses a button to start a new clip (such as ‘Next Play’ or ‘Time Out’).
+  * When the challenge ends, the referee window automatically returns to the live feed — no manual jump-to-live is needed.
 * Display a play counter in the bottom-left of this window. This will show the number of the current play (on the video feeds) OR the last play number, if the current clip is not a play. During the ‘pre-game’ clip this will show ‘N/A’.  
 * There will be buttons for pause/play, 2x speed, ½ speed, ¼ speed, ⅛ speed, rewind 5 seconds, step backwards 1 frame, and step forward 1 frame.
 * There will also be an inertia wheel which allows the referee to seek the video within the current clip. Whenever this wheel turns 1 degree, the video feed should seek 1 frame in that direction (forward or backward). Mouse-drag (click-and-drag in a circle around the wheel) is the only input. On release after a fast spin, the wheel coasts forward with momentum and the seek follows, decaying smoothly to a stop.

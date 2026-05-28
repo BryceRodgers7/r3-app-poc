@@ -434,6 +434,37 @@ class CoordinatorChallengeWiringTests(unittest.TestCase):
         coord.referee_controller.clear_clip_bounds.assert_not_called()
         self.assertEqual(emitted, [])
 
+    def test_clearing_fence_returns_referee_to_live(self) -> None:
+        # Phase 14.F.1: when a challenge ends, the referee window must
+        # auto-return to the live feed (no manual Jump to Live needed).
+        # The referee window has no Jump to Live button in 14.C/14.F, so
+        # the coordinator owns this transition.
+        coord = self._build_coord()
+        coord._challenge_active = True
+        next_clip = mock.Mock()
+        next_clip.play_number = 4
+        coord.clip_manager.mark_next_play.return_value = next_clip
+
+        coord.mark_next_play()
+
+        coord.referee_controller.clear_clip_bounds.assert_called_once()
+        coord.referee_controller.jump_to_live.assert_called_once()
+
+    def test_clearing_fence_does_not_jump_referee_when_no_challenge(self) -> None:
+        # Phase 14.F.1 narrow: if no challenge is active and Next Play
+        # fires, the referee should not be disturbed (operator advanced
+        # the game during normal play — referee may be reviewing
+        # something on their own).
+        coord = self._build_coord()
+        coord._challenge_active = False
+        next_clip = mock.Mock()
+        next_clip.play_number = 2
+        coord.clip_manager.mark_next_play.return_value = next_clip
+
+        coord.mark_next_play()
+
+        coord.referee_controller.jump_to_live.assert_not_called()
+
 
 class ClipManagerLastPlayBoundsTests(unittest.TestCase):
     """ClipManager exposes `last_play_bounds()` for the Challenge hot
