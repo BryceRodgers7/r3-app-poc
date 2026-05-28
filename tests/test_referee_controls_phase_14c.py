@@ -1,4 +1,4 @@
-"""Phase 14.C: referee-window transport rebuild + scrubber + play badge.
+"""Phase 14.C: referee-window transport rebuild + play badge.
 
 Covers the widget-level contract for the rebuilt
 `RefereeControlsWidget`:
@@ -6,10 +6,11 @@ Covers the widget-level contract for the rebuilt
 - Speed buttons (2x, 1/2x, 1/4x, 1/8x) emit distinct signals.
 - Rewind button label reflects `rewind_seconds`.
 - Pause label flips between Play and Pause based on `playback_rate`.
-- `ScrubberSlider` emits seek requests in session-time ns and clamps
-  to its configured range.
 - `RefereePlayBadge` shows "Play N/A" pre-game and "Play NN"
   otherwise; the challenge hook flips the stylesheet.
+
+Phase 14.F removed the `ScrubberSlider` (replaced by `JogWheel`) —
+slider tests moved to `test_jog_wheel.py`.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import QApplication
 
 from app.ui.referee_controls_widget import RefereeControlsWidget
 from app.ui.referee_play_badge import RefereePlayBadge
-from app.ui.scrubber_slider import ScrubberSlider
 
 
 class _QtTestCase(unittest.TestCase):
@@ -73,55 +73,6 @@ class RefereeControlsButtonSurfaceTests(_QtTestCase):
         # Slow motion is still "advancing", so Pause.
         controls.set_pause_label_for_rate(0.25)
         self.assertIn("Pause", controls.pause_button.text())
-
-
-class ScrubberSliderTests(_QtTestCase):
-    def test_disabled_when_no_replayable_range(self) -> None:
-        slider = ScrubberSlider()
-        slider.update_position(earliest_ns=None, latest_ns=None, current_ns=None)
-        self.assertFalse(slider.isEnabled())
-
-    def test_enabled_when_range_present(self) -> None:
-        slider = ScrubberSlider()
-        slider.update_position(
-            earliest_ns=0,
-            latest_ns=20_000_000_000,
-            current_ns=5_000_000_000,
-        )
-        self.assertTrue(slider.isEnabled())
-
-    def test_seek_emits_session_time_ns(self) -> None:
-        slider = ScrubberSlider()
-        slider.update_position(
-            earliest_ns=0,
-            latest_ns=20_000_000_000,
-            current_ns=0,
-        )
-        emitted: list[int] = []
-        slider.seek_to_session_time_requested.connect(emitted.append)
-        # Setting the value directly (not via drag) emits via the
-        # valueChanged → _on_value_changed path. Convert ns → steps.
-        target_ns = 7_500_000_000
-        slider.setValue(slider._ns_to_step(target_ns))
-        self.assertEqual(len(emitted), 1)
-        # Step-quantization to 10 ms; allow a tolerance.
-        self.assertAlmostEqual(emitted[0], target_ns, delta=10_000_000)
-
-    def test_position_tracks_current_ns_when_not_dragging(self) -> None:
-        slider = ScrubberSlider()
-        slider.update_position(
-            earliest_ns=0,
-            latest_ns=20_000_000_000,
-            current_ns=4_000_000_000,
-        )
-        first = slider.value()
-        slider.update_position(
-            earliest_ns=0,
-            latest_ns=20_000_000_000,
-            current_ns=12_000_000_000,
-        )
-        second = slider.value()
-        self.assertGreater(second, first)
 
 
 class RefereePlayBadgeTests(_QtTestCase):

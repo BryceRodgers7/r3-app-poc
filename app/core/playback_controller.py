@@ -278,7 +278,11 @@ class PlaybackController:
     def seek_to_session_time(self, target_session_time_ns: int) -> None:
         """Phase 14.C: seek the replay clock to an absolute session-time.
 
-        Drives the referee window's scrubber slider. Clamps the target
+        Phase 14.F: no longer driven by any UI surface (the Phase 14.C
+        scrubber slider was removed; the new jog wheel uses `step_frames`
+        instead). The primitive lives on because Phase 14.D's challenge-
+        lockout tests cover its clip-bounds clamping, and a future
+        absolute-time seek API can route through here. Clamps the target
         against the replayable range (same rule as
         `_resolve_rewind_target_locked`), bounces through SEEKING and
         lands in PAUSED. The operator can then press Play to resume.
@@ -690,20 +694,23 @@ class PlaybackController:
             return self._latest_live_frame
 
     def available_session_time_range(self) -> tuple[int | None, int | None]:
-        """Phase 14.C: pass through the replay store's available range.
+        """Pass through the replay store's available range.
 
-        The referee window's scrubber slider needs both endpoints to
-        size its track; exposing this here avoids MainWindow having to
-        reach through `controller._replay_store`.
+        Originally added for the Phase 14.C scrubber slider; the slider
+        is gone (Phase 14.F) but the accessor is still useful for any
+        caller that needs the replayable bounds without reaching
+        through `controller._replay_store`.
         """
         return self._replay_store.available_session_time_range()
 
     def get_playback_session_time_ns(self) -> int | None:
-        """Phase 14.C: current replay clock position in session-time.
+        """Current replay clock position in session-time.
 
         None when on the live edge (`_playback_session_time_ns` is None
-        outside REPLAY/PAUSED). MainWindow uses this to drive the
-        scrubber handle.
+        outside REPLAY/PAUSED). Originally added for the Phase 14.C
+        scrubber handle; the slider is gone (Phase 14.F) but the
+        accessor stays as a read-only window into the replay clock for
+        tests and any future caller.
         """
         with self._lock:
             return self._playback_session_time_ns

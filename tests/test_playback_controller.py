@@ -370,8 +370,9 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertEqual(self.controller._playback_rate, 0.125)
 
     def test_seek_to_session_time_lands_paused_inside_range(self) -> None:
-        """Phase 14.C: scrubber drives `seek_to_session_time`. Lands
-        in PAUSED at the requested session-time and renders the frame."""
+        """Phase 14.C primitive (no UI driver after 14.F removed the
+        scrubber): `seek_to_session_time` lands in PAUSED at the
+        requested session-time and renders the frame."""
         self._force_recording_state()
         self.controller.seek_to_session_time(7_500_000_000)
         self.assertEqual(self.controller._playback_session_time_ns, 7_500_000_000)

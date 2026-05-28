@@ -97,23 +97,37 @@ class RefereeControlsWidget(QWidget):
         self.step_back_button.clicked.connect(self.step_back_requested.emit)
         self.step_forward_button.clicked.connect(self.step_forward_requested.emit)
 
-        # Phase 12.B: frame-step buttons are gated on recording state
-        # because replay isn't available outside RECORDING (§10.4 /
-        # §15.2). The continuous transport controls (Pause, Rewind,
-        # speeds) stay enabled — they surface a status message if the
-        # operator presses them while replay is unavailable.
-        self.step_back_button.setEnabled(False)
-        self.step_forward_button.setEnabled(False)
+        # Phase 14.F: the entire transport is gated on
+        # `challenge_state_changed` (driven by ApplicationCoordinator).
+        # All buttons start disabled — no challenge is active at startup.
+        # `set_transport_enabled(True)` is called when a challenge begins;
+        # `set_transport_enabled(False)` is called when it ends.
+        # This subsumes the Phase 12.B recording-state gate (challenge
+        # implies recording).
+        self._set_all_enabled(False)
 
-    def set_recording_state(self, is_recording: bool) -> None:
-        """Enable/disable the replay-only buttons to track recording.
+    def _set_all_enabled(self, enabled: bool) -> None:
+        for button in (
+            self.pause_button,
+            self.speed_2x_button,
+            self.half_speed_button,
+            self.quarter_speed_button,
+            self.eighth_speed_button,
+            self.rewind_button,
+            self.step_back_button,
+            self.step_forward_button,
+        ):
+            button.setEnabled(enabled)
 
-        Step buttons require finalized segments (which only exist while
-        recording). Pause / Rewind / speeds stay enabled and surface a
-        status if pressed pre-recording.
+    def set_transport_enabled(self, active: bool) -> None:
+        """Phase 14.F: gate every transport button on challenge state.
+
+        Wired to `ApplicationCoordinator.challenge_state_changed` in
+        MainWindow. Owning every button's enable in one method (rather
+        than spreading the concern across multiple setters) avoids the
+        flicker race documented in the Phase 14.B field-test notes (3).
         """
-        self.step_back_button.setEnabled(is_recording)
-        self.step_forward_button.setEnabled(is_recording)
+        self._set_all_enabled(active)
 
     def set_pause_label_for_rate(self, playback_rate: float) -> None:
         """Flip Pause/Play label by playback rate.

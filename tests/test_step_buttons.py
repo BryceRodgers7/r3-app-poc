@@ -25,22 +25,22 @@ class StepButtonStateTests(unittest.TestCase):
         self.assertFalse(controls.step_back_button.isEnabled())
         self.assertFalse(controls.step_forward_button.isEnabled())
 
-    def test_set_recording_state_true_enables_buttons(self) -> None:
+    def test_set_transport_enabled_true_enables_buttons(self) -> None:
         controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
+        controls.set_transport_enabled(True)
         self.assertTrue(controls.step_back_button.isEnabled())
         self.assertTrue(controls.step_forward_button.isEnabled())
 
-    def test_set_recording_state_false_disables_buttons(self) -> None:
+    def test_set_transport_enabled_false_disables_buttons(self) -> None:
         controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
-        controls.set_recording_state(False)
+        controls.set_transport_enabled(True)
+        controls.set_transport_enabled(False)
         self.assertFalse(controls.step_back_button.isEnabled())
         self.assertFalse(controls.step_forward_button.isEnabled())
 
     def test_step_back_click_emits_step_back_signal(self) -> None:
         controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
+        controls.set_transport_enabled(True)
         emissions: list[None] = []
         controls.step_back_requested.connect(lambda: emissions.append(None))
         controls.step_back_button.clicked.emit()
@@ -48,7 +48,7 @@ class StepButtonStateTests(unittest.TestCase):
 
     def test_step_forward_click_emits_step_forward_signal(self) -> None:
         controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
+        controls.set_transport_enabled(True)
         emissions: list[None] = []
         controls.step_forward_requested.connect(lambda: emissions.append(None))
         controls.step_forward_button.clicked.emit()
@@ -58,7 +58,7 @@ class StepButtonStateTests(unittest.TestCase):
         # Locks in that one button's click doesn't accidentally fire
         # both signals — would mask an off-by-one wiring bug.
         controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
+        controls.set_transport_enabled(True)
         back_emissions: list[None] = []
         forward_emissions: list[None] = []
         controls.step_back_requested.connect(lambda: back_emissions.append(None))

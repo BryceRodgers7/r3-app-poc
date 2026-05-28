@@ -75,28 +75,10 @@ class RefereeControlsWidgetContractTests(_QtTestCase):
         self.assertFalse(hasattr(controls, "long_recording_toggle_requested"))
         self.assertFalse(hasattr(controls, "next_play_requested"))
 
-    def test_step_buttons_disabled_until_recording(self) -> None:
-        # Phase 14.C: only Step ◀/▶ are gated. Pause / Rewind / speed
-        # buttons stay enabled and surface a status when pressed
-        # pre-recording — same idea as 13.A but the gated set is
-        # smaller now that Replay Play is gone.
-        controls = RefereeControlsWidget(button_height=72)
-        self.assertFalse(controls.step_back_button.isEnabled())
-        self.assertFalse(controls.step_forward_button.isEnabled())
-
-    def test_set_recording_state_toggles_step_buttons(self) -> None:
-        controls = RefereeControlsWidget(button_height=72)
-        controls.set_recording_state(True)
-        self.assertTrue(controls.step_back_button.isEnabled())
-        self.assertTrue(controls.step_forward_button.isEnabled())
-        controls.set_recording_state(False)
-        self.assertFalse(controls.step_back_button.isEnabled())
-        self.assertFalse(controls.step_forward_button.isEnabled())
-
-    def test_continuous_transport_buttons_always_enabled(self) -> None:
-        # Pause / Rewind / speeds aren't gated — they surface a status
-        # message if pressed when replay is unavailable but the
-        # buttons themselves are always clickable.
+    def test_all_transport_buttons_disabled_at_construction(self) -> None:
+        # Phase 14.F: every referee transport control starts disabled.
+        # `set_transport_enabled(True)` is called on `challenge_state_changed`;
+        # outside an active challenge, no button is interactive.
         controls = RefereeControlsWidget(button_height=72)
         for button in (
             controls.pause_button,
@@ -105,8 +87,37 @@ class RefereeControlsWidgetContractTests(_QtTestCase):
             controls.half_speed_button,
             controls.quarter_speed_button,
             controls.eighth_speed_button,
+            controls.step_back_button,
+            controls.step_forward_button,
+        ):
+            self.assertFalse(button.isEnabled())
+
+    def test_set_transport_enabled_toggles_every_button(self) -> None:
+        controls = RefereeControlsWidget(button_height=72)
+        controls.set_transport_enabled(True)
+        for button in (
+            controls.pause_button,
+            controls.rewind_button,
+            controls.speed_2x_button,
+            controls.half_speed_button,
+            controls.quarter_speed_button,
+            controls.eighth_speed_button,
+            controls.step_back_button,
+            controls.step_forward_button,
         ):
             self.assertTrue(button.isEnabled())
+        controls.set_transport_enabled(False)
+        for button in (
+            controls.pause_button,
+            controls.rewind_button,
+            controls.speed_2x_button,
+            controls.half_speed_button,
+            controls.quarter_speed_button,
+            controls.eighth_speed_button,
+            controls.step_back_button,
+            controls.step_forward_button,
+        ):
+            self.assertFalse(button.isEnabled())
 
 
 class OperatorControlsWidgetContractTests(_QtTestCase):

@@ -30,12 +30,12 @@ from app.media.output_renderer import MultiFeedOutputRenderer
 from app.ui.alert_banner import AlertBanner
 from app.ui.camera_visibility_ribbon import CameraVisibilityRibbon
 from app.ui.diagnostics_widget import DiagnosticsWidget
+from app.ui.jog_wheel import JogWheel
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
 from app.ui.operator_status_overlay import OperatorStatusOverlay
 from app.ui.referee_controls_widget import RefereeControlsWidget
 from app.ui.referee_play_badge import RefereePlayBadge
-from app.ui.scrubber_slider import ScrubberSlider
 from app.ui.status_bar_widget import StatusBarWidget
 
 _VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
@@ -49,9 +49,9 @@ class MainWindow(QMainWindow):
 
     - `"referee"` — `RefereeControlsWidget` with the replay/review
       transport (Phase 14.C: Play/Pause, 2x, 1/2x, 1/4x, 1/8x,
-      Rewind Ns, Step ◀/▶ + a scrubber slider and play-number badge).
-      Default to keep older test callers that don't pass the kwarg
-      working as before.
+      Rewind Ns, Step ◀/▶, plus a jog wheel + play-number badge per
+      Phase 14.F). Default to keep older test callers that don't pass
+      the kwarg working as before.
     - `"operator"` — `OperatorControlsWidget` with the recording
       transport (Start/Stop game, Next Play). Combined with
       `live_only_window=True` it's the persistent operator's pane.
@@ -143,16 +143,17 @@ class MainWindow(QMainWindow):
             if controls_role == "operator"
             else None
         )
-        # Phase 14.B/14.C: per-window chrome. Both windows get their
-        # own CameraVisibilityRibbon — per-spec, hiding a feed on one
-        # window does NOT hide it on the other. The operator window
+        # Phase 14.B/14.C/14.F: per-window chrome. Both windows get
+        # their own CameraVisibilityRibbon — per-spec, hiding a feed on
+        # one window does NOT hide it on the other. The operator window
         # adds a Post-process & Exit link + a free-floating Play/Clip
-        # counter overlay; the referee window adds a scrubber slider
-        # and a play-number badge.
+        # counter overlay; the referee window adds a jog wheel
+        # (Phase 14.F, replaces the Phase 14.C slider) and a
+        # play-number badge.
         self.camera_ribbon: CameraVisibilityRibbon | None = None
         self.post_process_link: QLabel | None = None
         self.operator_status_overlay: OperatorStatusOverlay | None = None
-        self.scrubber: ScrubberSlider | None = None
+        self.jog_wheel: JogWheel | None = None
         self.referee_play_badge: RefereePlayBadge | None = None
         if controls_role == "operator":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
@@ -164,7 +165,7 @@ class MainWindow(QMainWindow):
             self.operator_status_overlay = OperatorStatusOverlay(self.video_panel)
         elif controls_role == "referee":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
-            self.scrubber = ScrubberSlider(self)
+            self.jog_wheel = JogWheel(self)
             # Parented to the video panel for the same panel-local
             # coordinate reason as `operator_status_overlay`.
             self.referee_play_badge = RefereePlayBadge(self.video_panel)
@@ -243,18 +244,23 @@ class MainWindow(QMainWindow):
                 bottom_row.addWidget(self.post_process_link)
             layout.addLayout(bottom_row)
         else:
-            # Phase 14.C referee layout:
+            # Phase 14.C / 14.F referee layout:
             #   [ video panel                                   ]
-            #   [ scrubber slider                               ]
-            #   [ RefereeControlsWidget transport row           ]
+            #   [ RefereeControlsWidget transport row | JogWheel ]
             #   [ CameraVisibilityRibbon                        ]
             # RefereePlayBadge floats bottom-left of the video panel
-            # (positioned by `resizeEvent`).
+            # (positioned by `resizeEvent`). The jog wheel sits beside
+            # the transport buttons because both controls are part of
+            # the same gated transport surface (Phase 14.F).
             layout.addWidget(self.video_panel, stretch=1)
-            if self.scrubber is not None:
-                layout.addWidget(self.scrubber)
+            transport_row = QHBoxLayout()
+            transport_row.setContentsMargins(0, 0, 0, 0)
+            transport_row.setSpacing(16)
             if self.referee_controls is not None:
-                layout.addWidget(self.referee_controls)
+                transport_row.addWidget(self.referee_controls, stretch=1)
+            if self.jog_wheel is not None:
+                transport_row.addWidget(self.jog_wheel)
+            layout.addLayout(transport_row)
             if self.camera_ribbon is not None:
                 layout.addWidget(self.camera_ribbon)
         if self.status_widget is not None:
@@ -301,22 +307,31 @@ class MainWindow(QMainWindow):
                     +self._settings.replay_frame_step_count
                 )
             )
-        if self.scrubber is not None:
-            self.scrubber.seek_to_session_time_requested.connect(
-                self._controller.seek_to_session_time
+        if self.jog_wheel is not None:
+            # Phase 14.F: each degree of rotation seeks by `frames_per_degree`
+            # frames (default 1). step_frames already clamps to clip-bounds
+            # (Phase 14.D) and to the available replay range, so the wheel
+            # is a pure seek source — no clamping logic at the widget.
+            self.jog_wheel.seek_by_frames_requested.connect(
+                self._controller.step_frames
             )
         # Phase 14.D: flip the referee play badge red while a
         # challenge lockout is active. The coordinator owns the
         # state (one challenge across both windows), so the signal
         # lives on the coordinator's bus, not on the per-controller
         # AppSignals.
-        if (
-            self.referee_play_badge is not None
-            and self._application_coordinator is not None
-        ):
-            self._application_coordinator.signals.challenge_state_changed.connect(
-                self.referee_play_badge.set_challenge_active
-            )
+        # Phase 14.F: the same signal gates the referee transport
+        # (every transport button + the jog wheel) — disabled outside
+        # a challenge, enabled while one is active.
+        if self._application_coordinator is not None:
+            if self.referee_play_badge is not None:
+                self._application_coordinator.signals.challenge_state_changed.connect(
+                    self.referee_play_badge.set_challenge_active
+                )
+            if self._controls_role == "referee":
+                self._application_coordinator.signals.challenge_state_changed.connect(
+                    self._set_referee_transport_enabled
+                )
         if self.operator_controls is not None and self._application_coordinator is not None:
             self.operator_controls.long_recording_toggle_requested.connect(
                 self._application_coordinator.toggle_long_session_recording
@@ -354,12 +369,12 @@ class MainWindow(QMainWindow):
                     self._application_coordinator._recording_manager.recording_state.state.value,
                 )
         # Phase 13.B: each widget self-handles its recording-state
-        # gating. RefereeControlsWidget toggles replay-related buttons
-        # (Step ◀/▶) since replay isn't available outside RECORDING.
-        # OperatorControlsWidget toggles Next Play and flips the
-        # Start/Stop button label.
+        # gating. OperatorControlsWidget toggles Next Play and flips the
+        # Start/Stop button label. The referee transport is gated by
+        # Phase 14.F's challenge-state hook (`_set_referee_transport_enabled`),
+        # not by recording state — challenge implies recording, so the
+        # narrower gate is enough.
         if self.referee_controls is not None:
-            self.referee_controls.set_recording_state(state.is_recording)
             self.referee_controls.set_pause_label_for_rate(
                 state.playback_overlay.playback_rate
             )
@@ -385,13 +400,6 @@ class MainWindow(QMainWindow):
                 clip_type=state.current_clip_type,
                 clip_number=state.current_clip_number,
                 play_number=state.current_play_number,
-            )
-        if self.scrubber is not None:
-            earliest, latest = self._controller.available_session_time_range()
-            self.scrubber.update_position(
-                earliest_ns=earliest,
-                latest_ns=latest,
-                current_ns=self._controller.get_playback_session_time_ns(),
             )
         if self.referee_play_badge is not None:
             self.referee_play_badge.set_play_state(
@@ -426,6 +434,22 @@ class MainWindow(QMainWindow):
         """Release widget bindings when the window closes."""
         self._output_renderer.detach_all()
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Phase 14.F helpers
+    # ------------------------------------------------------------------
+
+    def _set_referee_transport_enabled(self, active: bool) -> None:
+        """Gate every referee-window transport control on challenge state.
+
+        Wired to `ApplicationCoordinator.signals.challenge_state_changed`
+        for `controls_role == "referee"` windows only. The operator window
+        has no referee transport, so the signal is a no-op there.
+        """
+        if self.referee_controls is not None:
+            self.referee_controls.set_transport_enabled(active)
+        if self.jog_wheel is not None:
+            self.jog_wheel.set_wheel_enabled(active)
 
     # ------------------------------------------------------------------
     # Phase 14.B helpers
