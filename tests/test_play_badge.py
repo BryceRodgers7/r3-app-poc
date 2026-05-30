@@ -1,4 +1,10 @@
-"""Phase 7.H.3: `Play #N` badge in the playback overlay + status bar."""
+"""Phase 7.H.3: `Play #N` propagation into UiState + status bar.
+
+The on-video playback overlay that once rendered this badge was
+removed (no chrome overlays the video feed); the play number still
+flows onto `UiState`/`PlaybackOverlayInfo` and into the diagnostic
+status bar, which is what these tests cover.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +12,9 @@ import unittest
 from unittest import mock
 
 from app.core.app_state import UiState
-from app.core.models import PlaybackMode, PlaybackOverlayInfo
+from app.core.models import PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.core.recording_state import RecordingState
-from app.media.frame_overlay import build_playback_overlay_lines
 from app.ui.status_bar_widget import _format_play_badge
 
 
@@ -66,57 +71,6 @@ class ControllerPropagatesPlayNumberTests(unittest.TestCase):
         pc._update_state_timestamps_locked()
         self.assertIsNone(pc._state.current_play_number)
         self.assertIsNone(pc._state.playback_overlay.current_play_number)
-
-
-class OverlayLinesPlayBadgeTests(unittest.TestCase):
-    """The `Play #N` line appears just under the mode badge — between
-    `LIVE`/`REPLAY`/`PAUSED` and the timestamps — when present."""
-
-    def test_play_line_present_when_play_number_set(self) -> None:
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.LIVE,
-            wall_clock_timestamp=1234567890.0,
-            is_recording=True,
-            current_play_number=2,
-        )
-        lines = build_playback_overlay_lines(overlay)
-        self.assertEqual(lines[0], "LIVE")
-        self.assertEqual(lines[1], "Play #2")
-
-    def test_play_line_absent_when_play_number_none(self) -> None:
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.LIVE,
-            wall_clock_timestamp=1234567890.0,
-            is_recording=True,
-            current_play_number=None,
-        )
-        lines = build_playback_overlay_lines(overlay)
-        # Mode is first; no Play line should appear.
-        self.assertEqual(lines[0], "LIVE")
-        self.assertFalse(any(line.startswith("Play #") for line in lines))
-
-    def test_play_line_skipped_when_overlay_hidden(self) -> None:
-        # Outside recording the whole overlay is hidden; play badge
-        # should not appear in any form.
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.LIVE,
-            wall_clock_timestamp=1234567890.0,
-            is_recording=False,
-            current_play_number=2,
-        )
-        self.assertEqual(build_playback_overlay_lines(overlay), [])
-
-    def test_play_line_appears_in_replay_too(self) -> None:
-        # Mode = REPLAY shouldn't suppress the badge.
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.REPLAY,
-            wall_clock_timestamp=1234567890.0,
-            is_recording=True,
-            current_play_number=4,
-            seconds_behind_live=5.0,
-        )
-        lines = build_playback_overlay_lines(overlay)
-        self.assertIn("Play #4", lines)
 
 
 class StatusBarPlayRowTests(unittest.TestCase):

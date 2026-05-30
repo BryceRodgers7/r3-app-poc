@@ -77,6 +77,9 @@ class PlaybackController:
         clip_manager: "ClipManager | None" = None,
         frame_period_ns: int = _DEFAULT_FRAME_PERIOD_NS,
         rewind_seconds: int = _DEFAULT_REWIND_SECONDS,
+        jog_wheel_resume_after_release: bool = True,
+        step_button_resume_after_click: bool = False,
+        hold_paused_at_clip_start: bool = True,
     ) -> None:
         if not feed_runtimes:
             raise ValueError("PlaybackController requires at least one FeedRuntime.")
@@ -111,6 +114,19 @@ class PlaybackController:
         # (see `application_coordinator`). Tests / older callers fall
         # back to the module default.
         self._rewind_ns = max(1, int(rewind_seconds)) * 1_000_000_000
+        # Auto-pause behavior for the referee jog wheel and step
+        # buttons (see `begin_jog`/`end_jog`/`step_frames_button`).
+        # `step_frames` always lands PAUSED; these flags decide whether
+        # the gesture *resumes* afterward and whether a clip-start
+        # landing overrides that resume.
+        self._jog_resume_after_release = bool(jog_wheel_resume_after_release)
+        self._step_resume_after_click = bool(step_button_resume_after_click)
+        self._hold_paused_at_clip_start = bool(hold_paused_at_clip_start)
+        # Set between `begin_jog` and `end_jog`: the playback rate at
+        # the moment the jog gesture started, restored on release when
+        # auto-resume is enabled. None outside an active jog gesture.
+        self._pre_jog_rate: float | None = None
+        self._jog_active = False
         # Phase 14.D: challenge-lockout fence. When set, all replay
         # primitives clamp their target session-time to this range
         # and force PAUSED on out-of-bounds. `end` may be None when
@@ -638,6 +654,103 @@ class PlaybackController:
         else:
             sign = "+" if frame_delta > 0 else "-"
             self._emit_state(f"Step {sign}{abs(frame_delta)} frames")
+
+    # ------------------------------------------------------------------
+    # Jog-wheel gesture lifecycle + auto-resume policy
+    # ------------------------------------------------------------------
+
+    def begin_jog(self) -> None:
+        """Mark the start of a jog-wheel gesture.
+
+        Captures the playback rate at the instant the referee touches
+        the wheel — before the per-degree `step_frames` calls force the
+        clock to PAUSED — so `end_jog` can restore it. Idempotent for
+        the duration of a gesture: the widget only fires this once per
+        engagement (a re-grab mid-coast does not re-capture), so a
+        gesture that started from REPLAY 0.5× resumes at 0.5×, not 0.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if self._live_only or not self._replay_actions_allowed():
+            return
+        with self._lock:
+            self._jog_active = True
+            self._pre_jog_rate = self._playback_rate
+
+    def end_jog(self) -> None:
+        """Jog-wheel gesture fully settled (released + inertia stopped).
+
+        Resumes at the pre-jog rate when `jog_wheel_resume_after_release`
+        is on, unless `hold_paused_at_clip_start` applies. A no-op when
+        no gesture is active (e.g. the wheel was disabled mid-gesture by
+        a challenge ending)."""
+        if getattr(self, "_shutting_down", False):
+            return
+        with self._lock:
+            if not self._jog_active:
+                return
+            self._jog_active = False
+            pre_rate = self._pre_jog_rate
+            self._pre_jog_rate = None
+        if pre_rate is None:
+            return
+        self._resume_or_hold(pre_rate, self._jog_resume_after_release)
+
+    def step_frames_button(self, frame_delta: int) -> None:
+        """Step-button entry point: jog one step, then apply the
+        step-button resume policy.
+
+        Mirrors the jog-wheel gesture collapsed into a single click —
+        capture the pre-click rate, step (which lands PAUSED), then
+        resume only if `step_button_resume_after_click` is on and the
+        clip-start hold doesn't override it. The default leaves the
+        clock paused, matching the historical Step behavior.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        with self._lock:
+            pre_rate = self._playback_rate
+        self.step_frames(frame_delta)
+        self._resume_or_hold(pre_rate, self._step_resume_after_click)
+
+    def _resume_or_hold(self, pre_rate: float, resume_enabled: bool) -> None:
+        """Resume at `pre_rate` after a jog/step, or stay paused.
+
+        Stays paused unless we actually landed in PAUSED (so a rejected
+        or degraded step never spuriously starts playback), resume is
+        enabled, the prior rate was an advancing one, and the
+        clip-start hold doesn't apply.
+        """
+        with self._lock:
+            in_paused = (
+                self.replay_state is not None
+                and self.replay_state.state == ReplayState.PAUSED
+            )
+            hold = (
+                self._hold_paused_at_clip_start
+                and self._is_at_clip_start_locked()
+            )
+        if not in_paused:
+            return
+        if hold or not resume_enabled or pre_rate <= 0.0:
+            return
+        self.set_playback_rate(pre_rate)
+
+    def _is_at_clip_start_locked(self) -> bool:
+        """True when the playhead sits at the start of the clip.
+
+        "Start of the clip" is the active challenge fence's lower edge
+        when a fence is installed, else the earliest replayable
+        session-time. `step_frames` clamps the playhead to that lower
+        bound, so equality (`<=`) means we're parked at the start.
+        """
+        pos = self._playback_session_time_ns
+        if pos is None:
+            return False
+        if self._clip_bounds is not None:
+            return pos <= self._clip_bounds[0]
+        earliest, _ = self._replay_store.available_session_time_range()
+        return earliest is not None and pos <= earliest
 
     def set_source_lost(self, message: str = "Source signal lost.") -> None:
         """Reflect that the live source is no longer available."""

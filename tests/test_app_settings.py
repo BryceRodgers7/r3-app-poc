@@ -527,5 +527,46 @@ frame_step_count = 2.5
         self.assertEqual(settings.replay_frame_step_count, 1)
 
 
+class ReplayAutoPauseFlagTests(unittest.TestCase):
+    """Jog-wheel / step-button auto-pause `[replay]` flags."""
+
+    def test_defaults(self) -> None:
+        settings = AppSettings()
+        self.assertTrue(settings.replay_jog_wheel_resume_after_release)
+        self.assertFalse(settings.replay_step_button_resume_after_click)
+        self.assertTrue(settings.replay_hold_paused_at_clip_start)
+
+    def test_load_reads_flags(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+jog_wheel_resume_after_release = false
+step_button_resume_after_click = true
+hold_paused_at_clip_start = false
+""".strip(),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertFalse(settings.replay_jog_wheel_resume_after_release)
+        self.assertTrue(settings.replay_step_button_resume_after_click)
+        self.assertFalse(settings.replay_hold_paused_at_clip_start)
+
+    def test_load_rejects_non_bool_flag(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                """
+[replay]
+jog_wheel_resume_after_release = "yes"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                AppSettings.load(config_path)
+        self.assertIn("jog_wheel_resume_after_release", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

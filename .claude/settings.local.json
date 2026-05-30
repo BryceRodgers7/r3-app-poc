@@ -165,7 +165,19 @@
       "Bash(C:/msys64/ucrt64/bin/ffprobe.exe -v error -select_streams v -show_entries packet=pts_time -of csv=p=0 C:/SportsReplay/sessions/session_178/recording/game_002/ndi_1/segment_00000.mkv)",
       "Bash(C:/msys64/ucrt64/bin/ffprobe.exe -v error -select_streams a -show_entries packet=pts_time -of csv=p=0 C:/SportsReplay/sessions/session_177/recording/game_002/ndi_1/segment_00000.mkv)",
       "Bash(grep -A 20 \"dependencies\\\\|optional-dependencies\\\\|\\\\\\\\[media\\\\\\\\]\\\\|PySide6\" pyproject.toml)",
-      "Bash(git mv *)"
+      "Bash(git mv *)",
+      "Bash(.venv/Scripts/python.exe -m unittest tests.test_jog_wheel)",
+      "Bash(.venv/bin/python -m unittest tests.test_jog_wheel)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -m unittest tests.test_jog_wheel tests.test_native_preview tests.test_referee_controls_phase_14c tests.test_play_badge tests.test_playback_overlay_visibility)",
+      "Bash(.venv/bin/python -m unittest discover -s tests)",
+      "Bash(.venv/bin/python -m unittest tests.test_session_recovery.FindDirtySessionsTests.test_returns_only_dirty_sessions tests.test_telemetry.TelemetryHubDiskTests.test_disk_log_emits_after_set_path)",
+      "Bash(.venv/bin/python -m unittest tests.test_jog_wheel tests.test_playback_controller tests.test_referee_controls_phase_14f tests.test_challenge_lockout_phase_14d)",
+      "Bash(.venv/bin/python -m unittest discover -s tests -p \"test_settings*.py\" -p \"test_config*.py\")",
+      "Bash(.venv/bin/python -m unittest discover -s tests -p \"test_challenge_lockout_phase_14d.py\")",
+      "Bash(.venv/bin/python -m unittest tests.test_app_settings tests.test_recording_settings)",
+      "Bash(.venv/bin/python -m unittest discover -s tests -p \"test_jog_wheel.py\" -p \"test_app_settings.py\")",
+      "Bash(.venv/bin/python -m unittest discover -s tests -p \"test_playback_controller.py\")"
     ]
   }
 }

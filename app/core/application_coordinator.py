@@ -158,6 +158,15 @@ class ApplicationCoordinator:
             clip_manager=self.clip_manager,
             frame_period_ns=frame_period_ns,
             rewind_seconds=int(settings.replay_rewind_seconds),
+            jog_wheel_resume_after_release=bool(
+                settings.replay_jog_wheel_resume_after_release
+            ),
+            step_button_resume_after_click=bool(
+                settings.replay_step_button_resume_after_click
+            ),
+            hold_paused_at_clip_start=bool(
+                settings.replay_hold_paused_at_clip_start
+            ),
         )
         self.operator_controller = PlaybackController(
             feed_runtimes=enabled_runtimes,

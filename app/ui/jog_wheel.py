@@ -28,8 +28,8 @@ from __future__ import annotations
 import math
 import time
 
-from PySide6.QtCore import QPoint, QPointF, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen
+from PySide6.QtCore import QPoint, QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import QWidget
 
 
@@ -54,9 +54,18 @@ class JogWheel(QWidget):
     """Circular jog wheel: rotate to seek by integer frames.
 
     1° of rotation = 1 frame. Positive (counter-clockwise) = forward.
+
+    Gesture lifecycle: `jog_engaged` fires once when the referee
+    touches the wheel, `jog_released` fires once when the wheel fully
+    settles (mouse release plus any inertia coast). The controller uses
+    them to capture the pre-jog playback rate and to decide whether to
+    resume on release. A re-grab while coasting continues the same
+    gesture — it does not re-fire `jog_engaged`.
     """
 
     seek_by_frames_requested = Signal(int)
+    jog_engaged = Signal()
+    jog_released = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -70,6 +79,12 @@ class JogWheel(QWidget):
         self._drag_last_angle: float | None = None
         self._drag_last_delta_radians: float = 0.0
         self._drag_last_time_ns: int = 0
+
+        # Gesture state: True from the touch that begins a drag until
+        # the wheel fully settles (release + coast). Spans coasting and
+        # mid-coast re-grabs so `jog_engaged`/`jog_released` each fire
+        # exactly once per gesture.
+        self._gesture_engaged: bool = False
 
         # Coast (inertia) state.
         self._coast_velocity_rad_s: float = 0.0
@@ -106,6 +121,9 @@ class JogWheel(QWidget):
             self._dragging = False
             self._drag_last_angle = None
             self._frame_carry_degrees = 0.0
+            # Cancel any in-flight gesture without emitting jog_released:
+            # a challenge ending shouldn't trigger an auto-resume.
+            self._gesture_engaged = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -145,6 +163,10 @@ class JogWheel(QWidget):
         self._drag_last_angle = angle
         self._drag_last_delta_radians = 0.0
         self._drag_last_time_ns = time.monotonic_ns()
+        # First touch of a gesture (not a re-grab mid-coast) → engage.
+        if not self._gesture_engaged:
+            self._gesture_engaged = True
+            self.jog_engaged.emit()
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -181,6 +203,9 @@ class JogWheel(QWidget):
         if abs(velocity) > _COAST_STOP_THRESHOLD_RAD_S and self._wheel_enabled:
             self._coast_velocity_rad_s = velocity
             self._coast_timer.start()
+        else:
+            # No coast — the gesture settles immediately on release.
+            self._finish_gesture()
         event.accept()
 
     # ------------------------------------------------------------------
@@ -206,11 +231,19 @@ class JogWheel(QWidget):
         self._coast_velocity_rad_s *= _COAST_DECAY_PER_TICK
         if abs(self._coast_velocity_rad_s) < _COAST_STOP_THRESHOLD_RAD_S:
             self._stop_coast()
+            # Inertia has carried the wheel to a stop — gesture settles.
+            self._finish_gesture()
 
     def _stop_coast(self) -> None:
         if self._coast_timer.isActive():
             self._coast_timer.stop()
         self._coast_velocity_rad_s = 0.0
+
+    def _finish_gesture(self) -> None:
+        """Emit `jog_released` once when the wheel settles after a touch."""
+        if self._gesture_engaged:
+            self._gesture_engaged = False
+            self.jog_released.emit()
 
     # ------------------------------------------------------------------
     # Painting
@@ -254,3 +287,74 @@ class JogWheel(QWidget):
         x_outer = cx + math.cos(theta) * inner_r
         y_outer = cy - math.sin(theta) * inner_r
         painter.drawLine(int(x_inner), int(y_inner), int(x_outer), int(y_outer))
+
+        # Direction guide: counter-clockwise = forward (FF), clockwise =
+        # rewind (REW), matching `_angle_from_pos` (atan2 increases CCW)
+        # and `_apply_rotation` (positive degrees emit a forward seek).
+        # The two curved arrows hug the rim just inside the ticks; the
+        # arrowhead points the way that direction turns. Drawn last so
+        # they sit on top of the face, and greyed with the rest of the
+        # wheel when disabled.
+        guide_color = tick_color if self._wheel_enabled else QColor("#3a4150")
+        arrow_r = inner_r - 4
+        # FF arc: upper-left, sweeping counter-clockwise.
+        self._draw_curved_arrow(painter, cx, cy, arrow_r, 100.0, 150.0, guide_color)
+        # REW arc: upper-right, sweeping clockwise.
+        self._draw_curved_arrow(painter, cx, cy, arrow_r, 80.0, 30.0, guide_color)
+
+        label_font = QFont(painter.font())
+        label_font.setPointSize(9)
+        label_font.setBold(True)
+        painter.setFont(label_font)
+        painter.setPen(QPen(guide_color))
+        half = self.width() / 2.0
+        painter.drawText(
+            QRectF(0.0, cy - 10.0, half, 20.0),
+            Qt.AlignmentFlag.AlignCenter,
+            "FF",
+        )
+        painter.drawText(
+            QRectF(half, cy - 10.0, half, 20.0),
+            Qt.AlignmentFlag.AlignCenter,
+            "REW",
+        )
+
+    def _draw_curved_arrow(
+        self,
+        painter: QPainter,
+        cx: float,
+        cy: float,
+        radius: float,
+        start_deg: float,
+        end_deg: float,
+        color: QColor,
+    ) -> None:
+        """Draw an arc from `start_deg` to `end_deg` with an arrowhead at
+        the end, using this file's angle convention (CCW positive, Y
+        flipped). The arrowhead points along the direction of travel."""
+        painter.setPen(QPen(color, 2))
+        steps = 16
+        prev: tuple[float, float] | None = None
+        for i in range(steps + 1):
+            t = math.radians(start_deg + (end_deg - start_deg) * i / steps)
+            px = cx + math.cos(t) * radius
+            py = cy - math.sin(t) * radius
+            if prev is not None:
+                painter.drawLine(int(prev[0]), int(prev[1]), int(px), int(py))
+            prev = (px, py)
+        # Arrowhead at the end. Tangent for increasing theta (CCW) is
+        # (-sin, -cos) in screen space; flip it when the arc sweeps CW.
+        end = math.radians(end_deg)
+        sign = 1.0 if end_deg >= start_deg else -1.0
+        ex = cx + math.cos(end) * radius
+        ey = cy - math.sin(end) * radius
+        tx = -math.sin(end) * sign
+        ty = -math.cos(end) * sign
+        barb = 7.0
+        for a in (math.radians(150.0), math.radians(-150.0)):
+            ca, sa = math.cos(a), math.sin(a)
+            bx = tx * ca - ty * sa
+            by = tx * sa + ty * ca
+            painter.drawLine(
+                int(ex), int(ey), int(ex + bx * barb), int(ey + by * barb)
+            )

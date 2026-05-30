@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import cv2
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QImage, QPixmap, QResizeEvent, QShowEvent
+from PySide6.QtGui import QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import QLabel, QStackedLayout, QVBoxLayout, QWidget
 
-from app.core.models import MediaFrame, PlaybackOverlayInfo
-from app.media.frame_overlay import build_playback_overlay_lines
+from app.core.models import MediaFrame
 
 
 class VideoWidget(QWidget):
-    """Displays the selected frame and a playback-state overlay."""
+    """Displays the selected live/replay frame.
+
+    Nothing is drawn on top of the video surface — the tile shows the
+    feed (or a full-surface placeholder when there's no video). All
+    status chrome (play/clip counters, transport state) lives outside
+    the video panel.
+    """
 
     video_surface_resized = Signal()
 
@@ -56,37 +61,6 @@ class VideoWidget(QWidget):
         self._surface_stack.addWidget(self._frame_label)
         self._surface_stack.setCurrentWidget(self._frame_label)
 
-        self._playback_overlay_label = QLabel(self._surface_stack_host)
-        self._playback_overlay_label.setObjectName("playbackOverlayLabel")
-        self._playback_overlay_label.setAlignment(
-            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
-        )
-        self._playback_overlay_label.setWordWrap(True)
-        self._playback_overlay_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._playback_overlay_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._playback_overlay_label.hide()
-
-        self._display_resolution_label = QLabel(self._surface_stack_host)
-        self._display_resolution_label.setObjectName("displayResolutionLabel")
-        self._display_resolution_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._display_resolution_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-
-        # Phase 6: degraded-replay indicator. Shown when this tile is
-        # currently rendering a clamped freeze frame instead of an
-        # exact-coverage frame (per §15.5 / §8.6.1) — typically because
-        # this feed joined later than the playback target, was
-        # disconnected at that point, or has reached the end of its
-        # coverage.
-        self._freeze_badge_label = QLabel("FROZEN", self._surface_stack_host)
-        self._freeze_badge_label.setObjectName("freezeBadgeLabel")
-        self._freeze_badge_label.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
-        )
-        self._freeze_badge_label.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True
-        )
-        self._freeze_badge_label.hide()
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(10)
@@ -111,78 +85,13 @@ class VideoWidget(QWidget):
                 font-size: 20px;
                 font-weight: 600;
             }
-            QLabel#playbackOverlayLabel {
-                background-color: rgba(24, 24, 24, 212);
-                border: 1px solid #505050;
-                border-radius: 10px;
-                color: #f3f3f3;
-                font-size: 15px;
-                font-weight: 600;
-                padding: 12px 14px;
-            }
-            QLabel#displayResolutionLabel {
-                background-color: rgba(24, 24, 24, 212);
-                border: 1px solid #505050;
-                border-radius: 8px;
-                color: #e8e8e8;
-                font-size: 13px;
-                font-weight: 500;
-                padding: 8px 10px;
-            }
-            QLabel#freezeBadgeLabel {
-                background-color: rgba(180, 90, 0, 220);
-                border: 1px solid #ffb060;
-                border-radius: 8px;
-                color: #fff8e0;
-                font-size: 13px;
-                font-weight: 700;
-                letter-spacing: 1px;
-                padding: 6px 10px;
-            }
             """
         )
-
-    def set_freeze_indicator(self, visible: bool) -> None:
-        """Show/hide the degraded-replay freeze badge (Phase 6).
-
-        The badge is a small "FROZEN" pill rendered in the top-right
-        corner of the tile, alongside the playback overlay. It tells
-        the operator that this tile is currently displaying a clamped
-        freeze frame rather than an exact-coverage match — useful when
-        a feed joined later than the rewind target or was disconnected
-        at that session time.
-        """
-        if visible:
-            self._freeze_badge_label.adjustSize()
-            self._layout_freeze_badge()
-            self._freeze_badge_label.show()
-            self._freeze_badge_label.raise_()
-        else:
-            self._freeze_badge_label.hide()
 
     def set_placeholder_text(self, text: str) -> None:
         """Update the placeholder message shown when no embedded video is active."""
         self._frame_label.setPixmap(QPixmap())
         self._frame_label.setText(text)
-        self._update_display_resolution_overlay()
-        self._stack_overlay_z_order()
-
-    def set_playback_overlay(self, overlay: PlaybackOverlayInfo) -> None:
-        """Render playback-state details over the video surface."""
-        lines = build_playback_overlay_lines(overlay)
-        if not lines:
-            self._playback_overlay_label.hide()
-            self._update_display_resolution_overlay()
-            self._stack_overlay_z_order()
-            return
-
-        self._playback_overlay_label.setText("\n".join(lines))
-        self._playback_overlay_label.setMaximumWidth(max(260, self._surface_stack_host.width() // 2))
-        self._playback_overlay_label.adjustSize()
-        self._update_display_resolution_overlay()
-        self._layout_playback_overlay()
-        self._playback_overlay_label.show()
-        self._stack_overlay_z_order()
 
     def get_video_surface_handle(self) -> int:
         """Return the native child-window handle used by embedded video output."""
@@ -224,9 +133,6 @@ class VideoWidget(QWidget):
             self._surface_stack.setCurrentWidget(self._live_surface)
         else:
             self._surface_stack.setCurrentWidget(self._frame_label)
-        self._update_display_resolution_overlay()
-        self._layout_playback_overlay()
-        self._stack_overlay_z_order()
         self.video_surface_resized.emit()
 
     def display_frame(self, frame: MediaFrame) -> None:
@@ -257,16 +163,8 @@ class VideoWidget(QWidget):
         """Keep the rendered frame scaled to the current widget size."""
         super().resizeEvent(event)
         self._refresh_pixmap()
-        self._layout_playback_overlay()
-        self._layout_freeze_badge()
-        self._stack_overlay_z_order()
         if self._showing_video_surface:
             self.video_surface_resized.emit()
-
-    def showEvent(self, event: QShowEvent) -> None:
-        super().showEvent(event)
-        self._update_display_resolution_overlay()
-        self._stack_overlay_z_order()
 
     def _scaled_display_pixmap(self) -> QPixmap | None:
         if self._current_image is None:
@@ -281,66 +179,7 @@ class VideoWidget(QWidget):
     def _refresh_pixmap(self) -> None:
         scaled_pixmap = self._scaled_display_pixmap()
         if scaled_pixmap is None:
-            self._update_display_resolution_overlay()
-            self._stack_overlay_z_order()
             return
 
         self._frame_label.setText("")
         self._frame_label.setPixmap(scaled_pixmap)
-        self._update_display_resolution_overlay(scaled_pixmap)
-        self._stack_overlay_z_order()
-
-    def _update_display_resolution_overlay(self, scaled_pixmap: QPixmap | None = None) -> None:
-        """Show pixel size of the fitted video (or viewport when no frame). Updates on resize."""
-        if scaled_pixmap is None:
-            scaled_pixmap = self._scaled_display_pixmap()
-
-        if scaled_pixmap is not None and not scaled_pixmap.isNull():
-            width, height = scaled_pixmap.width(), scaled_pixmap.height()
-        else:
-            width = max(0, self._frame_label.width())
-            height = max(0, self._frame_label.height())
-
-        self._display_resolution_label.setText(f"Display: {width}×{height} px")
-        self._display_resolution_label.adjustSize()
-        margin = 14
-        self._display_resolution_label.move(
-            margin,
-            max(margin, self._surface_stack_host.height() - self._display_resolution_label.height() - margin),
-        )
-        self._display_resolution_label.show()
-
-    def _stack_overlay_z_order(self) -> None:
-        """Keep the playback pill above the display-size chip when both are visible."""
-        self._display_resolution_label.raise_()
-        if self._playback_overlay_label.isVisible():
-            self._playback_overlay_label.raise_()
-        if self._freeze_badge_label.isVisible():
-            self._freeze_badge_label.raise_()
-
-    def _layout_playback_overlay(self) -> None:
-        if self._playback_overlay_label.text() == "":
-            return
-        side_margin = 18
-        top_margin = 80
-        self._playback_overlay_label.adjustSize()
-        overlay_width = self._playback_overlay_label.width()
-        # adjustSize() under-reports height for wrapped multi-line QLabels; use
-        # heightForWidth when available so the first line isn't clipped.
-        hfw = self._playback_overlay_label.heightForWidth(overlay_width)
-        overlay_height = max(self._playback_overlay_label.height(), hfw)
-        x_position = max(side_margin, self._surface_stack_host.width() - overlay_width - side_margin)
-        self._playback_overlay_label.move(x_position, top_margin)
-        self._playback_overlay_label.resize(overlay_width, overlay_height)
-
-    def _layout_freeze_badge(self) -> None:
-        """Pin the FROZEN badge to the top-right corner of the tile."""
-        margin = 14
-        self._freeze_badge_label.adjustSize()
-        x_position = max(
-            margin,
-            self._surface_stack_host.width()
-            - self._freeze_badge_label.width()
-            - margin,
-        )
-        self._freeze_badge_label.move(x_position, margin)

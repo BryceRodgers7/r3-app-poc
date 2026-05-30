@@ -12,7 +12,8 @@ from __future__ import annotations
 import math
 import unittest
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from app.ui.jog_wheel import JogWheel
@@ -22,6 +23,30 @@ class _QtTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._app = QApplication.instance() or QApplication([])
+
+
+def _press(wheel: JogWheel, x: float, y: float) -> None:
+    wheel.mousePressEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(x, y),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+
+
+def _release(wheel: JogWheel, x: float, y: float) -> None:
+    wheel.mouseReleaseEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(x, y),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
 
 
 class JogWheelConstructionTests(_QtTestCase):
@@ -161,6 +186,68 @@ class JogWheelGatingTests(_QtTestCase):
         cursor_after_first = wheel.cursor().shape()
         wheel.set_wheel_enabled(True)
         self.assertEqual(wheel.cursor().shape(), cursor_after_first)
+
+
+class JogWheelGestureLifecycleTests(_QtTestCase):
+    """`jog_engaged` / `jog_released` bracket a touch-to-settle gesture."""
+
+    def _enabled_wheel(self) -> JogWheel:
+        wheel = JogWheel()
+        wheel.set_wheel_enabled(True)
+        return wheel
+
+    def test_press_emits_engaged_once(self) -> None:
+        wheel = self._enabled_wheel()
+        engaged: list[int] = []
+        wheel.jog_engaged.connect(lambda: engaged.append(1))
+        _press(wheel, 70, 70)  # center of the 140px wheel
+        self.assertEqual(len(engaged), 1)
+
+    def test_disabled_wheel_does_not_engage(self) -> None:
+        wheel = JogWheel()  # starts disabled
+        engaged: list[int] = []
+        wheel.jog_engaged.connect(lambda: engaged.append(1))
+        _press(wheel, 70, 70)
+        self.assertEqual(engaged, [])
+
+    def test_release_without_coast_emits_released(self) -> None:
+        wheel = self._enabled_wheel()
+        released: list[int] = []
+        wheel.jog_released.connect(lambda: released.append(1))
+        _press(wheel, 70, 70)
+        # No drag motion → zero velocity → no coast → settles on release.
+        _release(wheel, 70, 70)
+        self.assertEqual(len(released), 1)
+
+    def test_coast_stop_emits_released(self) -> None:
+        wheel = self._enabled_wheel()
+        released: list[int] = []
+        wheel.jog_released.connect(lambda: released.append(1))
+        _press(wheel, 70, 70)
+        # Simulate inertia decaying below the stop threshold.
+        wheel._coast_velocity_rad_s = math.radians(1.0)
+        wheel._on_coast_tick()
+        self.assertEqual(len(released), 1)
+
+    def test_regrab_during_coast_does_not_reengage(self) -> None:
+        wheel = self._enabled_wheel()
+        engaged: list[int] = []
+        wheel.jog_engaged.connect(lambda: engaged.append(1))
+        _press(wheel, 70, 70)
+        # Pretend the wheel is coasting, then the referee grabs it again.
+        wheel._coast_velocity_rad_s = math.radians(180.0)
+        wheel._coast_timer.start()
+        _press(wheel, 70, 70)
+        self.assertEqual(len(engaged), 1)
+
+    def test_disable_cancels_gesture_without_released(self) -> None:
+        wheel = self._enabled_wheel()
+        released: list[int] = []
+        wheel.jog_released.connect(lambda: released.append(1))
+        _press(wheel, 70, 70)
+        wheel.set_wheel_enabled(False)
+        self.assertEqual(released, [])
+        self.assertFalse(wheel._gesture_engaged)
 
 
 if __name__ == "__main__":

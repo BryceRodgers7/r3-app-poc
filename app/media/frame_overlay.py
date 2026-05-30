@@ -6,7 +6,7 @@ from datetime import datetime
 
 import cv2
 
-from app.core.models import FrameArray, FrameOverlayInfo, PlaybackOverlayInfo
+from app.core.models import FrameArray, FrameOverlayInfo
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _FONT_SCALE = 0.72
@@ -37,37 +37,6 @@ def build_frame_overlay_lines(frame_overlay: FrameOverlayInfo) -> list[str]:
         lines.append(f"Frame: {frame_overlay.frame_id:09d}")
     if frame_overlay.capture_timestamp is not None:
         lines.append(f"Capture: {format_timestamp(frame_overlay.capture_timestamp)}")
-    return lines
-
-
-def build_playback_overlay_lines(playback_overlay: PlaybackOverlayInfo) -> list[str]:
-    """Build operator-view playback lines for the transient UI overlay.
-
-    Returns an empty list when recording is not active. The panel's
-    `set_playback_overlay` hides the overlay label when it gets an
-    empty list, so the overlay appears the moment the operator presses
-    "Start game recording" and disappears on Stop. Outside of
-    recording, replay is unavailable (§10.4 / §15.2) and the LIVE
-    badge alone has no actionable meaning, so we hide entirely rather
-    than show a static label.
-    """
-    if not playback_overlay.is_recording:
-        return []
-    lines = [playback_overlay.mode.value]
-    # Phase 7.H.3: surface the currently-open play number so the
-    # operator can see which play they're inside of at a glance.
-    # Right under the mode badge, before the timestamps.
-    if playback_overlay.current_play_number is not None:
-        lines.append(f"Play #{playback_overlay.current_play_number}")
-    if playback_overlay.status_text:
-        lines.append(playback_overlay.status_text)
-    if playback_overlay.playback_timestamp is not None:
-        lines.append(f"Viewed: {format_timestamp(playback_overlay.playback_timestamp)}")
-    if playback_overlay.wall_clock_timestamp is not None:
-        lines.append(f"Now: {format_timestamp(playback_overlay.wall_clock_timestamp)}")
-    if playback_overlay.mode.value in {"PAUSED", "REPLAY"}:
-        lines.append(f"Behind live: {playback_overlay.seconds_behind_live:0.1f}s")
-        lines.append(f"Rate: {playback_overlay.playback_rate:0.2f}x")
     return lines
 
 

@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QCloseEvent, QResizeEvent
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -33,9 +33,7 @@ from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.jog_wheel import JogWheel
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
-from app.ui.operator_status_overlay import OperatorStatusOverlay
 from app.ui.referee_controls_widget import RefereeControlsWidget
-from app.ui.referee_play_badge import RefereePlayBadge
 from app.ui.status_bar_widget import StatusBarWidget
 
 _VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
@@ -152,23 +150,13 @@ class MainWindow(QMainWindow):
         # play-number badge.
         self.camera_ribbon: CameraVisibilityRibbon | None = None
         self.post_process_link: QLabel | None = None
-        self.operator_status_overlay: OperatorStatusOverlay | None = None
         self.jog_wheel: JogWheel | None = None
-        self.referee_play_badge: RefereePlayBadge | None = None
         if controls_role == "operator":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.post_process_link = self._build_post_process_link()
-            # Parent the floating Play/Clip overlay to the video panel
-            # so positioning math is panel-local — avoids the QMainWindow
-            # coordinate-system gotchas that result from parenting a
-            # free-floating child to the QMainWindow itself.
-            self.operator_status_overlay = OperatorStatusOverlay(self.video_panel)
         elif controls_role == "referee":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.jog_wheel = JogWheel(self)
-            # Parented to the video panel for the same panel-local
-            # coordinate reason as `operator_status_overlay`.
-            self.referee_play_badge = RefereePlayBadge(self.video_panel)
 
         # Phase 14.F: StatusBarWidget is the legacy diagnostic strip
         # (recording state / source name / behind-live counter). The
@@ -220,8 +208,6 @@ class MainWindow(QMainWindow):
             # Phase 14.B operator layout:
             #   [ video panel | OperatorControlsWidget (right column) ]
             #   [ CameraVisibilityRibbon | stretch | Post-process link ]
-            # OperatorStatusOverlay floats top-right of the video panel
-            # area (positioned by `resizeEvent`).
             middle_row = QHBoxLayout()
             middle_row.setContentsMargins(0, 0, 0, 0)
             middle_row.setSpacing(16)
@@ -248,10 +234,9 @@ class MainWindow(QMainWindow):
             #   [ video panel                                   ]
             #   [ RefereeControlsWidget transport row | JogWheel ]
             #   [ CameraVisibilityRibbon                        ]
-            # RefereePlayBadge floats bottom-left of the video panel
-            # (positioned by `resizeEvent`). The jog wheel sits beside
-            # the transport buttons because both controls are part of
-            # the same gated transport surface (Phase 14.F).
+            # The jog wheel sits beside the transport buttons because
+            # both controls are part of the same gated transport
+            # surface (Phase 14.F).
             layout.addWidget(self.video_panel, stretch=1)
             transport_row = QHBoxLayout()
             transport_row.setContentsMargins(0, 0, 0, 0)
@@ -297,13 +282,15 @@ class MainWindow(QMainWindow):
             # Phase 12.B: frame-step buttons — read the configured count
             # at click time so a future runtime knob (12.C) can update
             # `settings.replay_frame_step_count` without re-wiring.
+            # `step_frames_button` applies the step-button auto-resume
+            # policy (default: stay paused).
             self.referee_controls.step_back_requested.connect(
-                lambda: self._controller.step_frames(
+                lambda: self._controller.step_frames_button(
                     -self._settings.replay_frame_step_count
                 )
             )
             self.referee_controls.step_forward_requested.connect(
-                lambda: self._controller.step_frames(
+                lambda: self._controller.step_frames_button(
                     +self._settings.replay_frame_step_count
                 )
             )
@@ -315,23 +302,23 @@ class MainWindow(QMainWindow):
             self.jog_wheel.seek_by_frames_requested.connect(
                 self._controller.step_frames
             )
-        # Phase 14.D: flip the referee play badge red while a
-        # challenge lockout is active. The coordinator owns the
-        # state (one challenge across both windows), so the signal
-        # lives on the coordinator's bus, not on the per-controller
-        # AppSignals.
-        # Phase 14.F: the same signal gates the referee transport
-        # (every transport button + the jog wheel) — disabled outside
-        # a challenge, enabled while one is active.
-        if self._application_coordinator is not None:
-            if self.referee_play_badge is not None:
-                self._application_coordinator.signals.challenge_state_changed.connect(
-                    self.referee_play_badge.set_challenge_active
-                )
-            if self._controls_role == "referee":
-                self._application_coordinator.signals.challenge_state_changed.connect(
-                    self._set_referee_transport_enabled
-                )
+            # Auto-resume policy: capture the pre-jog rate on touch and
+            # (per config) resume it once the wheel settles.
+            self.jog_wheel.jog_engaged.connect(self._controller.begin_jog)
+            self.jog_wheel.jog_released.connect(self._controller.end_jog)
+        # Phase 14.F: the challenge-state signal gates the referee
+        # transport (every transport button + the jog wheel) — disabled
+        # outside a challenge, enabled while one is active. The
+        # coordinator owns the state (one challenge across both
+        # windows), so the signal lives on the coordinator's bus, not
+        # on the per-controller AppSignals.
+        if (
+            self._application_coordinator is not None
+            and self._controls_role == "referee"
+        ):
+            self._application_coordinator.signals.challenge_state_changed.connect(
+                self._set_referee_transport_enabled
+            )
         if self.operator_controls is not None and self._application_coordinator is not None:
             self.operator_controls.long_recording_toggle_requested.connect(
                 self._application_coordinator.toggle_long_session_recording
@@ -388,47 +375,24 @@ class MainWindow(QMainWindow):
                 has_play_started=state.current_play_number is not None,
                 current_clip_type=state.current_clip_type,
             )
-        if self.operator_status_overlay is not None:
-            self.operator_status_overlay.set_counters(
-                is_recording=state.is_recording,
-                play_number=state.current_play_number,
-                clip_number=state.current_clip_number,
-            )
-            self._position_operator_status_overlay()
         if self.camera_ribbon is not None:
             self.camera_ribbon.set_selector_label(
                 clip_type=state.current_clip_type,
                 clip_number=state.current_clip_number,
                 play_number=state.current_play_number,
             )
-        if self.referee_play_badge is not None:
-            self.referee_play_badge.set_play_state(
-                play_number=state.current_play_number,
-            )
-            self._position_referee_play_badge()
         show_embedded_video = state.current_playback_mode in {
             PlaybackMode.LIVE,
             PlaybackMode.PAUSED,
             PlaybackMode.REPLAY,
         }
-        self.video_panel.set_playback_overlay(state.playback_overlay)
         self.video_panel.apply_tile_visibility(
             state.current_playback_mode,
             live_only_window=self._live_only_window,
         )
-        self.video_panel.apply_freeze_indicators(state.feeds_in_freeze_frame)
         if not show_embedded_video:
             placeholder_text = state.playback_overlay.status_text or "Waiting for the selected source"
             self.video_panel.set_global_placeholder(placeholder_text)
-
-    def resizeEvent(self, event: QResizeEvent) -> None:
-        super().resizeEvent(event)
-        # Phase 14.B: keep the free-floating Play/Clip counter
-        # overlay pinned to the upper-right of the video panel.
-        self._position_operator_status_overlay()
-        # Phase 14.C: keep the play-number badge pinned to the
-        # bottom-left of the video panel on the referee window.
-        self._position_referee_play_badge()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release widget bindings when the window closes."""
@@ -534,33 +498,3 @@ class MainWindow(QMainWindow):
         else:
             self._controller.pause_playback()
 
-    def _position_referee_play_badge(self) -> None:
-        if self.referee_play_badge is None:
-            return
-        if not self.referee_play_badge.isVisible():
-            return
-        badge = self.referee_play_badge
-        badge.adjustSize()
-        margin = 18
-        # Panel-local coordinates: (0, 0) is top-left of the video
-        # panel; bottom-left places the badge near the playback
-        # surface without crowding the transport row below.
-        x = margin
-        y = max(0, self.video_panel.height() - badge.height() - margin)
-        badge.move(x, y)
-        badge.raise_()
-
-    def _position_operator_status_overlay(self) -> None:
-        if self.operator_status_overlay is None:
-            return
-        if not self.operator_status_overlay.isVisible():
-            return
-        # The overlay is a child of `self.video_panel`, so coordinates
-        # are panel-local: (0, 0) is the top-left of the panel.
-        margin = 18
-        overlay = self.operator_status_overlay
-        overlay.adjustSize()
-        x = max(0, self.video_panel.width() - overlay.width() - margin)
-        y = margin
-        overlay.move(x, y)
-        overlay.raise_()

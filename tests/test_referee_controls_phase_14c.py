@@ -1,4 +1,4 @@
-"""Phase 14.C: referee-window transport rebuild + play badge.
+"""Phase 14.C: referee-window transport rebuild.
 
 Covers the widget-level contract for the rebuilt
 `RefereeControlsWidget`:
@@ -6,11 +6,10 @@ Covers the widget-level contract for the rebuilt
 - Speed buttons (2x, 1/2x, 1/4x, 1/8x) emit distinct signals.
 - Rewind button label reflects `rewind_seconds`.
 - Pause label flips between Play and Pause based on `playback_rate`.
-- `RefereePlayBadge` shows "Play N/A" pre-game and "Play NN"
-  otherwise; the challenge hook flips the stylesheet.
 
 Phase 14.F removed the `ScrubberSlider` (replaced by `JogWheel`) —
-slider tests moved to `test_jog_wheel.py`.
+slider tests moved to `test_jog_wheel.py`. The free-floating play-
+number badge was later removed (no chrome overlays the video feed).
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import unittest
 from PySide6.QtWidgets import QApplication
 
 from app.ui.referee_controls_widget import RefereeControlsWidget
-from app.ui.referee_play_badge import RefereePlayBadge
 
 
 class _QtTestCase(unittest.TestCase):
@@ -73,29 +71,6 @@ class RefereeControlsButtonSurfaceTests(_QtTestCase):
         # Slow motion is still "advancing", so Pause.
         controls.set_pause_label_for_rate(0.25)
         self.assertIn("Pause", controls.pause_button.text())
-
-
-class RefereePlayBadgeTests(_QtTestCase):
-    def test_pre_game_shows_na(self) -> None:
-        badge = RefereePlayBadge()
-        badge.set_play_state(play_number=None)
-        self.assertIn("N/A", badge.text())
-
-    def test_play_number_renders(self) -> None:
-        badge = RefereePlayBadge()
-        badge.set_play_state(play_number=7)
-        self.assertIn("7", badge.text())
-        self.assertIn("Play", badge.text())
-
-    def test_challenge_active_changes_style(self) -> None:
-        badge = RefereePlayBadge()
-        default_style = badge.styleSheet()
-        badge.set_challenge_active(True)
-        self.assertNotEqual(badge.styleSheet(), default_style)
-        # Red — match the End Game red used on the operator window.
-        self.assertIn("d24747", badge.styleSheet())
-        badge.set_challenge_active(False)
-        self.assertEqual(badge.styleSheet(), default_style)
 
 
 if __name__ == "__main__":

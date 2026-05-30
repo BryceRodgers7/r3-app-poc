@@ -101,9 +101,22 @@ disk_budget_mb_s = 200.0
 # jogs back (default 5). The Rewind button label is built from this
 # setting at construction time, so changing it is config-only — no
 # code change required.
+#
+# Jog-wheel / step-button auto-pause behavior:
+#   jog_wheel_resume_after_release (default true)  — after the jog
+#     wheel settles, resume playback at the rate it had before you
+#     touched it. Set false to stay paused after the wheel settles.
+#   step_button_resume_after_click (default false) — Step ◀ / ▶ stay
+#     paused after a click. Set true to resume at the pre-click rate.
+#   hold_paused_at_clip_start (default true) — overrides the two flags
+#     above: when a jog/step lands at the start of the clip, hold
+#     paused regardless.
 # [replay]
 # frame_step_count = 1
 # rewind_seconds = 5
+# jog_wheel_resume_after_release = true
+# step_button_resume_after_click = false
+# hold_paused_at_clip_start = true
 
 # Phase 14.F — diagnostic chrome toggle. Off by default so the
 # production windows match `docs/window-layouts.pdf` (just the

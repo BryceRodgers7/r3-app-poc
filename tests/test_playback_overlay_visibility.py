@@ -1,9 +1,8 @@
-"""Overlay visibility is gated on `is_recording`.
+"""The controller threads `is_recording` onto its PlaybackOverlayInfo.
 
-The operator transport overlay (LIVE / REPLAY / PAUSED badge plus the
-behind-live counter and rate) only appears while a game is being
-recorded. Outside of recording, replay is unavailable per §10.4 / §15.2
-and a static LIVE badge has no actionable meaning, so we hide entirely.
+The recording flag drives downstream UI gating (e.g. the referee
+pause/play label). This locks down that `_update_state_timestamps_locked`
+copies the recording state onto the overlay info it builds.
 """
 
 from __future__ import annotations
@@ -11,54 +10,8 @@ from __future__ import annotations
 import unittest
 
 from app.core.app_state import UiState
-from app.core.models import PlaybackMode, PlaybackOverlayInfo
+from app.core.models import PlaybackMode
 from app.core.playback_controller import PlaybackController
-from app.media.frame_overlay import build_playback_overlay_lines
-
-
-class BuildLinesGatingTests(unittest.TestCase):
-    def test_returns_empty_when_not_recording(self) -> None:
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.LIVE,
-            wall_clock_timestamp=1234567890.0,
-            is_recording=False,
-        )
-        self.assertEqual(build_playback_overlay_lines(overlay), [])
-
-    def test_returns_empty_when_not_recording_even_in_replay(self) -> None:
-        # Defensive: REPLAY mode without `is_recording=True` shouldn't
-        # be reachable in practice (the controller flips back to LIVE
-        # when recording stops), but lock it down so the gate is
-        # purely on `is_recording`.
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.REPLAY,
-            wall_clock_timestamp=1234567890.0,
-            seconds_behind_live=4.0,
-            is_recording=False,
-        )
-        self.assertEqual(build_playback_overlay_lines(overlay), [])
-
-    def test_includes_mode_when_recording_in_live(self) -> None:
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.LIVE,
-            wall_clock_timestamp=1234567890.0,
-            is_recording=True,
-        )
-        lines = build_playback_overlay_lines(overlay)
-        self.assertIn("LIVE", lines)
-
-    def test_includes_behind_live_in_replay_when_recording(self) -> None:
-        overlay = PlaybackOverlayInfo(
-            mode=PlaybackMode.REPLAY,
-            wall_clock_timestamp=1234567890.0,
-            seconds_behind_live=4.0,
-            playback_rate=0.5,
-            is_recording=True,
-        )
-        lines = build_playback_overlay_lines(overlay)
-        self.assertIn("REPLAY", lines)
-        self.assertTrue(any("Behind live: 4.0s" in line for line in lines))
-        self.assertTrue(any("Rate: 0.50x" in line for line in lines))
 
 
 class ControllerPropagatesIsRecordingTests(unittest.TestCase):

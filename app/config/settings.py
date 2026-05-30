@@ -234,6 +234,15 @@ def _validate_replay(config: dict[str, Any], *, where: str) -> None:
             raise RuntimeError(
                 f"{where}: rewind_seconds={raw} must be >= 1."
             )
+    for bool_key in (
+        "jog_wheel_resume_after_release",
+        "step_button_resume_after_click",
+        "hold_paused_at_clip_start",
+    ):
+        if bool_key in config and not isinstance(config[bool_key], bool):
+            raise RuntimeError(
+                f"{where}: {bool_key}={config[bool_key]!r} must be true or false."
+            )
 
 
 def _validate_codec_container(codec: str, container: str, *, where: str) -> None:
@@ -372,6 +381,24 @@ class AppSettings:
     # was hardcoded to 10s; the spec ships at 5s. Operators can override
     # via `[replay] rewind_seconds = N`.
     replay_rewind_seconds: int = 5
+    # Jog wheel / step-button auto-pause behavior (see
+    # `PlaybackController`). All three are referee-transport knobs.
+    #
+    # `jog_wheel_resume_after_release` (default True): when the referee
+    # touches the jog wheel and lets it settle (release + inertia
+    # stop), playback resumes at whatever rate it was at before the
+    # touch. False keeps it paused after the wheel settles.
+    #
+    # `step_button_resume_after_click` (default False): the Step ◀ / ▶
+    # buttons stay paused after a click by default; True makes them
+    # resume at the pre-click rate, mirroring the jog wheel.
+    #
+    # `hold_paused_at_clip_start` (default True): overrides the two
+    # flags above — when a jog or step lands the playhead at the start
+    # of the clip, hold paused regardless of the resume settings.
+    replay_jog_wheel_resume_after_release: bool = True
+    replay_step_button_resume_after_click: bool = False
+    replay_hold_paused_at_clip_start: bool = True
     # Phase 14.F: render the legacy diagnostic chrome — the
     # `StatusBarWidget` strip above the Qt status bar, and the
     # referee window's `DiagnosticsWidget` telemetry panel. Off by
@@ -546,6 +573,18 @@ class AppSettings:
             if "rewind_seconds" in replay_config:
                 settings.replay_rewind_seconds = int(
                     replay_config["rewind_seconds"]
+                )
+            if "jog_wheel_resume_after_release" in replay_config:
+                settings.replay_jog_wheel_resume_after_release = bool(
+                    replay_config["jog_wheel_resume_after_release"]
+                )
+            if "step_button_resume_after_click" in replay_config:
+                settings.replay_step_button_resume_after_click = bool(
+                    replay_config["step_button_resume_after_click"]
+                )
+            if "hold_paused_at_clip_start" in replay_config:
+                settings.replay_hold_paused_at_clip_start = bool(
+                    replay_config["hold_paused_at_clip_start"]
                 )
 
         if "feed_id" in source_config:

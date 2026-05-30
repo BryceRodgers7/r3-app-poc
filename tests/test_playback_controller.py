@@ -1294,6 +1294,114 @@ class StepFramesTests(unittest.TestCase):
             "Replay degraded; step unavailable.",
         )
 
+    # ------------------------------------------------------------------
+    # Jog-wheel / step-button auto-resume policy
+    # ------------------------------------------------------------------
+
+    def _flagged_controller(self, **flags) -> PlaybackController:
+        """A recording-active controller with auto-pause flags overridden."""
+        controller = PlaybackController(
+            feed_runtimes=[self.runtime],
+            output_renderer=_FakeRenderer(),
+            recording_manager=self.recording_manager,
+            replay_store=self.replay_store,
+            default_source_name="Fake Source",
+            session_role="referee",
+            live_only=False,
+            decoder_factory=lambda *_a: self.stub_decoder,
+            frame_period_ns=self._FRAME_PERIOD_NS,
+            rewind_seconds=10,
+            **flags,
+        )
+        controller.initialize(self.session_paths.session_id)
+        self.addCleanup(controller.shutdown)
+        self.recording_manager.recording_state.force(RecordingState.RECORDING)
+        controller.refresh_recording_state()
+        return controller
+
+    def test_jog_resume_default_resumes_at_prior_rate(self) -> None:
+        # Default flags: jog wheel resumes on release.
+        self._force_recording_state()
+        self.controller.set_playback_rate(1.0)  # REPLAYING at 20 s
+        self.controller.begin_jog()
+        self.controller.step_frames(-30)  # back 3 s → 17 s, PAUSED
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.controller.end_jog()
+        self.assertEqual(self.controller.replay_state.state, ReplayState.REPLAYING)
+        self.assertEqual(self.controller._playback_rate, 1.0)
+
+    def test_jog_resume_preserves_slow_motion_rate(self) -> None:
+        self._force_recording_state()
+        self.controller.set_playback_rate(0.25)  # SLOW_MOTION at 20 s
+        self.controller.begin_jog()
+        self.controller.step_frames(-30)  # 17 s, PAUSED
+        self.controller.end_jog()
+        self.assertEqual(self.controller.replay_state.state, ReplayState.SLOW_MOTION)
+        self.assertEqual(self.controller._playback_rate, 0.25)
+
+    def test_jog_from_paused_stays_paused(self) -> None:
+        # Pre-jog rate is 0 → "resume at prior rate" means stay paused.
+        self._enter_paused_at(10_000_000_000)
+        self.controller.begin_jog()
+        self.controller.step_frames(-10)  # 9 s
+        self.controller.end_jog()
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(self.controller._playback_rate, 0.0)
+
+    def test_jog_resume_disabled_stays_paused(self) -> None:
+        controller = self._flagged_controller(jog_wheel_resume_after_release=False)
+        controller.set_playback_rate(1.0)
+        controller.begin_jog()
+        controller.step_frames(-30)
+        controller.end_jog()
+        self.assertEqual(controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(controller._playback_rate, 0.0)
+
+    def test_step_button_default_stays_paused(self) -> None:
+        self._force_recording_state()
+        self.controller.set_playback_rate(1.0)  # REPLAYING at 20 s
+        self.controller.step_frames_button(-1)
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(self.controller._playback_rate, 0.0)
+
+    def test_step_button_resume_when_enabled(self) -> None:
+        controller = self._flagged_controller(step_button_resume_after_click=True)
+        controller.set_playback_rate(1.0)  # REPLAYING at 20 s
+        controller.step_frames_button(-1)  # → 19.9 s, then resume at 1.0×
+        self.assertEqual(controller.replay_state.state, ReplayState.REPLAYING)
+        self.assertEqual(controller._playback_rate, 1.0)
+
+    def test_hold_at_clip_start_overrides_jog_resume(self) -> None:
+        # Default flags: hold_paused_at_clip_start is on.
+        self._force_recording_state()
+        self.controller.set_clip_bounds(8_000_000_000, 16_000_000_000)
+        self.controller.set_playback_rate(1.0)  # snaps to clip start (8 s)
+        self.controller.begin_jog()
+        self.controller.step_frames(-300)  # clamps to the fence low edge
+        self.assertEqual(self.controller._playback_session_time_ns, 8_000_000_000)
+        self.controller.end_jog()
+        self.assertEqual(self.controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(self.controller._playback_rate, 0.0)
+
+    def test_hold_disabled_resumes_at_clip_start(self) -> None:
+        controller = self._flagged_controller(hold_paused_at_clip_start=False)
+        controller.set_clip_bounds(8_000_000_000, 16_000_000_000)
+        controller.set_playback_rate(1.0)  # snaps to clip start (8 s)
+        controller.begin_jog()
+        controller.step_frames(-300)  # clamps to 8 s
+        controller.end_jog()
+        self.assertEqual(controller.replay_state.state, ReplayState.REPLAYING)
+        self.assertEqual(controller._playback_rate, 1.0)
+
+    def test_step_button_held_at_clip_start_despite_resume(self) -> None:
+        # Resume on, but the clip-start hold (default on) wins.
+        controller = self._flagged_controller(step_button_resume_after_click=True)
+        controller.set_clip_bounds(8_000_000_000, 16_000_000_000)
+        controller.set_playback_rate(1.0)  # at clip start (8 s)
+        controller.step_frames_button(-5)  # stays clamped at 8 s
+        self.assertEqual(controller.replay_state.state, ReplayState.PAUSED)
+        self.assertEqual(controller._playback_rate, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
