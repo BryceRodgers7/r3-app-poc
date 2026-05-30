@@ -714,7 +714,7 @@ max_replay_scope = "current_recording"
 completed_segments_only = true
 ```
 
-> **Currently shipped:** the `[replay]` block is not read by the loader (see §13.2). The behaviors it would gate are already correct as hard-coded constants: `requires_recording = true` is enforced unconditionally, `completed_segments_only = true` is enforced by `RecordingSegmentReplayStore` (Phase 7.C lock-in), and the operator UI ships only the **Rewind 10s** shortcut today (the 30 / 60 / 120 buttons listed above are queued — see §15.3).
+> **Currently shipped:** the loader *does* read a `[replay]` block, but only the keys added by later phases — `frame_step_count` (Phase 12.B), `rewind_seconds` (Phase 14.C), and the jog-wheel / step-button auto-pause flags `jog_wheel_resume_after_release` / `step_button_resume_after_click` / `hold_paused_at_clip_start` (§14.G). See `app_settings.toml.example` for all of them. The *proposed* keys shown above (`enabled`, `requires_recording`, `quick_replay_seconds`, …) are **not** read. The behaviors they would gate are already correct as hard-coded constants: `requires_recording = true` is enforced unconditionally, `completed_segments_only = true` is enforced by `RecordingSegmentReplayStore` (Phase 7.C lock-in), and the referee UI ships the **Rewind 5s** shortcut + jog wheel today (the 30 / 60 / 120 buttons listed above are queued — see §15.3).
 
 Rules:
 
@@ -760,7 +760,7 @@ Crash and resume:
 Replay use case:
 
 - A new transport button **"Replay Play"** seeks playback to the currently-open play's `start_session_time_ns` and resumes at 1.0x. To go further back, the operator stacks Rewind 10s clicks (the existing per-10-second offset path).
-- The current play number is rendered on the playback overlay (`Play #N`) so the operator always knows what they're inside of.
+- The current play number (`Play #N`) is surfaced off the video feed so the operator always knows what they're inside of — on the camera-ribbon selector label and the diagnostic status bar. (Originally drawn on an on-video playback overlay; all on-feed chrome was removed in the post-14.F cleanup — see §14.G.)
 
 Post-session export:
 
@@ -1561,7 +1561,7 @@ reader at the same time as the behavior the section gates.
 | `[media] pipeline_mode` | unimplemented; `SourceInterface.pipeline_mode` is hard-coded per source kind | no plan to add — the per-source declaration is the right surface |
 | `[media] hardware_acceleration` | unimplemented | Phase 11 |
 | `[media] default_width / default_height / default_fps` | code reads these from `[app] target_frame_*` instead | doc-only rename |
-| `[replay]` block | unimplemented; `requires_recording = true` is enforced unconditionally, `quick_replay_seconds` is contradicted by the code's single Rewind 10s button | no plan to add — the constants are correct |
+| `[replay]` *proposed* keys (`enabled`, `requires_recording`, `quick_replay_seconds`, …) | unimplemented; `requires_recording = true` is enforced unconditionally, `quick_replay_seconds` is contradicted by the code's single Rewind button | no plan to add — the constants are correct. **NB:** the loader *does* read other `[replay]` keys — `frame_step_count` (12.B), `rewind_seconds` (14.C), and the jog/step auto-pause flags (§14.G). |
 | `[retention]` block | unimplemented; the live recording app never deletes anything (§6.8) | future cleanup CLI / post-session processor flag |
 | `[post_processing]` block | unimplemented; the post-session processor uses hard-coded ffmpeg defaults (`libx264` / `aac` via subprocess) | future Phase-8 follow-up if a deployment needs to override the encoder |
 | `[audio] mode = "master"` and friends | obsoleted by Phase 9's per-feed embedded-audio model. The doc's old master-audio TOML described a workflow that was never built. | n/a — drop from §13 in a future edit |
@@ -2396,12 +2396,14 @@ Tasks:
 - `MultiFeedVideoPanel.apply_freeze_indicators(feeds)` — sets each tile's badge by feed_id. Wired into `MainWindow._render_state` so Qt re-renders when the controller emits a state change.
 - 5 new tests cover the four `is_freeze` branches in the replay store + controller-side state population (late-join scenario sets `("ndi_b",)`; in-coverage range sets `()`; jump-to-live clears the list) + widget badge toggle.
 
+> **Superseded (post-14.F, §14.G):** the per-tile "FROZEN" badge UI was removed along with all other on-feed chrome. `VideoWidget.set_freeze_indicator` and `MultiFeedVideoPanel.apply_freeze_indicators` no longer exist, and the widget badge-toggle test was dropped. The clamping *behavior* is unchanged — `is_freeze` still selects the clamped freeze frame to render, and `UiState.feeds_in_freeze_frame` is still populated; only the visible badge is gone.
+
 Exit criteria:
 
 - ✅ Operator can replay multiple feeds for same time range.
 - ✅ Program output remains live.
 - ✅ Recording continues during replay.
-- ✅ Missing feed does not break replay (clamps via §8.6.1, surfaces as a per-tile FROZEN badge).
+- ✅ Missing feed does not break replay (clamps via §8.6.1; originally surfaced as a per-tile FROZEN badge, since removed — the clamped freeze frame still renders).
 
 ---
 
@@ -2500,7 +2502,7 @@ Shipped in four sub-slices:
 
 - **7.H.1 ✅ — `plays` SQLite table + `PlayManager`.** Table per the §6.7 schema; `UNIQUE(session_id, game_subdir, play_number)`. `PlayManager` (`app/core/play_manager.py`) owns the in-memory currently-open-play pointer and persists boundary transitions. Hooks: `toggle_long_session_recording` Start opens the next play (Play #1 for a fresh game, `max(existing) + 1` on Phase 7.D resume continuation); Stop closes the current play; `coordinator.mark_next_play()` advances the boundary. Crash recovery via `_setup_resume_continuation` calls `auto_close_open_plays_for_session` to close any NULL-end plays at the latest finalized segment's end, flagging `auto_closed_on_crash = TRUE`.
 - **7.H.2 ✅ — operator UI.** "Next clip" button (formerly bound to the no-op `advance_short_segments` stub) renamed to "Next Play" and rebound to `coordinator.mark_next_play`. New `ControlsWidget.set_recording_state(bool)` toggles enabled state. The `advance_short_segments` stub was removed.
-- **7.H.3 ✅ — overlay current-play badge.** `UiState.current_play_number` and `PlaybackOverlayInfo.current_play_number` populated by `PlaybackController._update_state_timestamps_locked` from `PlayManager.current_play_number()`. The playback overlay renders `Play #N` directly under the mode badge; the operator status bar gained a "Play" row.
+- **7.H.3 ✅ — current-play badge.** `UiState.current_play_number` and `PlaybackOverlayInfo.current_play_number` populated by `PlaybackController._update_state_timestamps_locked` from `PlayManager.current_play_number()`. Originally rendered `Play #N` on an on-video playback overlay; that overlay (and all other on-feed chrome) was removed post-14.F (§14.G). The number now surfaces only off-feed — the diagnostic status bar's "Play" row and the camera-ribbon selector label.
 - **7.H.4 ✅ — "Replay Play" transport.** `PlaybackController.replay_current_play()` seeks playback to the currently-open play's `start_session_time_ns` (clamped defensively to the per-game replay scope's earliest), transitions the replay state machine through `SEEKING → REPLAYING`, and resumes at 1.0x. New "Replay Play" button on the operator controls panel; same recording-state gating as Next Play.
 
 Tests:
@@ -3324,17 +3326,17 @@ Motivation: Phase 14.C shipped a horizontal `ScrubberSlider` on the referee wind
 
 - `clips` table replaces `plays`. Every clip has a type from {pre-game, play, timeout, challenge}, a 0-indexed monotonic `clip_number`, and a `marked` flag. Pre-Phase-14 DBs migrate cleanly (old plays data dropped — operator-confirmed).
 - Operator window: Begin Game (green) → confirm-modal End Game (red); Next Play, Time-out, Challenge, Mark Play all create / mark the right clip type with the right gating (Time-out and Challenge disabled until first Next Play; Challenge ignored back-to-back). Clip + play counters reflect ClipManager state. Camera ribbon hides/shows tiles on the operator window only.
-- Referee window: transport row has Play/Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind 5s, Step ◀, Step ▶, inertia jog wheel (no slider/progress bar on either window). Every transport control is disabled outside an active challenge and enabled the moment a challenge starts; goes back to disabled when the challenge ends. Replay Play and Jump to Live are gone. Camera ribbon and play-number badge work per-window.
+- Referee window: transport row has Play/Pause, 2x, 1/2x, 1/4x, 1/8x, Rewind 5s, Step ◀, Step ▶, inertia jog wheel (no slider/progress bar on either window). Every transport control is disabled outside an active challenge and enabled the moment a challenge starts; goes back to disabled when the challenge ends. Replay Play and Jump to Live are gone. Camera ribbon works per-window. (The per-window play-number badge was later removed — §14.G.)
 - Challenge flow: pressing Challenge on operator window jumps the referee window to the start of the most-recent play, paused. Referee cannot seek before play.start or after play.end (auto-clamps to PAUSED). Lockout clears when operator presses Next Play / Time-out / End Game.
 - Post-process & Exit: pressing the link stops recording (if running), runs the post-processor in-app with a progress modal, and closes both windows on success / waits for OK on failure. CLI invocation still works as manual retry.
 - All existing replay / recovery / pipeline tests pass. New tests cover clip-type transitions, clip-bound clamping, the post-process dialog states, and the camera-ribbon visibility toggle.
 
 ### Settled questions
 
-- **Counter placement on the operator window:** free-form `QLabel` overlay (same pattern as `MultiFeedVideoPanel`'s playback-status pill), top-right but offset from the button stack so it does not crowd Next Play / Time-out / Challenge.
+- **Counter placement on the operator window:** free-form `QLabel` overlay (same pattern as `MultiFeedVideoPanel`'s playback-status pill), top-right but offset from the button stack so it does not crowd Next Play / Time-out / Challenge. *(Both this counter overlay and the playback-status pill were later removed — no chrome overlays the video; see §14.G.)*
 - **Camera ribbon labels:** 1-based feed index on the ribbon buttons; `feed.display_name` continues to label the tile in `MultiFeedVideoPanel`.
 - **`rewind_10_seconds` rename:** rename to `rewind_configured_seconds` on `PlaybackController`; full-repo grep before declaring complete. Duration is config-driven (`[replay] rewind_seconds`) so future tweaks are a settings change, not code.
-- **Challenge indicator on the referee window:** flip the play-number badge text color to red while a challenge is active (re-using the End Game red for visual consistency). No separate overlay widget.
+- **Challenge indicator on the referee window:** flip the play-number badge text color to red while a challenge is active (re-using the End Game red for visual consistency). No separate overlay widget. *(Superseded — the play-number badge was removed in §14.G; the challenge lockout is shown by the transport greying out.)*
 - **`plays_json_export.py` schema versioning:** none. Downstream consumers are in-tree and updated atomically with the JSON shape; rename the file to `clips_json_export.py` to match the new vocabulary.
 
 ### Phase 14 sequencing notes
@@ -3345,6 +3347,28 @@ Motivation: Phase 14.C shipped a horizontal `ScrubberSlider` on the referee wind
 - **14.E is independent of 14.D** but depends on 14.B for the Post-process link to exist. Can land between 14.B and 14.C, or after 14.D.
 - **Repo-wide rename grep is mandatory before declaring 14.A complete.** `feedback_rename_grep` memory: a partial-grep rename of a Qt signal in Phase 13 missed `next_clip_button` and crashed the app at startup. Touch every reference to `play_manager`, `mark_next_play`, `current_play_number`, `next_play_button` (where it should stay as Next Play but new clip-aware accessors are nearby), `play_id`, `play_number`, `auto_close_open_plays_for_session`.
 - **No GStreamer pipeline changes.** Phase 14 is entirely UI + state + schema. The existing recording / replay paths are unchanged.
+
+### 14.G — Post-14.F cleanup: no on-feed chrome, jog direction guide, configurable auto-pause ✅
+
+Three follow-on changes after 14.F. None touch the GStreamer or recording paths.
+
+**1. Remove all chrome drawn over the video feeds.** Nothing is rendered on top of the live/replay tiles in either window. Removed:
+- the panel-level playback-status pill (mode / `Play #N` / behind-live / rate),
+- the per-tile "Display NNN×NNN px" resolution chip,
+- the per-tile "FROZEN" badge (supersedes Phase 6's badge; see the "Superseded (post-14.F)" note in the Phase 6 section),
+- the floating `RefereePlayBadge` (referee play counter, bottom-left) and `OperatorStatusOverlay` (operator play/clip counter, top-right),
+- the `build_playback_overlay_lines` formatter that fed the pills.
+
+`app/ui/referee_play_badge.py` and `app/ui/operator_status_overlay.py` were deleted, and `VideoWidget` / `MultiFeedVideoPanel` lost their overlay labels and `set_playback_overlay` / `set_freeze_indicator` / `apply_freeze_indicators` methods. The underlying data still lives on `UiState` / `PlaybackOverlayInfo` and drives **off-feed** surfaces instead: the camera-ribbon selector label (play/clip number), the referee Pause/Play button label (rate), and the diagnostic `StatusBarWidget`. This supersedes the 14.B/14.C/14.F "play-number badge" and "counter overlay" entries above (Settled questions → *Counter placement*, *Challenge indicator on the referee window*). The challenge indicator that flipped the badge red is gone with the badge; the challenge lockout is still shown by the transport greying out (14.F gate).
+
+**2. Jog-wheel direction guide.** The `JogWheel` face now draws curved arrows + "FF" / "REW" labels so the rewind / fast-forward directions are obvious. Counter-clockwise = forward, clockwise = rewind (matches the seek sign convention). Greyed out with the rest of the wheel when no challenge is active.
+
+**3. Configurable jog-wheel / step-button auto-pause.** `step_frames` stays a pure seek-and-pause primitive; two gesture wrappers apply a configurable resume policy (all `[replay]`, defaults shown):
+- `jog_wheel_resume_after_release` (default `true`) — the wheel emits `jog_engaged` / `jog_released`; `PlaybackController.begin_jog()` captures the pre-touch rate and `end_jog()` resumes it once the wheel settles (slow-mo preserved; a pre-touch pause stays paused). `false` keeps it paused.
+- `step_button_resume_after_click` (default `false`) — `step_frames_button()` captures the pre-click rate, steps, and stays paused by default; `true` resumes.
+- `hold_paused_at_clip_start` (default `true`) — overrides both: a jog/step that lands at the clip-start fence (else start-of-recording) holds paused.
+
+`_resume_or_hold` centralizes the decision and only resumes when the gesture left the controller in PAUSED, so a rejected/degraded step never spuriously plays. The Rewind button is unaffected (it already pauses at the clip-start fence). See `IMPLEMENTATION.md` §11.5–§11.6 for the implementation reference and `app_settings.toml.example` for the config.
 
 ---
 

@@ -748,8 +748,11 @@ replayable segment. Decision tree:
    clamped to its `duration_ns`, `is_freeze=True` (freeze on last
    frame).
 
-The `is_freeze` flag drives the operator UI's "FROZEN" badge per tile
-(Phase 6).
+The `is_freeze` flag selects the clamped freeze frame to render for a
+feed without exact coverage at the target timestamp. It is still
+recorded on `UiState.feeds_in_freeze_frame`, but no longer surfaces a
+per-tile "FROZEN" badge — all video-feed chrome was removed (see
+§11.5).
 
 `resolve_session_time` is the strict counterpart — returns `None`
 instead of clamping. Used by the rewind-target picker which wants to
@@ -856,9 +859,11 @@ hooks fire from the Qt main thread:
 - `stop_game(end_session_time_ns)` — closes the current play.
 
 Plays are operator-scoped (one sequence per game across all feeds),
-not feed-scoped. The current play number renders as `Play #N` on the
-playback overlay (`PlaybackOverlayInfo.current_play_number`) and the
-operator status bar.
+not feed-scoped. The current play number is carried on
+`UiState.current_play_number` / `PlaybackOverlayInfo.current_play_number`
+and renders as `Play #N` on the diagnostic status bar
+(`StatusBarWidget`, gated by `[ui] show_diagnostics`). It is no longer
+drawn over the video — all on-feed chrome was removed (see §11.5).
 
 The "Replay Play" transport seeks to the currently-open play's
 `start_session_time_ns` (clamped defensively to the per-game replay
@@ -1227,14 +1232,72 @@ reads `Replay not yet available — first segment finalizing` (during
 the first segment's lifetime) or `Replay unavailable: start game
 recording first` (between games).
 
-### 11.5 FROZEN badges (Phase 6)
+### 11.5 No chrome over the video feed
+
+Nothing is drawn on top of the live/replay video tiles in either
+window. A `VideoWidget` shows the feed (or a full-surface placeholder
+when there is no video) and nothing else; `MultiFeedVideoPanel` keeps
+only the per-tile title label *outside* the video area. A later
+cleanup removed every on-feed overlay that earlier phases had added:
+
+- the panel-level playback-status pill (mode / `Play #N` /
+  behind-live / rate),
+- the per-tile "Display NNN×NNN px" resolution chip,
+- the per-tile amber "FROZEN" badge (Phase 6),
+- the floating `RefereePlayBadge` (referee) and `OperatorStatusOverlay`
+  (operator) play/clip counters,
+- the `build_playback_overlay_lines` formatter that fed them.
+
+The underlying data still flows on `UiState` /
+`PlaybackOverlayInfo` (play number, `seconds_behind_live`, rate,
+`feeds_in_freeze_frame`) and drives off-feed surfaces instead: the
+camera-ribbon selector label keeps the play/clip numbers, the referee
+Pause/Play button label reads the rate, and the diagnostic
+`StatusBarWidget` (when `[ui] show_diagnostics`) shows the status
+strip. `is_freeze` still selects the clamped freeze frame to render
+(§6.2) — only its badge was removed.
 
 `SegmentReplayLocation.is_freeze=True` for the three §8.6.1 clamping
 branches (before-earliest / after-latest / in-gap), `False` for exact
-coverage. Per-tile amber "FROZEN" badge in each `VideoWidget`'s top-right
-corner. Cleared on `jump_to_live` and on the recording-stop snap-back.
+coverage.
 
-### 11.6 PlaybackController still leans on the primary feed
+### 11.6 Referee jog wheel + step transport (Phase 14.F + later)
+
+The referee window's `JogWheel` (replaced the Phase 14.C
+`ScrubberSlider`) is a circular drag control: 1° of rotation = 1
+frame, counter-clockwise = forward, clockwise = rewind, with an
+inertial coast on release. A drawn direction guide (curved arrows +
+"FF" / "REW" labels) sits on the wheel face. The wheel is interactive
+only while a challenge lockout is active (Phase 14.F gate) and greys
+out otherwise. Each degree emits `seek_by_frames_requested(int)` wired
+to `PlaybackController.step_frames`, which is a pure seek-and-pause
+primitive: it always lands in PAUSED and clamps to the replayable
+range and the challenge fence (§14.D clip bounds).
+
+**Auto-pause / resume policy.** `step_frames` itself never resumes,
+but two gesture wrappers apply a configurable policy (defaults shown,
+all under `[replay]`):
+
+- **Jog wheel** (`jog_wheel_resume_after_release`, default `true`): the
+  wheel emits `jog_engaged` on touch and `jog_released` once it fully
+  settles (release + coast). `begin_jog()` captures the playback rate
+  at touch; `end_jog()` resumes at that rate when the gesture settles
+  (slow-mo is preserved; a pre-touch pause stays paused). `false`
+  keeps it paused after settling.
+- **Step buttons** (`step_button_resume_after_click`, default `false`):
+  `step_frames_button()` captures the pre-click rate, steps, and stays
+  paused by default; `true` resumes at the pre-click rate.
+- **Clip-start hold** (`hold_paused_at_clip_start`, default `true`):
+  overrides both of the above — when a jog/step lands the playhead at
+  the start of the clip (the challenge fence's lower edge, else
+  start-of-recording), it holds paused regardless.
+
+`_resume_or_hold` centralizes the decision and only resumes when the
+gesture actually left the controller in PAUSED, so a rejected or
+degraded step never spuriously starts playback. The Rewind button is
+unaffected — it already pauses when it crosses the clip-start fence.
+
+### 11.7 PlaybackController still leans on the primary feed
 
 Some replay paths still center the primary feed (`_primary_runtime`,
 `_primary_feed_id`) — `on_live_sample` only updates the overlay state
@@ -1306,9 +1369,10 @@ current behavior; on the architecture-doc "Still open" list.
   (`post_session_processor.py`, `long_form_export.py`,
   `plays_json_export.py`).
 - **`app/ui/`** — `MainWindow` (re-used for referee + operator with
-  flags), `controls_widget`, `multi_feed_video_panel`,
+  flags), `operator_controls_widget` / `referee_controls_widget`,
+  `jog_wheel` (referee transport), `multi_feed_video_panel`,
   `status_bar_widget`, `video_widget`, `diagnostics_widget`,
-  `recovery_dialog`.
+  `recovery_dialog`. No widget draws over the video tiles (§11.5).
 - **`tests/`** — fast unit tests using stdlib `unittest`. They mock or
   stub GStreamer where needed. Notable test contracts:
   - `test_replay_safety_invariants.py` — locks in §15.2 / §15.7
