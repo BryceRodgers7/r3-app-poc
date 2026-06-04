@@ -66,6 +66,14 @@ implementation actually does, and where the two differ.
 2. [`r3_app_architecture.md` §6.3 / §14](r3_app_architecture.md) —
    the canonical entity schemas.
 
+### "I'm investigating video quality, or considering a codec change"
+
+1. [`VIDEO_QUALITY_AND_CODECS.md`](VIDEO_QUALITY_AND_CODECS.md) — the
+   three stages where quality is lost (ingest downscale → MJPEG master
+   → H.264 re-encode), and why ProRes/DNxHR are export-only (not viable
+   on the live path). Read before tuning resolution/CRF or revisiting
+   the recording codec.
+
 ### "I'm setting up a dev environment"
 
 1. [`UCRT64_DEVELOPMENT.md`](UCRT64_DEVELOPMENT.md) — MSYS2 UCRT64
@@ -81,6 +89,7 @@ implementation actually does, and where the two differ.
 | [`r3_app_architecture.md`](r3_app_architecture.md) | Target production architecture spec. Authoritative for what the system *should* be. | A design decision changes the target. Phased plan progress is tracked here. |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | Current implementation reference. Authoritative for what the system *is*. | A state machine, lifecycle step, lock, thread, recovery edge case, or schema changes. |
 | [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) | GStreamer construction rules, each tied to a known failure mode. | A new GStreamer rule whose violation causes a non-obvious failure is introduced. |
+| [`VIDEO_QUALITY_AND_CODECS.md`](VIDEO_QUALITY_AND_CODECS.md) | The quality-loss stages from NDI source to MP4, and ProRes/DNxHR viability (export-only). | Quality behavior, resolution/CRF defaults, or codec support changes. |
 | [`../ARCHITECTURE.md`](../ARCHITECTURE.md) | Status snapshot of the current code's object graph. Older framing than `IMPLEMENTATION.md`; substantial overlap. | "Implemented today" / "Still open" lists need refreshing. |
 | [`../CLAUDE.md`](../CLAUDE.md) | Claude-specific working instructions for this repo. | A coding-tool-specific rule changes. |
 | [`UCRT64_DEVELOPMENT.md`](UCRT64_DEVELOPMENT.md) | Dev-env setup for MSYS2 UCRT64 + PyGObject. | The dev toolchain changes. |
