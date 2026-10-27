@@ -78,3 +78,5 @@ fly.toml.backup
 
 # video files
 *.mkv
+
+docs/setup-r3.md
