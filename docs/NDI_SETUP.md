@@ -162,7 +162,18 @@ enabled = true
 ```
 
 Replace `DAVIDI7` with the sender machine's hostname. If the sender is running
-on the same box as the app, that is `$env:COMPUTERNAME`. Keep the USB feed rows
+on the same box as the app, that is `$env:COMPUTERNAME`.
+
+Each NDI feed can also set `ndi_timestamp_mode`, which is passed to `ndisrc`'s
+`timestamp-mode` property. It defaults to `"receive-time-vs-timestamp"`, not
+ndisrc's own `"auto"`: with senders whose NDI timecodes advance in coarse
+steps (the Zowietek POV cameras), `auto` produces clumped timestamps and the
+app ends up with ~8 distinct fps in both preview and recording. Only override
+it if a specific sender misbehaves with the default — see
+[NDI_LOW_FPS_INVESTIGATION.md](NDI_LOW_FPS_INVESTIGATION.md). The 1Hz
+`telemetry feed_id=…` log line shows `source_fps` (what the sender delivers)
+and `vrate_dup_per_s`; a dup rate well above zero at steady state means the
+timestamps are still uneven. Keep the USB feed rows
 (`cam_a`, `cam_b`) with `enabled = false` unless you also want to run them.
 
 ## Launching the app

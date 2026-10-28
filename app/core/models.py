@@ -162,6 +162,9 @@ class FeedDefinition:
 
     `source_kind` accepts only `"ndi"` (production) or `"synthetic"` (dev
     fallback). USB / OpenCV camera ingest was removed in Phase 2.5.
+
+    `ndi_timestamp_mode` is passed to `ndisrc`'s `timestamp-mode`
+    property; None means `NDIReceiver`'s default.
     """
 
     feed_id: str
@@ -169,6 +172,7 @@ class FeedDefinition:
     source_kind: str = "synthetic"
     ndi_name: str | None = None
     enabled: bool = True
+    ndi_timestamp_mode: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

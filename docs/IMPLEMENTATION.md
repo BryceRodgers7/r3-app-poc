@@ -1092,6 +1092,23 @@ once per tick; sustained record saturation drives `RecordingState
 RECORDING_ERROR` and sustained preview saturation drives
 `FeedState DEGRADED` (slice 3.B).
 
+For native (NDI) feeds, `source_fps` is ticked by a probe on the
+ingest `videorate`'s sink pad (`PipelineManager._on_ingest_frame_probe`)
+— i.e. the sender's real rate, ahead of rate conversion and the tee.
+It used to be ticked on the preview branch past the leaky preview
+queue, which made it identical to `preview_fps`. `python_push` feeds
+still tick it at the preview appsink.
+`register_rate_conversion_sampler` runs
+`PipelineManager.sample_rate_conversion` once per tick to turn the
+ingest `videorate`'s cumulative `drop` / `duplicate` counters into
+`rate_dropped_per_sec` / `rate_duplicated_per_sec` (logged as
+`vrate_drop_per_s` / `vrate_dup_per_s`). A healthy `source_fps` with
+sustained duplicates means the sender's PTS are uneven — the
+signature of the `ndisrc` `timestamp-mode` problem in
+[NDI_LOW_FPS_INVESTIGATION.md](NDI_LOW_FPS_INVESTIGATION.md). The
+mode is per-feed (`[[feeds]] ndi_timestamp_mode`, default
+`receive-time-vs-timestamp` via `NDIReceiver`).
+
 **Invariants worth knowing before refactoring the hub:**
 
 - **Qt-decoupled.** `start(periodic_registrar)` accepts a callable —

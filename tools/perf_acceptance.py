@@ -232,7 +232,10 @@ def evaluate_pass_fail(
 
     Rules (all must hold):
       * Each feed's source_fps_p50 within 1% of `target_fps`.
-      * Each feed's recording_fps_p50 within 1% of its own source_fps_p50.
+      * Each feed's recording_fps_p50 within 1% of min(source_fps_p50,
+        target_fps). Native feeds count `source_fps` ahead of the ingest
+        `videorate`, so a sender faster than the target (59.94 → 30)
+        legitimately records at the target, not the sender's rate.
       * No feed's queue saturation (preview or recording) peak exceeds 75%.
       * No `recording_branch_saturated` / `disk_full*` events fired.
     """
@@ -248,11 +251,13 @@ def evaluate_pass_fail(
                 f"feed {feed.feed_id}: source_fps_p50={feed.source_fps_p50:.2f} "
                 f"below target_fps={target_fps:.2f} - 1% ({src_min:.2f})"
             )
-        rec_min = feed.source_fps_p50 * (1.0 - RECORDING_FPS_TOLERANCE)
+        expected_rec = min(feed.source_fps_p50, target_fps)
+        rec_min = expected_rec * (1.0 - RECORDING_FPS_TOLERANCE)
         if feed.recording_fps_p50 < rec_min:
             failures.append(
                 f"feed {feed.feed_id}: recording_fps_p50={feed.recording_fps_p50:.2f} "
-                f"below source_fps_p50={feed.source_fps_p50:.2f} - 1% ({rec_min:.2f})"
+                f"below min(source_fps_p50={feed.source_fps_p50:.2f}, "
+                f"target_fps={target_fps:.2f}) - 1% ({rec_min:.2f})"
             )
         if feed.queue_saturation_preview_max_pct > QUEUE_SATURATION_MAX_PCT:
             failures.append(

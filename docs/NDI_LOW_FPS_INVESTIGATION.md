@@ -4,6 +4,15 @@ Date: 2026-10-25
 Hardware under test: one Zowietek POV 4K camera (`POVZOOM-47800 (POVZoom-47800)`),
 wired 1 Gb Ethernet to the dev PC (Intel I219-LM), GStreamer 1.28.2 on MSYS2 UCRT64.
 
+> **Status (2026-10-27):** recommendations 1 and 4 are implemented on branch
+> `ndi-timestamp-mode`, pending the section 6 validation with the camera.
+> `ndisrc` now gets `timestamp-mode=receive-time-vs-timestamp` by default, with
+> a per-feed `ndi_timestamp_mode` override on `[[feeds]]` (and `[source]`).
+> `source_fps` is counted ahead of `videorate`, and the 1Hz telemetry line
+> gained `vrate_drop_per_s` / `vrate_dup_per_s`. Recommendations 2 and 3 are
+> not done. The "no config-file equivalent" notes below describe the code before
+> that branch.
+
 No application code or settings were changed during this investigation. Every
 result below comes from reading the code, today's `C:\SportsReplay\logs\app.log`
 and recordings, and running standalone `gst-launch-1.0` pipelines against the

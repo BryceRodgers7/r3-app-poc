@@ -454,6 +454,90 @@ kind = "auto"
         self.assertFalse(synthetic_source.supports_embedded_audio())
 
 
+class NdiTimestampModeSettingsTests(unittest.TestCase):
+    """`ndi_timestamp_mode` on `[[feeds]]` rows and the legacy `[source]` block."""
+
+    def _load(self, toml_text: str) -> AppSettings:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(toml_text.strip(), encoding="utf-8")
+            return AppSettings.load(config_path)
+
+    def test_unset_mode_is_none_so_receiver_default_applies(self) -> None:
+        settings = self._load(
+            """
+[[feeds]]
+feed_id = "cam"
+kind = "ndi"
+ndi_name = "Sender"
+"""
+        )
+        self.assertIsNone(settings.feeds_table_rows[0]["ndi_timestamp_mode"])
+        feed = FeedRegistry.build_default(settings).get_primary_feed()
+        self.assertIsNone(feed.ndi_timestamp_mode)
+        self.assertIsNone(AppSettings().ndi_timestamp_mode)
+
+    def test_feeds_row_mode_round_trips_to_feed_definition(self) -> None:
+        settings = self._load(
+            """
+[[feeds]]
+feed_id = "pov"
+kind = "ndi"
+ndi_name = "POV"
+ndi_timestamp_mode = "Receive-Time"
+
+[[feeds]]
+feed_id = "obs"
+kind = "ndi"
+ndi_name = "OBS"
+ndi_timestamp_mode = "auto"
+"""
+        )
+        feeds = FeedRegistry.build_default(settings).get_enabled_feeds()
+        # Values are normalized to the lower-case ndisrc enum nicks.
+        self.assertEqual(feeds[0].ndi_timestamp_mode, "receive-time")
+        self.assertEqual(feeds[1].ndi_timestamp_mode, "auto")
+
+    def test_legacy_source_block_mode_round_trips(self) -> None:
+        settings = self._load(
+            """
+[source]
+kind = "ndi"
+ndi_name = "Sender"
+ndi_timestamp_mode = "timestamp"
+"""
+        )
+        self.assertEqual(settings.ndi_timestamp_mode, "timestamp")
+        feed = FeedRegistry.build_default(settings).get_primary_feed()
+        self.assertEqual(feed.ndi_timestamp_mode, "timestamp")
+
+    def test_unknown_mode_rejected_in_feeds_row(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load(
+                """
+[[feeds]]
+feed_id = "cam"
+kind = "ndi"
+ndi_name = "Sender"
+ndi_timestamp_mode = "smooth"
+"""
+            )
+        self.assertIn("ndi_timestamp_mode", str(ctx.exception))
+        self.assertIn("receive-time-vs-timestamp", str(ctx.exception))
+
+    def test_unknown_mode_rejected_in_source_block(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load(
+                """
+[source]
+kind = "ndi"
+ndi_name = "Sender"
+ndi_timestamp_mode = "smooth"
+"""
+            )
+        self.assertIn("[source]", str(ctx.exception))
+
+
 class ReplayBlockTests(unittest.TestCase):
     """Phase 12.B: `[replay]` block parsing."""
 

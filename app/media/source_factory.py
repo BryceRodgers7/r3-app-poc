@@ -41,6 +41,7 @@ def build_source_for_feed(settings: AppSettings, feed: FeedDefinition) -> Source
             frame_width=settings.target_frame_width,
             frame_height=settings.target_frame_height,
             target_fps=settings.target_fps,
+            timestamp_mode=feed.ndi_timestamp_mode,
         )
     if kind == "synthetic":
         return TestSource(
@@ -67,5 +68,6 @@ def build_default_source(settings: AppSettings) -> SourceInterface:
             display_name=settings.default_source_name,
             source_kind=settings.default_source_kind,
             ndi_name=settings.ndi_source_name,
+            ndi_timestamp_mode=settings.ndi_timestamp_mode,
         ),
     )

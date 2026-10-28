@@ -124,6 +124,90 @@ class FeedMetricsTests(unittest.TestCase):
         self.assertEqual(snap.recording_fps, 0.0)
 
 
+class FeedMetricsRateConversionTests(unittest.TestCase):
+    """Ingest `videorate` drop / duplicate totals → per-second rates."""
+
+    def _metrics(self) -> tuple[FeedMetrics, FakeClock]:
+        clock = FakeClock()
+        return FeedMetrics(feed_id="ndi", display_name="NDI", clock=clock), clock
+
+    def test_defaults_to_zero_without_samples(self) -> None:
+        metrics, _ = self._metrics()
+        snap = metrics.snapshot()
+        self.assertEqual(snap.rate_dropped_per_sec, 0.0)
+        self.assertEqual(snap.rate_duplicated_per_sec, 0.0)
+
+    def test_first_sample_only_sets_baseline(self) -> None:
+        # Start-up back-fill can leave large totals; the first sample
+        # must not report them as a rate.
+        metrics, _ = self._metrics()
+        metrics.set_rate_conversion_totals(dropped=40, duplicated=120)
+        snap = metrics.snapshot()
+        self.assertEqual(snap.rate_dropped_per_sec, 0.0)
+        self.assertEqual(snap.rate_duplicated_per_sec, 0.0)
+
+    def test_rates_come_from_deltas_between_samples(self) -> None:
+        metrics, clock = self._metrics()
+        metrics.set_rate_conversion_totals(dropped=10, duplicated=20)
+        clock.advance(2.0)
+        metrics.set_rate_conversion_totals(dropped=56, duplicated=66)
+        snap = metrics.snapshot()
+        self.assertAlmostEqual(snap.rate_dropped_per_sec, 23.0)
+        self.assertAlmostEqual(snap.rate_duplicated_per_sec, 23.0)
+
+    def test_backwards_totals_rebaseline_after_rebuild(self) -> None:
+        metrics, clock = self._metrics()
+        metrics.set_rate_conversion_totals(dropped=500, duplicated=600)
+        clock.advance(1.0)
+        metrics.set_rate_conversion_totals(dropped=530, duplicated=630)
+        self.assertAlmostEqual(metrics.snapshot().rate_duplicated_per_sec, 30.0)
+        # Pipeline rebuilt → fresh videorate with counters back near zero.
+        clock.advance(1.0)
+        metrics.set_rate_conversion_totals(dropped=2, duplicated=3)
+        self.assertEqual(metrics.snapshot().rate_duplicated_per_sec, 0.0)
+        clock.advance(1.0)
+        metrics.set_rate_conversion_totals(dropped=2, duplicated=4)
+        self.assertAlmostEqual(metrics.snapshot().rate_duplicated_per_sec, 1.0)
+        self.assertEqual(metrics.snapshot().rate_dropped_per_sec, 0.0)
+
+
+class TelemetryHubRateConversionSamplerTests(unittest.TestCase):
+    def test_sampler_totals_reach_snapshot(self) -> None:
+        hub = TelemetryHub()
+        hub.register("ndi", "NDI")
+        totals = {"dropped": 0, "duplicated": 0}
+        hub.register_rate_conversion_sampler("ndi", lambda: dict(totals))
+        hub._log_all_snapshots()
+        totals["duplicated"] = 50
+        hub._log_all_snapshots()
+        self.assertGreater(hub.snapshot()[0].rate_duplicated_per_sec, 0.0)
+        self.assertEqual(hub.snapshot()[0].rate_dropped_per_sec, 0.0)
+
+    def test_none_and_raising_samplers_leave_rates_at_zero(self) -> None:
+        hub = TelemetryHub()
+        hub.register("synthetic", "Synthetic")
+        hub.register("flaky", "Flaky")
+        hub.register_rate_conversion_sampler("synthetic", lambda: None)
+
+        def boom() -> dict:
+            raise RuntimeError("sampler exploded")
+
+        hub.register_rate_conversion_sampler("flaky", boom)
+        with self.assertLogs("app.core.telemetry", level="INFO"):
+            hub._log_all_snapshots()
+            hub._log_all_snapshots()
+        for snap in hub.snapshot():
+            self.assertEqual(snap.rate_duplicated_per_sec, 0.0)
+
+    def test_log_line_includes_videorate_rates(self) -> None:
+        hub = TelemetryHub()
+        hub.register("ndi", "NDI")
+        with self.assertLogs("app.core.telemetry", level="INFO") as captured:
+            hub._log_all_snapshots()
+        self.assertIn("vrate_drop_per_s=0.00", captured.output[0])
+        self.assertIn("vrate_dup_per_s=0.00", captured.output[0])
+
+
 class TelemetryHubTests(unittest.TestCase):
     def test_register_returns_same_metrics_for_repeat_id(self) -> None:
         hub = TelemetryHub()

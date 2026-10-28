@@ -233,6 +233,9 @@ class PipelineManager:
         self._appsrc: Any | None = None
         self._audio_appsrc: Any | None = None
         self._native_audio_src_pad: Any | None = None
+        # Native sources' ingest `videorate`, polled by
+        # `sample_rate_conversion` for drop / duplicate counters.
+        self._ingest_rate_element: Any | None = None
         self._bus: Any | None = None
         self._tee_request_pads: list[Any] = []
         self._audio_tee_request_pads: list[Any] = []
@@ -960,6 +963,14 @@ class PipelineManager:
                         "Failed to link the native video src pad into the video tee."
                     )
                 self._native_audio_src_pad = chain["audio_src_pad"]
+                ingest_frame_pad = chain.get("ingest_frame_pad")
+                if ingest_frame_pad is not None:
+                    ingest_frame_pad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._on_ingest_frame_probe,
+                        None,
+                    )
+                self._ingest_rate_element = chain.get("rate_element")
                 self._appsrc = None
             else:
                 appsrc = self._make_element("appsrc", "source_appsrc")
@@ -981,6 +992,7 @@ class PipelineManager:
                 if not appsrc.link(source_convert) or not source_convert.link(tee):
                     raise RuntimeError("Failed to link the GStreamer source path.")
                 self._native_source_bin = None
+                self._ingest_rate_element = None
                 self._appsrc = appsrc
 
             self._pipeline = pipeline
@@ -1119,6 +1131,25 @@ class PipelineManager:
                 "max_time_ns": int(caps.get("max_size_time_ns", 0)),
             }
         return out
+
+    def sample_rate_conversion(self) -> dict[str, int] | None:
+        """Read the ingest `videorate`'s cumulative `drop` / `duplicate` counters.
+
+        Returns None for sources without an ingest rate converter
+        (`python_push`) or before the pipeline is built. Used by the
+        telemetry hub's periodic sampler; errors are swallowed like
+        `sample_queue_depths`.
+        """
+        element = self._ingest_rate_element
+        if element is None:
+            return None
+        try:
+            return {
+                "dropped": int(element.get_property("drop") or 0),
+                "duplicated": int(element.get_property("duplicate") or 0),
+            }
+        except Exception:
+            return None
 
     def _add_branch(self, branch_name: str) -> None:
         if branch_name == "preview":
@@ -1336,10 +1367,11 @@ class PipelineManager:
         Gst = self._Gst
         if Gst is None:
             return Gst.PadProbeReturn.OK if Gst is not None else 0
-        if self._feed_metrics is not None:
-            self._feed_metrics.tick_source()
-            if self._preview_running:
-                self._feed_metrics.tick_preview()
+        # `tick_source` lives on the ingest chain (`_on_ingest_frame_probe`);
+        # this point is past the leaky preview queue, so it only sees what
+        # the preview kept.
+        if self._feed_metrics is not None and self._preview_running:
+            self._feed_metrics.tick_preview()
         if self._preview_running and self._live_sample_callback is not None:
             buffer = info.get_buffer()
             pts_seconds: float | None = None
@@ -1360,6 +1392,17 @@ class PipelineManager:
             except Exception:
                 LOGGER.exception("native preview live_sample_callback raised")
         return Gst.PadProbeReturn.OK
+
+    def _on_ingest_frame_probe(self, _pad: Any, _info: Any, _user: Any) -> Any:
+        """Tick `source_fps` once per frame a native source delivered.
+
+        Sits on the ingest chain ahead of `videorate` and the tee, so the
+        count is the sender's real rate — not the rate-converted stream
+        the preview and record branches see. Metric tick only.
+        """
+        if self._feed_metrics is not None:
+            self._feed_metrics.tick_source()
+        return self._Gst.PadProbeReturn.OK
 
     def _add_record_branch_via_splitmuxsink(self, branch_name: str) -> None:
         """Native segmented recording branch (Phase 4.A).
@@ -3316,6 +3359,7 @@ class PipelineManager:
             self._preview_probe_pad = None
             self._preview_probe_id = None
             self._pipeline = None
+            self._ingest_rate_element = None
             self._appsrc = None
             self._audio_appsrc = None
             self._bus = None

@@ -51,6 +51,20 @@ _DEFAULT_RECORDING_QUEUE_POLICY: dict[str, Any] = {
 }
 _VALID_LEAKY_VALUES = {0, 1, 2}
 
+# `ndisrc` `timestamp-mode` enum nicks (gst-plugins-rs). A feed that
+# leaves `ndi_timestamp_mode` unset gets `NDIReceiver`'s default
+# (`receive-time-vs-timestamp`, not ndisrc's own `auto`) — see
+# `app/media/ndi_receiver.py` and docs/NDI_LOW_FPS_INVESTIGATION.md.
+_VALID_NDI_TIMESTAMP_MODES = {
+    "auto",
+    "receive-time-vs-timecode",
+    "receive-time-vs-timestamp",
+    "timecode",
+    "timestamp",
+    "receive-time",
+    "clocked",
+}
+
 # Per-codec encoder settings. Defaults match what the encoder factory
 # applies when no `[recording.encoder_settings]` block is present.
 # 11.C fixes 11.B's prores profile off-by-one (was integer 2 = standard;
@@ -80,6 +94,21 @@ def _validate_source_kind(kind: str, *, where: str) -> None:
         f"{where}: unsupported kind={kind!r}. Valid values are "
         f"{sorted(_VALID_SOURCE_KINDS)}."
     )
+
+
+def _parse_ndi_timestamp_mode(raw: Any, *, where: str) -> str | None:
+    """Normalize an `ndi_timestamp_mode` value; None/empty means "use the default"."""
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if not value:
+        return None
+    if value not in _VALID_NDI_TIMESTAMP_MODES:
+        raise RuntimeError(
+            f"{where}: ndi_timestamp_mode={value!r} is not supported. "
+            f"Valid values are {sorted(_VALID_NDI_TIMESTAMP_MODES)}."
+        )
+    return value
 
 
 def _validate_hwaccel(value: str, *, where: str) -> None:
@@ -290,6 +319,9 @@ class AppSettings:
     default_source_name: str = "Test Source"
     default_source_kind: str = "synthetic"
     ndi_source_name: str | None = None
+    # `ndisrc` timestamp-mode for the legacy [source] feed. None means
+    # NDIReceiver's default (`receive-time-vs-timestamp`).
+    ndi_timestamp_mode: str | None = None
     # Defaults chosen to keep the Python frame-callback path manageable.
     # 1280x720x3 = ~2.7 MB/frame; at 30 fps that's ~81 MB/s through the
     # GIL — comfortable for modern hardware. End-to-end 1080p requires
@@ -598,6 +630,10 @@ class AppSettings:
         if "ndi_name" in source_config:
             ndi_name = str(source_config["ndi_name"]).strip()
             settings.ndi_source_name = ndi_name or None
+        if "ndi_timestamp_mode" in source_config:
+            settings.ndi_timestamp_mode = _parse_ndi_timestamp_mode(
+                source_config["ndi_timestamp_mode"], where="[source]"
+            )
 
         settings.feeds_table_rows = cls._parse_feeds_table(data.get("feeds"))
 
@@ -621,6 +657,10 @@ class AppSettings:
             ndi_name = str(ndi_raw).strip() if ndi_raw is not None else None
             if ndi_name == "":
                 ndi_name = None
+            ndi_timestamp_mode = _parse_ndi_timestamp_mode(
+                row.get("ndi_timestamp_mode"),
+                where=f"[[feeds]] feed_id={feed_id!r}",
+            )
             enabled = bool(row.get("enabled", True))
             out.append(
                 {
@@ -628,6 +668,7 @@ class AppSettings:
                     "display_name": display_name or feed_id,
                     "source_kind": kind,
                     "ndi_name": ndi_name,
+                    "ndi_timestamp_mode": ndi_timestamp_mode,
                     "enabled": enabled,
                 }
             )

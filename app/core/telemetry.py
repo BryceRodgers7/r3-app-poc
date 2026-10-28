@@ -121,6 +121,11 @@ class FeedMetricsSnapshot:
     queue_depth_recording: int = 0
     queue_max_preview: int = 0
     queue_max_recording: int = 0
+    # Ingest `videorate` drop / duplicate rates (native sources only).
+    # Sustained duplicates with a healthy `source_fps` mean the sender's
+    # PTS are uneven — see docs/NDI_LOW_FPS_INVESTIGATION.md.
+    rate_dropped_per_sec: float = 0.0
+    rate_duplicated_per_sec: float = 0.0
 
     @property
     def record_queue_saturation_pct(self) -> float:
@@ -151,9 +156,13 @@ class FeedMetricsSnapshot:
 class FeedMetrics:
     """Per-feed counters wired at the ingest, preview, and recording seams.
 
-    `tick_source` fires at the head of the per-feed pipeline (one event per
-    inbound frame, regardless of branch). `tick_preview` and `tick_recording`
-    fire on the respective tee branch sinks. `tick_python_frame` fires once
+    `tick_source` fires once per frame the source delivered. Native sources
+    tick it on the ingest chain ahead of `videorate`, so it reports the
+    sender's real rate rather than the rate-converted one; `python_push`
+    sources tick it at the preview appsink. `tick_preview` and
+    `tick_recording` fire on the respective tee branch sinks.
+    `set_rate_conversion_totals` takes the ingest `videorate`'s cumulative
+    drop / duplicate counters from a 1Hz sampler. `tick_python_frame` fires once
     per frame that round-tripped through Python; native sources never tick
     it and should report `0.0`. `tick_dropped` fires once per GStreamer QOS
     bus message on the live pipeline. `recording_fps` is expected to be
@@ -176,6 +185,10 @@ class FeedMetrics:
         "_queue_depth_recording",
         "_queue_max_preview",
         "_queue_max_recording",
+        "_clock",
+        "_rate_totals",
+        "_rate_dropped_per_sec",
+        "_rate_duplicated_per_sec",
     )
 
     def __init__(
@@ -203,6 +216,12 @@ class FeedMetrics:
         self._queue_depth_recording = 0
         self._queue_max_preview = 0
         self._queue_max_recording = 0
+        self._clock = clock or time.monotonic
+        # (sample time, dropped total, duplicated total) from the last
+        # `set_rate_conversion_totals` call; None until the first sample.
+        self._rate_totals: tuple[float, int, int] | None = None
+        self._rate_dropped_per_sec = 0.0
+        self._rate_duplicated_per_sec = 0.0
 
     def tick_source(self) -> None:
         self._source.tick()
@@ -246,6 +265,29 @@ class FeedMetrics:
         self._queue_max_preview = max(0, int(preview_max_buffers))
         self._queue_max_recording = max(0, int(recording_max_buffers))
 
+    def set_rate_conversion_totals(self, *, dropped: int, duplicated: int) -> None:
+        """Update drop / duplicate rates from `videorate`'s cumulative counters.
+
+        Rates are computed against the previous call. A total that goes
+        backwards means the pipeline was rebuilt with a fresh `videorate`;
+        that sample only re-baselines and reports zero.
+        """
+        now = self._clock()
+        dropped = max(0, int(dropped))
+        duplicated = max(0, int(duplicated))
+        previous = self._rate_totals
+        self._rate_totals = (now, dropped, duplicated)
+        if previous is None:
+            return
+        prev_time, prev_dropped, prev_duplicated = previous
+        elapsed = now - prev_time
+        if elapsed <= 0 or dropped < prev_dropped or duplicated < prev_duplicated:
+            self._rate_dropped_per_sec = 0.0
+            self._rate_duplicated_per_sec = 0.0
+            return
+        self._rate_dropped_per_sec = (dropped - prev_dropped) / elapsed
+        self._rate_duplicated_per_sec = (duplicated - prev_duplicated) / elapsed
+
     def snapshot(self) -> FeedMetricsSnapshot:
         return FeedMetricsSnapshot(
             feed_id=self.feed_id,
@@ -261,6 +303,8 @@ class FeedMetrics:
             queue_depth_recording=self._queue_depth_recording,
             queue_max_preview=self._queue_max_preview,
             queue_max_recording=self._queue_max_recording,
+            rate_dropped_per_sec=self._rate_dropped_per_sec,
+            rate_duplicated_per_sec=self._rate_duplicated_per_sec,
         )
 
 
@@ -518,6 +562,12 @@ class TelemetryHub:
         self._queue_depth_samplers: dict[
             str, Callable[[], dict[str, dict[str, int]]]
         ] = {}
+        # Per-feed callbacks returning the ingest `videorate`'s cumulative
+        # `{"dropped": int, "duplicated": int}`, or None when the feed has
+        # no rate converter. Mirrors `PipelineManager.sample_rate_conversion`.
+        self._rate_conversion_samplers: dict[
+            str, Callable[[], dict[str, int] | None]
+        ] = {}
         # Streak counters for the §4.4 saturation health rules.
         self._record_saturated_streak: dict[str, int] = {}
         self._preview_saturated_streak: dict[str, int] = {}
@@ -570,6 +620,19 @@ class TelemetryHub:
         """
         with self._lock:
             self._queue_depth_samplers[feed_id] = sampler
+
+    def register_rate_conversion_sampler(
+        self,
+        feed_id: str,
+        sampler: Callable[[], dict[str, int] | None],
+    ) -> None:
+        """Register a callback returning the feed's ingest `videorate` counters.
+
+        Invoked once per `_log_all_snapshots` tick, like the queue-depth
+        sampler. Errors are caught and logged.
+        """
+        with self._lock:
+            self._rate_conversion_samplers[feed_id] = sampler
 
     def register_recording_state(self, state_machine: StateMachine[Any]) -> None:
         """Attach the global `RecordingState` machine for saturation-driven errors."""
@@ -647,14 +710,17 @@ class TelemetryHub:
         # both the log line and the saturation evaluator see the same
         # value within one tick.
         self._refresh_queue_depths()
+        self._refresh_rate_conversion()
         for snap in self.snapshot():
             LOGGER.info(
                 "telemetry feed_id=%s source_fps=%.2f preview_fps=%.2f recording_fps=%.2f "
-                "qprv=%d/%d qrec=%d/%d",
+                "vrate_drop_per_s=%.2f vrate_dup_per_s=%.2f qprv=%d/%d qrec=%d/%d",
                 snap.feed_id,
                 snap.source_fps,
                 snap.preview_fps,
                 snap.recording_fps,
+                snap.rate_dropped_per_sec,
+                snap.rate_duplicated_per_sec,
                 snap.queue_depth_preview,
                 snap.queue_max_preview,
                 snap.queue_depth_recording,
@@ -699,6 +765,29 @@ class TelemetryHub:
             metrics.set_queue_capacity(
                 preview_max_buffers=int(preview.get("max_buffers", 0) or 0),
                 recording_max_buffers=int(record.get("max_buffers", 0) or 0),
+            )
+
+    def _refresh_rate_conversion(self) -> None:
+        """Pull per-feed `videorate` counters from registered samplers into `FeedMetrics`."""
+        with self._lock:
+            samplers = list(self._rate_conversion_samplers.items())
+            feeds = dict(self._feeds)
+        for feed_id, sampler in samplers:
+            metrics = feeds.get(feed_id)
+            if metrics is None:
+                continue
+            try:
+                totals = sampler()
+            except Exception:
+                LOGGER.exception(
+                    "rate-conversion sampler raised for %s; skipping update", feed_id
+                )
+                continue
+            if totals is None:
+                continue
+            metrics.set_rate_conversion_totals(
+                dropped=int(totals.get("dropped", 0) or 0),
+                duplicated=int(totals.get("duplicated", 0) or 0),
             )
 
     def _evaluate_queue_saturation(self, snap: FeedMetricsSnapshot) -> None:

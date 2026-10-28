@@ -23,6 +23,14 @@ from app.media.source_interface import PipelineMode, SourceInterface
 
 LOGGER = logging.getLogger(__name__)
 
+# `ndisrc`'s own default (`auto`) resolves to `receive-time-vs-timecode`.
+# Senders with coarse NDI timecodes (the Zowietek POV camera) get PTS in
+# ~0.5 s clumps under that mode; `videorate` then drops most real frames
+# and duplicates the rest, so preview and recording both end up at ~8
+# distinct fps. `receive-time-vs-timestamp` keeps PTS evenly spaced for
+# those senders. See docs/NDI_LOW_FPS_INVESTIGATION.md.
+DEFAULT_NDI_TIMESTAMP_MODE = "receive-time-vs-timestamp"
+
 
 class NDIReceiver(SourceInterface):
     """Native NDI source providing a configured `Gst.Bin` to `PipelineManager`."""
@@ -39,10 +47,12 @@ class NDIReceiver(SourceInterface):
         frame_width: int,
         frame_height: int,
         target_fps: float,
+        timestamp_mode: str | None = None,
     ) -> None:
         self._source_name = source_name
         self._feed_id = feed_id
         self._ndi_name = ndi_name
+        self._timestamp_mode = timestamp_mode or DEFAULT_NDI_TIMESTAMP_MODE
         self._frame_width = frame_width
         self._frame_height = frame_height
         self._target_fps = max(target_fps, 1.0)
@@ -133,6 +143,10 @@ class NDIReceiver(SourceInterface):
     def get_nominal_fps(self) -> float:
         return self._target_fps
 
+    def get_timestamp_mode(self) -> str:
+        """Return the `ndisrc` `timestamp-mode` this receiver applies."""
+        return self._timestamp_mode
+
     def get_status_message(self) -> str | None:
         return self._status_message
 
@@ -148,6 +162,8 @@ class NDIReceiver(SourceInterface):
                 "elements": [Gst.Element, ...],   # add each to the parent pipeline
                 "video_src_pad": Gst.Pad,         # link to source tee.sink
                 "audio_src_pad": Gst.Pad,         # link to audio tee.sink
+                "ingest_frame_pad": Gst.Pad,      # one buffer per frame NDI delivered
+                "rate_element": Gst.Element,      # videorate (drop/duplicate counters)
             }
 
         or None on failure. Layout (matches the canonical gst-plugins-rs
@@ -224,6 +240,17 @@ class NDIReceiver(SourceInterface):
             self._status_message = f"Failed to set ndi-name: {exc}"
             LOGGER.warning(self._status_message)
             return None
+        try:
+            source.set_property("timestamp-mode", self._timestamp_mode)
+        except Exception as exc:
+            # Non-fatal: the feed still runs on ndisrc's default, which is
+            # only a problem for senders with coarse timecodes.
+            LOGGER.warning(
+                "NDI feed %s: failed to set timestamp-mode=%r (%s); ndisrc keeps its default.",
+                self._feed_id,
+                self._timestamp_mode,
+                exc,
+            )
 
         fps_fraction = Fraction(str(self._target_fps)).limit_denominator(1000)
         video_caps.set_property(
@@ -252,7 +279,10 @@ class NDIReceiver(SourceInterface):
             return None
 
         LOGGER.info(
-            "NDI chain built for feed_id=%s ndi_name=%r", self._feed_id, self._ndi_name
+            "NDI chain built for feed_id=%s ndi_name=%r timestamp_mode=%s",
+            self._feed_id,
+            self._ndi_name,
+            self._timestamp_mode,
         )
         # Stash references for the caller's `link_native_chain_static`.
         self._native_source = source
@@ -266,6 +296,10 @@ class NDIReceiver(SourceInterface):
             "elements": elements,
             "video_src_pad": video_src_pad,
             "audio_src_pad": audio_src_pad,
+            # videorate's input sees each frame NDI delivered exactly once
+            # (pre drop/duplicate), so it's the honest point for source_fps.
+            "ingest_frame_pad": video_rate.get_static_pad("sink"),
+            "rate_element": video_rate,
         }
 
     def link_native_chain_static(self) -> bool:

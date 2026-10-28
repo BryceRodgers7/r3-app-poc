@@ -130,12 +130,21 @@ disk_budget_mb_s = 200.0
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera
 # ingest was removed in Phase 2.5 — `kind = "auto"` is now an error.
+#
+# `ndi_timestamp_mode` (optional, per NDI feed) sets `ndisrc`'s
+# `timestamp-mode`. Default "receive-time-vs-timestamp". ndisrc's own
+# default ("auto") clumps PTS for senders with coarse NDI timecodes
+# (e.g. Zowietek POV cameras), which `videorate` turns into ~8 distinct
+# fps — see docs/NDI_LOW_FPS_INVESTIGATION.md. Other values: "auto",
+# "receive-time-vs-timecode", "timecode", "timestamp", "receive-time",
+# "clocked".
 
 [[feeds]]
 feed_id = "ndi_main"
 display_name = "Main Camera"
 kind = "ndi"
 ndi_name = "DAVIDI7 (Camera 1)"
+# ndi_timestamp_mode = "receive-time-vs-timestamp"
 enabled = true
 
 [[feeds]]

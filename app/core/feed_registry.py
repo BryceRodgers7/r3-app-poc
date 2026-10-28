@@ -48,6 +48,7 @@ class FeedRegistry:
                     display_name=settings.default_source_name,
                     source_kind=settings.default_source_kind,
                     ndi_name=settings.ndi_source_name,
+                    ndi_timestamp_mode=settings.ndi_timestamp_mode,
                 )
             ]
         )
@@ -85,4 +86,5 @@ def _feed_from_settings_row(row: dict[str, Any]) -> FeedDefinition:
         source_kind=str(row.get("source_kind", "synthetic")),
         ndi_name=row.get("ndi_name"),
         enabled=bool(row.get("enabled", True)),
+        ndi_timestamp_mode=row.get("ndi_timestamp_mode"),
     )

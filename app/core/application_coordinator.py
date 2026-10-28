@@ -983,6 +983,11 @@ def build_default_application_coordinator(
         telemetry_hub.register_queue_depth_sampler(
             feed.feed_id, pipeline_manager.sample_queue_depths
         )
+        # Ingest `videorate` drop / duplicate counters (native feeds;
+        # python_push feeds' sampler returns None).
+        telemetry_hub.register_rate_conversion_sampler(
+            feed.feed_id, pipeline_manager.sample_rate_conversion
+        )
         # Slice 3.C: visible startup log line per feed. Production-mode
         # warning is emitted by the diagnostics widget once the UI is
         # up; the log line below is enough to make the transitional

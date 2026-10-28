@@ -180,6 +180,19 @@ class EvaluatePassFailTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertTrue(any("recording_fps_p50" in f for f in failures))
 
+    def test_sender_faster_than_target_records_at_target(self) -> None:
+        # Native source_fps is the sender's rate (ahead of videorate):
+        # a 59.94 sender rate-converted to 30 records at 30 and passes.
+        feeds = [_make_feed_stats(source_fps_p50=59.94, recording_fps_p50=30.0)]
+        passed, failures = evaluate_pass_fail(feeds, [], target_fps=30.0)
+        self.assertTrue(passed, failures)
+
+    def test_recording_below_target_fails_for_fast_sender(self) -> None:
+        feeds = [_make_feed_stats(source_fps_p50=59.94, recording_fps_p50=29.6)]
+        passed, failures = evaluate_pass_fail(feeds, [], target_fps=30.0)
+        self.assertFalse(passed)
+        self.assertTrue(any("recording_fps_p50" in f for f in failures))
+
     def test_preview_queue_saturation_over_75_fails(self) -> None:
         feeds = [_make_feed_stats(preview_sat=QUEUE_SATURATION_MAX_PCT + 0.1)]
         passed, failures = evaluate_pass_fail(feeds, [], target_fps=30.0)

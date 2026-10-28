@@ -11,6 +11,7 @@ import unittest
 
 from app.config.settings import AppSettings
 from app.core.models import FeedDefinition
+from app.media.ndi_receiver import DEFAULT_NDI_TIMESTAMP_MODE, NDIReceiver
 from app.media.source_factory import ConfigError, VALID_SOURCE_KINDS, build_source_for_feed
 from app.media.test_source import TestSource
 
@@ -47,6 +48,31 @@ class BuildSourceForFeedTests(unittest.TestCase):
         with self.assertRaises(ConfigError) as ctx:
             build_source_for_feed(settings, feed)
         self.assertIn("Phase 2.5", str(ctx.exception))
+
+    def test_ndi_kind_defaults_timestamp_mode_when_unset(self) -> None:
+        settings = AppSettings()
+        feed = FeedDefinition(
+            feed_id="feed_ndi",
+            display_name="NDI",
+            source_kind="ndi",
+            ndi_name="Sender",
+        )
+        source = build_source_for_feed(settings, feed)
+        self.assertIsInstance(source, NDIReceiver)
+        self.assertEqual(source.get_timestamp_mode(), DEFAULT_NDI_TIMESTAMP_MODE)
+        self.assertEqual(DEFAULT_NDI_TIMESTAMP_MODE, "receive-time-vs-timestamp")
+
+    def test_ndi_kind_passes_feed_timestamp_mode(self) -> None:
+        settings = AppSettings()
+        feed = FeedDefinition(
+            feed_id="feed_ndi",
+            display_name="NDI",
+            source_kind="ndi",
+            ndi_name="Sender",
+            ndi_timestamp_mode="auto",
+        )
+        source = build_source_for_feed(settings, feed)
+        self.assertEqual(source.get_timestamp_mode(), "auto")
 
     def test_valid_kinds_set(self) -> None:
         self.assertEqual(VALID_SOURCE_KINDS, {"ndi", "synthetic"})
