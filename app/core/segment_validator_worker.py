@@ -13,6 +13,11 @@ The worker is deliberately decoupled from `PipelineManager`: producers
 construct one and call `submit(...)` per finalized segment. Consumers
 (tests, future tooling) can drive the same logic synchronously via
 `run_one(...)`.
+
+Submit only fully written files: `PipelineManager` waits for
+splitmuxsink's `splitmuxsink-fragment-closed` message, because a file
+checked mid-trailer fails validation. As a backstop the worker re-checks
+a failed file once, after `retry_delay_seconds`, before quarantining it.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import logging
 from pathlib import Path
 import queue
 import threading
+import time
 from typing import Any
 
 from app.core.health_events import (
@@ -62,11 +68,15 @@ class SegmentValidatorWorker:
         *,
         validator: SegmentValidator | None = None,
         health_log: HealthEventLog | None = None,
+        retry_delay_seconds: float = 1.0,
     ) -> None:
         self._feed_id = feed_id
         self._validator: SegmentValidator = (
             validator if validator is not None else _default_segment_validator
         )
+        # Pause before the one re-check of a segment that failed
+        # validation (see `_process_task`).
+        self._retry_delay_seconds = max(0.0, float(retry_delay_seconds))
         self._health_log = health_log if health_log is not None else default_log()
         # `queue.SimpleQueue` is thread-safe and (unlike `queue.Queue`)
         # never raises on a get/put under unusual interpreter shutdown
@@ -191,15 +201,21 @@ class SegmentValidatorWorker:
             self._mark_quarantined_in_storage(task, new_path=file_path)
             self._emit_quarantine_event(file_path, reason="file_missing")
             return SegmentValidationResult(is_valid=False)
-        try:
-            result = self._validator(file_path)
-        except Exception:
-            LOGGER.exception(
-                "segment-validator[%s] validator raised for %s; treating as invalid",
+        result = self._run_validator(file_path)
+        if not result.is_valid:
+            # Look once more before quarantining. `PipelineManager` only
+            # submits after splitmuxsink reports the file closed, but a
+            # segment submitted at teardown (or after a missed close
+            # message) can still be mid-trailer; a good file passes on
+            # the second look.
+            LOGGER.info(
+                "segment-validator[%s] %s failed validation; re-checking in %.1fs",
                 self._feed_id,
-                file_path,
+                file_path.name,
+                self._retry_delay_seconds,
             )
-            result = SegmentValidationResult(is_valid=False)
+            time.sleep(self._retry_delay_seconds)
+            result = self._run_validator(file_path)
         if result.is_valid:
             return result
         try:
@@ -214,6 +230,17 @@ class SegmentValidatorWorker:
         self._mark_quarantined_in_storage(task, new_path=new_path)
         self._emit_quarantine_event(new_path, reason="invalid")
         return result
+
+    def _run_validator(self, file_path: Path) -> SegmentValidationResult:
+        try:
+            return self._validator(file_path)
+        except Exception:
+            LOGGER.exception(
+                "segment-validator[%s] validator raised for %s; treating as invalid",
+                self._feed_id,
+                file_path,
+            )
+            return SegmentValidationResult(is_valid=False)
 
     def _mark_quarantined_in_storage(
         self, task: _ValidationTask, *, new_path: Path

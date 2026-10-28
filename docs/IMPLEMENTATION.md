@@ -351,7 +351,9 @@ Per app, at runtime:
   `new-sample` signal handlers, splitmuxsink's `format-location`
   callback, `prepare-window-handle` sync bus messages.
 - **Bus monitor thread (per pipeline)** — `_monitor_bus_loop` polls
-  asynchronous bus messages (`ERROR`, `WARNING`, `INFO`, `EOS`, `QOS`).
+  asynchronous bus messages (`ERROR`, `WARNING`, `INFO`, `EOS`, `QOS`,
+  and `ELEMENT` for `splitmuxsink-fragment-closed`, which releases a
+  finalized segment to the mid-session validator — see §7.2).
 - **Frame feed thread (python_push only)** — `_feed_appsrc_loop`,
   pushes synthetic frames into `appsrc`. Native sources don't have
   one — they ingest natively.
@@ -371,6 +373,7 @@ limited:
 |---|---|---|---|
 | `_pipeline_lock` | `PipelineManager` | tree mutations against streaming-thread reads | `threading.Lock` |
 | `_metadata_lock` | `PipelineManager` | `_frame_metadata` ring buffer (python_push appsink callback) | `threading.Lock` |
+| `_segment_close_lock` | `PipelineManager` | segments awaiting their file-closed message (streaming thread finalize vs. bus thread) | `threading.Lock` |
 | `_write_lock` | `MetadataDb` | SQLite writes from streaming thread + Qt main thread | `threading.Lock` |
 | `_lock` | `SegmentIndex` | per-feed list mutations | `threading.Lock` |
 | `_lock` | `PlaybackController` | UiState + replay clock | **`threading.RLock`** |
@@ -905,6 +908,22 @@ reconciles against SQLite:
 
 Files not matching the `segment_NNNNN.(mkv|mov)` pattern are skipped
 (zero-byte files, leftover tooling output, etc.).
+
+**Mid-session validation (Phase 10.E).** While recording, each
+finalized segment is also checked by the feed's `SegmentValidatorWorker`
+(`app/core/segment_validator_worker.py`) with the same validator; a
+failure quarantines the file, marks the row `quarantined`, evicts it
+from the `SegmentIndex` (replay then holds the previous frame across the
+hole) and emits `segment_quarantined_runtime`. Timing matters:
+`_finalize_pending_segment_locked` runs from `format-location` for the
+*next* fragment, while `async-finalize` is still writing the old
+fragment's matroskamux trailer, and a check at that instant fails on
+good files. So `PipelineManager._validate_segment_once_closed` holds
+the task until the bus thread sees `splitmuxsink-fragment-closed` for
+that file. `disable_file_recording` and `stop_all` submit anything still
+waiting once splitmuxsink / the pipeline is at NULL. The worker also
+re-checks a failed file once, after `retry_delay_seconds` (1s), before
+quarantining it.
 
 ### 7.3 Resume continuation (Phase 7.D)
 

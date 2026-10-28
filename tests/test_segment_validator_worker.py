@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
+from unittest import mock
 
 from app.core.health_events import HealthEventLog, HealthSeverity
 import app.core.health_events as health_events
@@ -133,6 +134,7 @@ class SyncQuarantineTests(unittest.TestCase):
             worker = SegmentValidatorWorker(
                 "cam_a",
                 validator=lambda _: SegmentValidationResult(is_valid=False),
+                retry_delay_seconds=0.0,
             )
             worker.run_one(
                 seg,
@@ -155,6 +157,7 @@ class SyncQuarantineTests(unittest.TestCase):
         worker = SegmentValidatorWorker(
             "cam_a",
             validator=lambda _: SegmentValidationResult(is_valid=False),
+            retry_delay_seconds=0.0,
         )
         worker.run_one(
             seg,
@@ -175,6 +178,7 @@ class SyncQuarantineTests(unittest.TestCase):
         worker = SegmentValidatorWorker(
             "cam_a",
             validator=lambda _: SegmentValidationResult(is_valid=False),
+            retry_delay_seconds=0.0,
         )
         worker.run_one(
             seg,
@@ -216,7 +220,9 @@ class SyncQuarantineTests(unittest.TestCase):
         def boom(_):
             raise RuntimeError("validator crash")
 
-        worker = SegmentValidatorWorker("cam_a", validator=boom)
+        worker = SegmentValidatorWorker(
+            "cam_a", validator=boom, retry_delay_seconds=0.0
+        )
         worker.run_one(
             seg,
             quarantine_dir=self.quarantine_dir,
@@ -226,6 +232,79 @@ class SyncQuarantineTests(unittest.TestCase):
         self.assertFalse(file_path.exists())
         self.assertEqual(self.index.all_for_feed("cam_a"), [])
 
+    def test_failed_check_passing_on_retry_is_not_quarantined(self) -> None:
+        # A file caught mid-trailer fails the first look and passes the
+        # second; it must stay in place and in the index.
+        with _LogPatch() as log:
+            file_path = _make_file(self.recording_dir, "segment_00000.mkv")
+            seg = self._add_segment(file_path)
+            outcomes = [False, True]
+
+            def validate(_):
+                return SegmentValidationResult(is_valid=outcomes.pop(0))
+
+            worker = SegmentValidatorWorker(
+                "cam_a", validator=validate, retry_delay_seconds=0.0
+            )
+            result = worker.run_one(
+                seg,
+                quarantine_dir=self.quarantine_dir,
+                metadata_db=self.db,
+                segment_index=self.index,
+            )
+            self.assertTrue(result.is_valid)
+            self.assertEqual(outcomes, [])
+            self.assertTrue(file_path.exists())
+            self.assertEqual(len(self.index.all_for_feed("cam_a")), 1)
+            self.assertFalse(
+                log.has_open_event(
+                    category="segment_quarantined_runtime", feed_id="cam_a"
+                )
+            )
+
+    def test_invalid_file_checked_twice_with_delay_before_quarantine(self) -> None:
+        file_path = _make_file(self.recording_dir, "segment_00000.mkv")
+        seg = self._add_segment(file_path)
+        calls: list[Path] = []
+
+        def validate(path):
+            calls.append(path)
+            return SegmentValidationResult(is_valid=False)
+
+        worker = SegmentValidatorWorker(
+            "cam_a", validator=validate, retry_delay_seconds=1.5
+        )
+        with mock.patch("app.core.segment_validator_worker.time.sleep") as sleep:
+            worker.run_one(
+                seg,
+                quarantine_dir=self.quarantine_dir,
+                metadata_db=self.db,
+                segment_index=self.index,
+            )
+        sleep.assert_called_once_with(1.5)
+        self.assertEqual(calls, [file_path, file_path])
+        self.assertFalse(file_path.exists())
+
+    def test_valid_file_checked_once_without_delay(self) -> None:
+        file_path = _make_file(self.recording_dir, "segment_00000.mkv")
+        seg = self._add_segment(file_path)
+        calls: list[Path] = []
+
+        def validate(path):
+            calls.append(path)
+            return SegmentValidationResult(is_valid=True)
+
+        worker = SegmentValidatorWorker("cam_a", validator=validate)
+        with mock.patch("app.core.segment_validator_worker.time.sleep") as sleep:
+            worker.run_one(
+                seg,
+                quarantine_dir=self.quarantine_dir,
+                metadata_db=self.db,
+                segment_index=self.index,
+            )
+        sleep.assert_not_called()
+        self.assertEqual(len(calls), 1)
+
     def test_quarantine_event_severity_is_warning(self) -> None:
         with _LogPatch() as log:
             file_path = _make_file(self.recording_dir, "segment_00000.mkv")
@@ -233,6 +312,7 @@ class SyncQuarantineTests(unittest.TestCase):
             worker = SegmentValidatorWorker(
                 "cam_a",
                 validator=lambda _: SegmentValidationResult(is_valid=False),
+                retry_delay_seconds=0.0,
             )
             worker.run_one(
                 seg,
@@ -254,6 +334,7 @@ class SyncQuarantineTests(unittest.TestCase):
         worker = SegmentValidatorWorker(
             "cam_a",
             validator=lambda _: SegmentValidationResult(is_valid=False),
+            retry_delay_seconds=0.0,
         )
         worker.run_one(
             seg,

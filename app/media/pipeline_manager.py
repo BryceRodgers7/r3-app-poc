@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 import importlib
 import logging
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -125,6 +126,11 @@ def purge_unrouted_segments() -> None:
             LOGGER.exception("could not remove unrouted segment %s", entry)
 
 
+def _segment_path_key(path: str) -> str:
+    """Normalize a segment path so splitmuxsink's `location` matches `Segment.file_path`."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
 @dataclass(slots=True)
 class _FrameMetadata:
     """Tracks source-side metadata while buffers fan out through GStreamer."""
@@ -226,6 +232,13 @@ class PipelineManager:
         self._segment_validator_worker = SegmentValidatorWorker(
             self._source.get_feed_id()
         )
+        # Validation of a finalized segment waits for splitmuxsink to
+        # report its file closed (`_validate_segment_once_closed`).
+        # Keyed by `_segment_path_key`; `_closed_segment_paths` holds
+        # close messages that arrived before their segment finalized.
+        self._segment_close_lock = threading.Lock()
+        self._segments_awaiting_close: dict[str, tuple[Segment, Path, Any, Any]] = {}
+        self._closed_segment_paths: set[str] = set()
 
         self._Gst: Any | None = None
         self._GstVideo: Any | None = None
@@ -583,6 +596,9 @@ class PipelineManager:
                     "splitmuxsink NULL transition failed on disable for feed_id=%s",
                     self._recording_feed_id,
                 )
+        # At NULL every fragment file is closed; validate any segment
+        # whose close message hasn't been read off the bus yet.
+        self._submit_segments_awaiting_close()
 
         # 6. Flush the audio mux-branch so no opus packet survives the
         # gap between games.
@@ -653,6 +669,10 @@ class PipelineManager:
 
         self._teardown_pipeline()
         self._source.disconnect_source()
+        # The pipeline is at NULL, so every fragment file is closed and
+        # the bus thread that would have read their close messages has
+        # exited — validate whatever was still waiting.
+        self._submit_segments_awaiting_close()
         # Phase 10.E: drain the validator worker so any finalized
         # segments still in its queue get checked before the pipeline
         # is rebuilt or torn down for good. 5s budget is generous —
@@ -2093,9 +2113,10 @@ class PipelineManager:
         # the validator finds it corrupt, the worker quarantines the
         # file, marks the DB row, evicts from the index, and emits a
         # `segment_quarantined_runtime` health event. Validation runs
-        # on a daemon thread so finalize itself stays cheap. `getattr`
-        # tolerates the older PipelineManager.__new__-bypassing test
-        # stubs that don't initialize the worker attribute.
+        # on a daemon thread so finalize itself stays cheap, and only
+        # once the file is closed (`_validate_segment_once_closed`).
+        # `getattr` tolerates the older PipelineManager.__new__-bypassing
+        # test stubs that don't initialize the worker attribute.
         worker = getattr(self, "_segment_validator_worker", None)
         if (
             worker is not None
@@ -2106,16 +2127,89 @@ class PipelineManager:
                 feed_paths = self._recording_session_paths.get_feed_paths(
                     segment.feed_id
                 )
-                worker.submit(
-                    segment,
-                    quarantine_dir=feed_paths.quarantine_dir,
-                    metadata_db=self._metadata_db,
-                    segment_index=self._segment_index,
+                self._validate_segment_once_closed(
+                    segment, quarantine_dir=feed_paths.quarantine_dir
                 )
             except Exception:
                 LOGGER.exception(
                     "segment-validator submit failed for %s", file_path
                 )
+
+    def _validate_segment_once_closed(
+        self, segment: Segment, *, quarantine_dir: Path
+    ) -> None:
+        """Submit `segment` for validation once splitmuxsink has closed its file.
+
+        Finalize runs from `format-location` for the NEXT fragment, but
+        with `async-finalize` the old fragment's muxer is still writing
+        its trailer at that point. Validating then intermittently failed
+        good files and quarantined them, which left segment-sized holes
+        in replay. The task waits here until the bus thread sees
+        `splitmuxsink-fragment-closed` for the file
+        (`_on_segment_file_closed`), or goes out immediately if that
+        message already arrived.
+        """
+        submission = (segment, quarantine_dir, self._metadata_db, self._segment_index)
+        key = _segment_path_key(segment.file_path)
+        with self._segment_close_lock:
+            already_closed = key in self._closed_segment_paths
+            if already_closed:
+                self._closed_segment_paths.discard(key)
+            else:
+                self._segments_awaiting_close[key] = submission
+        if already_closed:
+            self._submit_segment_validation(*submission)
+
+    def _on_segment_file_closed(self, location: str) -> None:
+        """Bus-thread handler for splitmuxsink's `splitmuxsink-fragment-closed`."""
+        key = _segment_path_key(location)
+        with self._segment_close_lock:
+            submission = self._segments_awaiting_close.pop(key, None)
+            if submission is None:
+                # Closed before its finalize ran, or a file that never
+                # gets a DB row (empty / post-split throwaway segment).
+                self._closed_segment_paths.add(key)
+                return
+        self._submit_segment_validation(*submission)
+
+    def _submit_segments_awaiting_close(self) -> None:
+        """Submit every segment still waiting on a close message.
+
+        Callers invoke this once splitmuxsink (or the whole pipeline) is
+        at NULL, which closes every fragment file, so any close message
+        not yet read off the bus no longer matters.
+        """
+        lock = getattr(self, "_segment_close_lock", None)
+        if lock is None:
+            return  # PipelineManager.__new__ test stub
+        with lock:
+            pending = list(self._segments_awaiting_close.values())
+            self._segments_awaiting_close.clear()
+            self._closed_segment_paths.clear()
+        for submission in pending:
+            self._submit_segment_validation(*submission)
+
+    def _submit_segment_validation(
+        self,
+        segment: Segment,
+        quarantine_dir: Path,
+        metadata_db: Any,
+        segment_index: Any,
+    ) -> None:
+        worker = getattr(self, "_segment_validator_worker", None)
+        if worker is None:
+            return
+        try:
+            worker.submit(
+                segment,
+                quarantine_dir=quarantine_dir,
+                metadata_db=metadata_db,
+                segment_index=segment_index,
+            )
+        except Exception:
+            LOGGER.exception(
+                "segment-validator submit failed for %s", segment.file_path
+            )
 
     def _on_record_branch_buffer_probe(self, _pad: Any, _info: Any, _user: Any) -> Any:
         """Tick the recording-fps metric when the operator is actively recording."""
@@ -2954,6 +3048,8 @@ class PipelineManager:
             | Gst.MessageType.INFO
             | Gst.MessageType.EOS
             | Gst.MessageType.QOS
+            # `splitmuxsink-fragment-closed` gates segment validation.
+            | Gst.MessageType.ELEMENT
         )
         while not self._stop_event.is_set():
             if self._poll_bus_for_messages(
@@ -3127,6 +3223,17 @@ class PipelineManager:
                 self._preview_output.show_placeholder_message("GStreamer pipeline reached EOS.")
                 self._stop_event.set()
                 return True
+            return False
+
+        if mtype == Gst.MessageType.ELEMENT:
+            structure = message.get_structure()
+            if (
+                structure is not None
+                and structure.get_name() == "splitmuxsink-fragment-closed"
+            ):
+                location = structure.get_string("location")
+                if location:
+                    self._on_segment_file_closed(location)
             return False
 
         return False
