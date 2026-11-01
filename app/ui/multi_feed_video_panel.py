@@ -12,6 +12,7 @@ from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from app.core.models import FeedDefinition, PlaybackMode
+from app.ui.feed_view import FeedView
 from app.ui.video_widget import VideoWidget
 
 
@@ -66,6 +67,7 @@ class MultiFeedVideoPanel(QWidget):
         # `_cells` so `set_tile_visible` can reflow the grid without
         # re-creating them.
         self._cells: dict[str, QWidget] = {}
+        self._titles: dict[str, QLabel] = {}
         self._visible: dict[str, bool] = {}
         self._title_height = 0
         # (visible feed ids, columns) last applied to the grid, so a
@@ -92,6 +94,7 @@ class MultiFeedVideoPanel(QWidget):
             cell_layout.addWidget(tile, stretch=1)
             self._tiles[feed.feed_id] = tile
             self._cells[feed.feed_id] = cell
+            self._titles[feed.feed_id] = title
             self._visible[feed.feed_id] = True
             self._title_height = title.sizeHint().height() + _TITLE_SPACING
 
@@ -129,6 +132,26 @@ class MultiFeedVideoPanel(QWidget):
         live = mode == PlaybackMode.LIVE
         for tile in self._tiles.values():
             tile.set_video_surface_visible(show_video, live=live)
+
+    def enable_zoom_pan(self, aspect_ratio: float) -> None:
+        """Let each tile hold its own zoom and pan.
+
+        The zoom level shows in the tile's title. A review call shouldn't
+        rest on a magnified picture nobody can tell is magnified, and
+        nothing can be drawn over the video to say so.
+        """
+        for feed in self._feeds:
+            tile = self._tiles[feed.feed_id]
+            tile.enable_zoom_pan(aspect_ratio)
+            tile.view_changed.connect(
+                lambda view, feed=feed: self._show_zoom_in_title(feed, view)
+            )
+
+    def _show_zoom_in_title(self, feed: FeedDefinition, view: FeedView) -> None:
+        name = feed.display_name
+        self._titles[feed.feed_id].setText(
+            f"{name}  {view.zoom:.1f}×" if view.is_zoomed else name
+        )
 
     def set_global_placeholder(self, text: str) -> None:
         """Apply the same placeholder to every tile (e.g. source lost)."""

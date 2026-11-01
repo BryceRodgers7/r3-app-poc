@@ -419,7 +419,8 @@ class AppSettings:
     # `jog_wheel_resume_after_release` (default True): when the referee
     # touches the jog wheel and lets it settle (release + inertia
     # stop), playback resumes at whatever rate it was at before the
-    # touch. False keeps it paused after the wheel settles.
+    # touch. False keeps it paused after the wheel settles. The review
+    # seek bar follows the same setting.
     #
     # `step_button_resume_after_click` (default False): the Step ◀ / ▶
     # buttons stay paused after a click by default; True makes them

@@ -224,6 +224,20 @@ class ApplicationCoordinator:
             return
         runtime.pipeline_manager.set_native_preview_window_handle(role, window_handle)
 
+    def set_native_preview_render_rectangle(
+        self, role: str, feed_id: str, rect: tuple[int, int, int, int]
+    ) -> None:
+        """Draw `feed_id`'s native preview into `rect` of its window.
+
+        This is how a tile zooms and pans live video. No-op for feeds
+        that aren't on the native path: those draw through `VideoWidget`,
+        which applies the view itself.
+        """
+        if self.is_native_preview_active(feed_id):
+            self._feed_runtimes[feed_id].pipeline_manager.set_native_preview_render_rectangle(
+                role, rect
+            )
+
     def is_native_preview_active(self, feed_id: str) -> bool:
         """Return True when `feed_id` is using the d3d11 native-preview path."""
         runtime = self._feed_runtimes.get(feed_id)

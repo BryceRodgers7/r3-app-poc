@@ -73,7 +73,10 @@ class ControlRailLayoutTests(_QtTestCase):
                 window.show()
                 QApplication.processEvents()
                 panel = window.video_panel
-                self.assertEqual(panel.height(), 860 - 2 * _LAYOUT_GAP)
+                expected_height = 860 - 2 * _LAYOUT_GAP
+                if window.review_seek_bar is not None:
+                    expected_height -= window.review_seek_bar.height() + _LAYOUT_GAP
+                self.assertEqual(panel.height(), expected_height)
                 self.assertEqual(
                     panel.width(),
                     1280 - _CONTROL_RAIL_WIDTH - 3 * _LAYOUT_GAP,

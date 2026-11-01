@@ -106,6 +106,7 @@ disk_budget_mb_s = 200.0
 #   jog_wheel_resume_after_release (default true)  — after the jog
 #     wheel settles, resume playback at the rate it had before you
 #     touched it. Set false to stay paused after the wheel settles.
+#     The review seek bar follows this setting too.
 #   step_button_resume_after_click (default false) — Step ◀ / ▶ stay
 #     paused after a click. Set true to resume at the pre-click rate.
 #   hold_paused_at_clip_start (default true) — overrides the two flags

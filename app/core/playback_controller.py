@@ -905,12 +905,10 @@ class PlaybackController:
         that case we fall back to the segment store's `latest` so the
         fence still bounds the upper edge.
         """
-        if self._clip_bounds is None:
+        bounds = self._resolved_clip_bounds_locked()
+        if bounds is None:
             return target_session_time_ns, False, False
-        start_ns, end_ns = self._clip_bounds
-        if end_ns is None:
-            _, latest = self._replay_store.available_session_time_range()
-            end_ns = latest if latest is not None else start_ns
+        start_ns, end_ns = bounds
         clamped_low = target_session_time_ns < start_ns
         clamped_high = target_session_time_ns > end_ns
         if clamped_low:
@@ -918,6 +916,16 @@ class PlaybackController:
         if clamped_high:
             return end_ns, False, True
         return target_session_time_ns, False, False
+
+    def _resolved_clip_bounds_locked(self) -> tuple[int, int] | None:
+        """The active fence as `(start, end)`, or None when there isn't one."""
+        if self._clip_bounds is None:
+            return None
+        start_ns, end_ns = self._clip_bounds
+        if end_ns is None:
+            _, latest = self._replay_store.available_session_time_range()
+            end_ns = latest if latest is not None else start_ns
+        return start_ns, end_ns
 
     def _resolve_pause_anchor_locked(self) -> int | None:
         """Pick a session-time to freeze on when the operator presses Pause.
@@ -1212,6 +1220,8 @@ class PlaybackController:
             self._state.current_clip_number = None
             self._state.current_clip_type = None
             self._state.current_clip_marked = False
+        self._state.review_range_ns = self._resolved_clip_bounds_locked()
+        self._state.playback_position_ns = self._playback_session_time_ns
         if latest_session_time_ns is None:
             self._state.live_lag_behind_replayable_seconds = 0.0
         elif self._session_clock is not None:

@@ -170,5 +170,106 @@ class PipelineManagerNativeWindowBindingTests(unittest.TestCase):
         self.assertEqual(pm._operator_window_handle, 0x1234)
 
 
+class PipelineManagerRenderRectangleTests(unittest.TestCase):
+    """A tile zooms live video through its sink's render rectangle."""
+
+    def _manager(self):
+        from unittest.mock import MagicMock
+        from app.media.pipeline_manager import PipelineManager
+
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._pipeline_lock = __import__("threading").Lock()
+        pm._referee_window_handle = None
+        pm._operator_window_handle = None
+        pm._referee_render_rect = None
+        pm._operator_render_rect = None
+        pm._referee_preview_sink = MagicMock(name="referee_sink")
+        pm._operator_preview_sink = MagicMock(name="operator_sink")
+        pm._GstVideo = None
+        return pm
+
+    def test_rejects_bad_role(self) -> None:
+        pm = self._manager()
+        with self.assertRaises(ValueError):
+            pm.set_native_preview_render_rectangle("third-monitor", (0, 0, 10, 10))
+
+    def test_goes_to_that_roles_sink_only(self) -> None:
+        pm = self._manager()
+        pm.set_native_preview_render_rectangle("referee", (-100, -50, 800, 450))
+        pm._referee_preview_sink.set_render_rectangle.assert_called_once_with(
+            -100, -50, 800, 450
+        )
+        pm._operator_preview_sink.set_render_rectangle.assert_not_called()
+
+    def test_stores_when_sink_missing(self) -> None:
+        pm = self._manager()
+        pm._referee_preview_sink = None
+        pm.set_native_preview_render_rectangle("referee", (-100, -50, 800, 450))
+        self.assertEqual(pm._referee_render_rect, (-100, -50, 800, 450))
+
+    def test_rebuilt_sink_gets_the_view_back(self) -> None:
+        # A reconnect replaces the sink; the tile doesn't re-send its
+        # rectangle, because nothing about the tile changed.
+        from unittest.mock import MagicMock
+
+        pm = self._manager()
+        pm.set_native_preview_render_rectangle("referee", (-100, -50, 800, 450))
+        rebuilt = MagicMock(name="rebuilt_referee_sink")
+        pm._referee_preview_sink = rebuilt
+        pm._bind_named_video_sink_locked(rebuilt, 0xABCD)
+        rebuilt.set_window_handle.assert_called_once_with(0xABCD)
+        rebuilt.set_render_rectangle.assert_called_once_with(-100, -50, 800, 450)
+
+    def test_never_zoomed_sink_is_bound_without_a_rectangle(self) -> None:
+        # An explicit rectangle would stop it tracking its window.
+        pm = self._manager()
+        pm._bind_named_video_sink_locked(pm._referee_preview_sink, 0xABCD)
+        pm._referee_preview_sink.set_render_rectangle.assert_not_called()
+
+
+class CoordinatorRenderRectangleTests(unittest.TestCase):
+    def _coordinator(self, *, mode, force_python_push: bool = False):
+        from unittest.mock import MagicMock
+        from app.core.application_coordinator import ApplicationCoordinator
+
+        coordinator = ApplicationCoordinator.__new__(ApplicationCoordinator)
+        runtime = MagicMock()
+        runtime.source.pipeline_mode = mode
+        coordinator._feed_runtimes = {"feed_a": runtime}
+        coordinator._settings = MagicMock(force_python_push_preview=force_python_push)
+        return coordinator, runtime
+
+    def test_native_feed_reaches_its_pipeline(self) -> None:
+        coordinator, runtime = self._coordinator(mode=PipelineMode.NATIVE)
+        coordinator.set_native_preview_render_rectangle(
+            "referee", "feed_a", (-10, -5, 800, 450)
+        )
+        runtime.pipeline_manager.set_native_preview_render_rectangle.assert_called_once_with(
+            "referee", (-10, -5, 800, 450)
+        )
+
+    def test_python_push_feed_is_left_to_the_widget(self) -> None:
+        coordinator, runtime = self._coordinator(mode=PipelineMode.PYTHON_PUSH)
+        coordinator.set_native_preview_render_rectangle(
+            "referee", "feed_a", (-10, -5, 800, 450)
+        )
+        runtime.pipeline_manager.set_native_preview_render_rectangle.assert_not_called()
+
+    def test_forced_python_push_is_left_to_the_widget(self) -> None:
+        coordinator, runtime = self._coordinator(
+            mode=PipelineMode.NATIVE, force_python_push=True
+        )
+        coordinator.set_native_preview_render_rectangle(
+            "referee", "feed_a", (-10, -5, 800, 450)
+        )
+        runtime.pipeline_manager.set_native_preview_render_rectangle.assert_not_called()
+
+    def test_unknown_feed_is_ignored(self) -> None:
+        coordinator, _ = self._coordinator(mode=PipelineMode.NATIVE)
+        coordinator.set_native_preview_render_rectangle(
+            "referee", "feed_z", (-10, -5, 800, 450)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

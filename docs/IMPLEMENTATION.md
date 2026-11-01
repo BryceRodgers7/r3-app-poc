@@ -1347,6 +1347,52 @@ QSS rule order in `control_button_style` is load-bearing; see its
 docstring. `_render_state` runs at up to 25 Hz, so `set_tone` and
 `set_active` no-op when unchanged rather than re-polishing on each tick.
 
+#### 11.5.3 Zoom and pan (referee window)
+
+Each referee tile holds its own `FeedView`: a zoom factor plus the
+source point at the middle of the tile, normalized to the picture.
+Ctrl+wheel zooms about the cursor, 1.25x a notch up to 4x, and a left
+drag pans once zoomed. `MultiFeedVideoPanel.enable_zoom_pan` turns it
+on; the operator window never calls it. The zoom level shows in the
+tile's title because nothing may be drawn over the video.
+
+The view belongs to `VideoWidget`, which outlives a camera being hidden
+on the ribbon and every live/replay switch. Normalizing it to the source
+is what lets it survive a resize or grid reflow. `app/ui/feed_view.py` is
+the pure geometry.
+
+`VideoWidget._view` is what the referee set, and it is never rewritten
+to fit the tile. Hiding other feeds can leave a tile the wrong shape to
+show a view, so drawing uses a fitted copy (`_shown_view`) and the view
+comes back intact with the tile.
+
+The same view reaches the screen two ways:
+
+- **Replay / python_push:** `_scaled_display_pixmap` crops the frame.
+  Replay frames are full resolution, so the crop shows real detail.
+- **Native live:** `PipelineManager.set_native_preview_render_rectangle`
+  draws the d3d11 sink into a rectangle larger than its window, and the
+  window clips it. Nothing upstream of the sink changes and there is no
+  per-frame Python. Each change costs about 1 ms.
+
+Native render rectangle behavior, measured on `d3d11videosink`
+(GStreamer 1.28):
+
+- Mouse input reaches Qt over the surface: the sink's child window is
+  transparent to hit-testing. `QTest` events skip this routing, so it
+  needs real Win32 input to verify.
+- The GstVideoOverlay reset value `(-1, -1, -1, -1)` **blanks the
+  picture.** An explicit rectangle also stops the sink tracking its
+  window, so a tile that has ever been zoomed sends a rectangle on every
+  resize, for good. `_native_rect_engaged` tracks this. A tile that has
+  never been zoomed sends none and keeps the sink's auto-sizing.
+- The rectangle survives hide/show, and one set before PLAYING takes
+  effect. `PipelineManager` stores it and re-applies it on bind, so a
+  sink rebuilt by a reconnect keeps the view.
+- Oversizing the native child *widget* instead renders wrongly.
+- The swapchain is as large as the rectangle, which is what `MAX_ZOOM`
+  bounds: 4x of a maximized single tile is a 9288x5224 surface.
+
 ### 11.6 Referee jog wheel + step transport (Phase 14.F + later)
 
 The referee window's `JogWheel` (replaced the Phase 14.C
@@ -1382,6 +1428,24 @@ all under `[replay]`):
 gesture actually left the controller in PAUSED, so a rejected or
 degraded step never spuriously starts playback. The Rewind button is
 unaffected — it already pauses when it crosses the clip-start fence.
+
+**Review seek bar.** `ReviewSeekBar` sits under the video panel and
+spans the clip under review: `UiState.review_range_ns` is the challenge
+fence with its open end resolved, and `playback_position_ns` is the
+replay clock. The Phase 14.C `ScrubberSlider` it follows ran the whole
+replayable range, where most of the bar would be behind the fence. Same
+challenge gate as the wheel. It stays on screen, greyed, outside a
+challenge, because showing it on demand would resize the feeds at the
+moment a challenge opens.
+
+A press drives `seek_to_session_time` inside the jog gesture
+(`begin_jog`/`end_jog`), so a seek pauses under the hand and resumes per
+`jog_wheel_resume_after_release`. A seek renders every feed synchronously
+on the UI thread (about 180 ms at four 1080p feeds), so mouse moves only
+record the handle position and a 33 ms timer seeks to the latest one.
+The seek clamps to what is replayable, so close to the live edge the
+handle can snap back from the clip's end until the last segment
+finalizes.
 
 ### 11.7 PlaybackController still leans on the primary feed
 

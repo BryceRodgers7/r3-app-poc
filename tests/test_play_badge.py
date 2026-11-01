@@ -34,6 +34,7 @@ def _build_pc_stub(
     pc._playback_rate = 1.0
     pc._session_clock = None
     pc._clip_manager = clip_manager  # ClipManager (Phase 14.A)
+    pc._clip_bounds = None
     pc._replay_store = type(
         "S", (), {"available_session_time_range": lambda self: (None, None)}
     )()

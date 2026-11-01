@@ -267,6 +267,8 @@ class PipelineManager:
         self._operator_preview_sink: Any | None = None
         self._referee_window_handle: int | None = None
         self._operator_window_handle: int | None = None
+        self._referee_render_rect: tuple[int, int, int, int] | None = None
+        self._operator_render_rect: tuple[int, int, int, int] | None = None
         self._preview_probe_pad: Any | None = None
         self._preview_probe_id: int | None = None
         self._video_window_handle: int | None = None
@@ -834,6 +836,54 @@ class PipelineManager:
                 return
             self._bind_named_video_sink_locked(sink, int(window_handle))
 
+    def set_native_preview_render_rectangle(
+        self, role: str, rect: tuple[int, int, int, int]
+    ) -> None:
+        """Draw a per-window native preview sink into `rect` of its window.
+
+        `rect` is `(x, y, width, height)` and may overhang the window,
+        which clips it. That is how a tile zooms and pans live video:
+        nothing upstream of the sink changes and there is no per-frame
+        work. Stored so a sink rebuilt by a reconnect keeps the view.
+        """
+        if role not in {"referee", "operator"}:
+            raise ValueError(f"Unknown native preview window role: {role!r}")
+        with self._pipeline_lock:
+            if role == "referee":
+                self._referee_render_rect = rect
+                sink = self._referee_preview_sink
+            else:
+                self._operator_render_rect = rect
+                sink = self._operator_preview_sink
+            if sink is not None:
+                self._apply_render_rectangle_locked(sink)
+
+    def _apply_render_rectangle_locked(self, sink: Any) -> None:
+        """Give `sink` its stored render rectangle, if it has one."""
+        rect = (
+            self._referee_render_rect
+            if sink == self._referee_preview_sink
+            else self._operator_render_rect
+        )
+        if rect is None:
+            return
+        try:
+            sink.set_render_rectangle(*rect)
+            return
+        except Exception as exc:
+            LOGGER.debug(
+                "video-sink direct set_render_rectangle failed for %s: %s",
+                sink.get_name(),
+                exc,
+            )
+        GstVideo = self._GstVideo
+        if GstVideo is None:
+            return
+        try:
+            GstVideo.VideoOverlay.set_render_rectangle(sink, *rect)
+        except Exception:
+            LOGGER.exception("Failed to set render rectangle on %s", sink.get_name())
+
     def _bind_named_video_sink_locked(self, sink: Any, window_handle: int) -> None:
         """Bind one specific sink to a window handle via GstVideoOverlay.
 
@@ -863,6 +913,7 @@ class PipelineManager:
                 sink_name,
                 int(window_handle),
             )
+            self._apply_render_rectangle_locked(sink)
             return
         except Exception as exc:
             LOGGER.debug(
@@ -884,6 +935,7 @@ class PipelineManager:
                 sink_name,
                 int(window_handle),
             )
+            self._apply_render_rectangle_locked(sink)
         except Exception:
             LOGGER.exception(
                 "Failed to bind video sink %s to window handle 0x%x",

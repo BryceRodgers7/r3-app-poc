@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import cv2
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QImage, QPixmap, QResizeEvent
+from PySide6.QtCore import QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QResizeEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QLabel,
     QSizePolicy,
@@ -14,6 +14,18 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.models import MediaFrame
+from app.ui.feed_view import (
+    FeedView,
+    Tile,
+    clamped,
+    panned,
+    picture_rect,
+    visible_source_rect,
+    zoomed,
+)
+
+
+_ANGLE_DELTA_PER_NOTCH = 120
 
 
 class VideoWidget(QWidget):
@@ -23,9 +35,16 @@ class VideoWidget(QWidget):
     feed (or a full-surface placeholder when there's no video). All
     status chrome (play/clip counters, transport state) lives outside
     the video panel.
+
+    With `enable_zoom_pan`, Ctrl+wheel zooms and a left-button drag pans.
+    The view belongs to the widget, so it outlasts hiding the tile and
+    switching between live and replay.
     """
 
     video_surface_resized = Signal()
+    view_changed = Signal(object)  # FeedView
+    # (x, y, width, height) the native sink should draw the picture into.
+    native_render_rect_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -65,6 +84,15 @@ class VideoWidget(QWidget):
         # QLabel via QImage. `native` (3.A.3+ native sources) lets a
         # GStreamer video sink render directly into `_live_surface`.
         self._render_mode: str = "qimage"
+        # Aspect ratio of the picture; None until `enable_zoom_pan`.
+        self._zoom_pan_aspect_ratio: float | None = None
+        self._view = FeedView()
+        self._drag_position: QPointF | None = None
+        # True once the native sink has been given a render rectangle.
+        # An explicit rectangle stops the sink tracking its window, and
+        # the sink can't be handed back: its (-1, -1, -1, -1) reset
+        # blanks the picture. So it stays on rectangles from then on.
+        self._native_rect_engaged = False
 
         self._surface_stack_host = QWidget(self)
         self._surface_stack_host.setObjectName("videoSurfaceHost")
@@ -95,6 +123,107 @@ class VideoWidget(QWidget):
             }
             """
         )
+
+    def enable_zoom_pan(self, aspect_ratio: float) -> None:
+        """Let this tile be zoomed and panned, for a picture of `aspect_ratio`."""
+        self._zoom_pan_aspect_ratio = float(aspect_ratio)
+
+    def view(self) -> FeedView:
+        """Return the tile's current zoom and pan."""
+        return self._view
+
+    def _tile(self) -> Tile:
+        assert self._zoom_pan_aspect_ratio is not None
+        return Tile(self.width(), self.height(), self._zoom_pan_aspect_ratio)
+
+    def _has_area(self) -> bool:
+        return self.width() > 0 and self.height() > 0
+
+    def _shown_view(self) -> FeedView:
+        """The view fitted to the tile as it is now.
+
+        Hiding other feeds can leave a tile the wrong shape to show a
+        view. Only drawing uses this fitted copy, so the referee's view
+        is back intact when the tile is.
+        """
+        return clamped(self._view, self._tile())
+
+    def _set_view(self, view: FeedView) -> None:
+        if view == self._view:
+            return
+        self._view = view
+        self._refresh_pixmap()
+        self._push_native_render_rect()
+        self._update_cursor()
+        self.view_changed.emit(view)
+
+    def _push_native_render_rect(self) -> None:
+        """Tell the native sink where to draw, once it has been zoomed.
+
+        A tile that has never been zoomed sends nothing, so the sink
+        keeps tracking its window by itself.
+        """
+        if self._render_mode != "native" or self._zoom_pan_aspect_ratio is None:
+            return
+        if not (self._view.is_zoomed or self._native_rect_engaged):
+            return
+        if not self._has_area():
+            return
+        self._native_rect_engaged = True
+        self.native_render_rect_changed.emit(
+            picture_rect(self._shown_view(), self._tile())
+        )
+
+    def _update_cursor(self) -> None:
+        if self._drag_position is not None:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif self._view.is_zoomed:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.unsetCursor()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Ctrl+wheel zooms about the cursor; a plain wheel does nothing here."""
+        control_held = event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        if self._zoom_pan_aspect_ratio is None or not control_held:
+            super().wheelEvent(event)
+            return
+        position = event.position()
+        self._set_view(
+            zoomed(
+                self._shown_view(),
+                event.angleDelta().y() / _ANGLE_DELTA_PER_NOTCH,
+                position.x(),
+                position.y(),
+                self._tile(),
+            )
+        )
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or not self._view.is_zoomed:
+            super().mousePressEvent(event)
+            return
+        self._drag_position = event.position()
+        self._update_cursor()
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_position is None:
+            super().mouseMoveEvent(event)
+            return
+        delta = event.position() - self._drag_position
+        self._drag_position = event.position()
+        self._set_view(panned(self._shown_view(), delta.x(), delta.y(), self._tile()))
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self._drag_position is None:
+            super().mouseReleaseEvent(event)
+            return
+        self._drag_position = None
+        self._update_cursor()
+        event.accept()
 
     def set_placeholder_text(self, text: str) -> None:
         """Update the placeholder message shown when no embedded video is active."""
@@ -171,12 +300,27 @@ class VideoWidget(QWidget):
         """Keep the rendered frame scaled to the current widget size."""
         super().resizeEvent(event)
         self._refresh_pixmap()
+        self._push_native_render_rect()
         if self._showing_video_surface:
             self.video_surface_resized.emit()
 
     def _scaled_display_pixmap(self) -> QPixmap | None:
         if self._current_image is None:
             return None
+        if self._view.is_zoomed and self._has_area():
+            source, target = visible_source_rect(
+                self._shown_view(),
+                self._tile(),
+                self._current_image.width(),
+                self._current_image.height(),
+            )
+            return QPixmap.fromImage(
+                self._current_image.copy(QRect(*source)).scaled(
+                    QSize(*target),
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
         pixmap = QPixmap.fromImage(self._current_image)
         return pixmap.scaled(
             self._frame_label.size(),

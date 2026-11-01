@@ -30,6 +30,7 @@ class ControllerPropagatesIsRecordingTests(unittest.TestCase):
         controller._playback_rate = 1.0
         controller._session_clock = None
         controller._clip_manager = None
+        controller._clip_bounds = None
         controller._replay_store = type(
             "S", (), {
                 "available_session_time_range": lambda self: (None, None),
@@ -62,6 +63,7 @@ class ControllerPropagatesIsRecordingTests(unittest.TestCase):
         controller._playback_rate = 1.0
         controller._session_clock = None
         controller._clip_manager = None
+        controller._clip_bounds = None
         controller._replay_store = type(
             "S", (), {
                 "available_session_time_range": lambda self: (None, None),
@@ -96,6 +98,7 @@ class ControllerPropagatesClipMarkTests(unittest.TestCase):
         controller._playback_rate = 1.0
         controller._session_clock = None
         controller._clip_manager = clip_manager
+        controller._clip_bounds = None
         controller._replay_store = type(
             "S", (), {
                 "available_session_time_range": lambda self: (None, None),
@@ -145,6 +148,44 @@ class ControllerPropagatesClipMarkTests(unittest.TestCase):
         controller._state.current_clip_marked = True
         controller._update_state_timestamps_locked()
         self.assertFalse(controller._state.current_clip_marked)
+
+    def test_no_fence_means_no_clip_under_review(self) -> None:
+        controller = self._controller(None)
+        controller._update_state_timestamps_locked()
+        self.assertIsNone(controller._state.review_range_ns)
+        self.assertIsNone(controller._state.playback_position_ns)
+
+    def test_fence_and_replay_clock_reach_state(self) -> None:
+        # What the seek bar draws from.
+        controller = self._controller(None)
+        controller._clip_bounds = (10_000_000_000, 20_000_000_000)
+        controller._playback_session_time_ns = 12_000_000_000
+        controller._update_state_timestamps_locked()
+        self.assertEqual(
+            controller._state.review_range_ns, (10_000_000_000, 20_000_000_000)
+        )
+        self.assertEqual(controller._state.playback_position_ns, 12_000_000_000)
+
+    def test_open_ended_fence_runs_to_the_replayable_edge(self) -> None:
+        controller = self._controller(None)
+        controller._clip_bounds = (10_000_000_000, None)
+        controller._replay_store = type(
+            "S", (), {
+                "available_session_time_range": lambda self: (0, 18_000_000_000),
+            }
+        )()
+        controller._update_state_timestamps_locked()
+        self.assertEqual(
+            controller._state.review_range_ns, (10_000_000_000, 18_000_000_000)
+        )
+
+    def test_lifting_the_fence_clears_the_range(self) -> None:
+        controller = self._controller(None)
+        controller._clip_bounds = (10_000_000_000, 20_000_000_000)
+        controller._update_state_timestamps_locked()
+        controller._clip_bounds = None
+        controller._update_state_timestamps_locked()
+        self.assertIsNone(controller._state.review_range_ns)
 
 
 if __name__ == "__main__":

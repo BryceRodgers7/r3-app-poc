@@ -29,6 +29,7 @@ from app.ui.alert_banner import AlertBanner
 from app.ui.camera_visibility_ribbon import CameraVisibilityRibbon
 from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.jog_wheel import JogWheel
+from app.ui.review_seek_bar import ReviewSeekBar
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
 from app.ui.referee_controls_widget import RefereeControlsWidget
@@ -112,6 +113,10 @@ class MainWindow(QMainWindow):
         # path. The `force_python_push_preview` setting overrides this
         # to keep everyone on the qimage path.
         role = "operator" if live_only_window else "referee"
+        if controls_role == "referee":
+            self.video_panel.enable_zoom_pan(
+                settings.target_frame_width / settings.target_frame_height
+            )
         for feed_id, widget in self.video_panel.widgets_by_feed_id.items():
             self._output_renderer.bind_feed_widget(feed_id, widget)
             if (
@@ -128,6 +133,13 @@ class MainWindow(QMainWindow):
                 )
                 application_coordinator.bind_native_preview_window_handle(
                     role, feed_id, handle
+                )
+                widget.native_render_rect_changed.connect(
+                    lambda rect, feed_id=feed_id: (
+                        application_coordinator.set_native_preview_render_rectangle(
+                            role, feed_id, rect
+                        )
+                    )
                 )
 
         # Phase 13.A/13.B: at most one of these is non-None per window.
@@ -158,12 +170,14 @@ class MainWindow(QMainWindow):
         self.camera_ribbon: CameraVisibilityRibbon | None = None
         self.post_process_link: QLabel | None = None
         self.jog_wheel: JogWheel | None = None
+        self.review_seek_bar: ReviewSeekBar | None = None
         if controls_role == "operator":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.post_process_link = self._build_post_process_link()
         elif controls_role == "referee":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.jog_wheel = JogWheel(self)
+            self.review_seek_bar = ReviewSeekBar(self)
 
         # Phase 14.F: StatusBarWidget is the legacy diagnostic strip
         # (recording state / source name / behind-live counter). The
@@ -214,7 +228,17 @@ class MainWindow(QMainWindow):
         content_row = QHBoxLayout()
         content_row.setContentsMargins(0, 0, 0, 0)
         content_row.setSpacing(_LAYOUT_GAP)
-        content_row.addWidget(self.video_panel, stretch=1)
+        if self.review_seek_bar is None:
+            content_row.addWidget(self.video_panel, stretch=1)
+        else:
+            # The bar stays in place, greyed, outside a challenge. Showing
+            # it on demand would resize the feeds the moment one starts.
+            video_column = QVBoxLayout()
+            video_column.setContentsMargins(0, 0, 0, 0)
+            video_column.setSpacing(_LAYOUT_GAP)
+            video_column.addWidget(self.video_panel, stretch=1)
+            video_column.addWidget(self.review_seek_bar)
+            content_row.addLayout(video_column, stretch=1)
         if controls_role == "none":
             layout.addLayout(content_row, stretch=1)
             layout.addWidget(self._status_bar)
@@ -313,6 +337,14 @@ class MainWindow(QMainWindow):
             # (per config) resume it once the wheel settles.
             self.jog_wheel.jog_engaged.connect(self._controller.begin_jog)
             self.jog_wheel.jog_released.connect(self._controller.end_jog)
+        if self.review_seek_bar is not None:
+            # A seek is the same gesture as a jog: pause under the
+            # referee's hand, then resume at the rate it interrupted.
+            self.review_seek_bar.seek_requested.connect(
+                self._controller.seek_to_session_time
+            )
+            self.review_seek_bar.seek_started.connect(self._controller.begin_jog)
+            self.review_seek_bar.seek_finished.connect(self._controller.end_jog)
         # Phase 14.F: the challenge-state signal gates the referee
         # transport (every transport button + the jog wheel) — disabled
         # outside a challenge, enabled while one is active. The
@@ -375,6 +407,10 @@ class MainWindow(QMainWindow):
             self.referee_controls.set_active_rate(
                 state.playback_overlay.playback_rate
             )
+        if self.review_seek_bar is not None:
+            self.review_seek_bar.update_review(
+                state.review_range_ns, state.playback_position_ns
+            )
         if self.operator_controls is not None:
             self.operator_controls.set_recording_state(state.is_recording)
             self.operator_controls.set_recording_label(state.is_recording)
@@ -425,6 +461,8 @@ class MainWindow(QMainWindow):
             self.referee_controls.set_transport_enabled(active)
         if self.jog_wheel is not None:
             self.jog_wheel.set_wheel_enabled(active)
+        if self.review_seek_bar is not None:
+            self.review_seek_bar.set_bar_enabled(active)
 
     # ------------------------------------------------------------------
     # Phase 14.B helpers

@@ -75,5 +75,11 @@ class UiState:
     # highlight — a mark is otherwise only a DB flag with no visible
     # effect on screen.
     current_clip_marked: bool = False
+    # Session-time bounds of the clip under review, the challenge fence
+    # with its open end resolved. None outside a challenge. Together
+    # with `playback_position_ns` (the replay clock, None on the live
+    # edge) this drives the referee window's seek bar.
+    review_range_ns: tuple[int, int] | None = None
+    playback_position_ns: int | None = None
 
 
