@@ -29,6 +29,12 @@ After reading these three you should be able to reason about any
 proposed change in terms of: what the spec calls for, what the
 implementation actually does, and where the two differ.
 
+### "I'm fixing the open NDI bugs"
+
+Start with [`NDI_OPEN_BUGS.md`](NDI_OPEN_BUGS.md): a feed freezing at
+Begin Game and its footage going unindexed, exit hanging inside the NDI
+library, how to reproduce both, and the test traps that fake failures.
+
 ### "I'm refactoring the GStreamer pipeline"
 
 1. [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) — first.
