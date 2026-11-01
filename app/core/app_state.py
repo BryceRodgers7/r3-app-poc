@@ -70,5 +70,10 @@ class UiState:
     # type and on whether any play has started yet).
     current_clip_number: int | None = None
     current_clip_type: str | None = None
+    # Whether the open clip carries the operator's Mark Play flag.
+    # False when no clip is open. Drives the Mark Play button's latched
+    # highlight — a mark is otherwise only a DB flag with no visible
+    # effect on screen.
+    current_clip_marked: bool = False
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from app.core.models import (
@@ -62,6 +63,27 @@ class CameraVisibilityRibbonTests(_QtTestCase):
         ribbon._buttons_by_feed["cam_1"].click()
         self.assertEqual(events[-1], ("cam_1", True))
         self.assertTrue(ribbon.is_feed_visible("cam_1"))
+
+    def test_button_highlight_tracks_visibility(self) -> None:
+        ribbon = CameraVisibilityRibbon(_feeds(2))
+        button = ribbon._buttons_by_feed["cam_1"]
+        self.assertTrue(button.is_active())
+        button.click()
+        self.assertFalse(button.is_active())
+        button.click()
+        self.assertTrue(button.is_active())
+
+    def test_buttons_wrap_past_four_feeds(self) -> None:
+        ribbon = CameraVisibilityRibbon(_feeds(6))
+        ribbon.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+        ribbon.show()
+        first, fifth = (
+            ribbon._buttons_by_feed["cam_1"],
+            ribbon._buttons_by_feed["cam_5"],
+        )
+        self.assertEqual(first.x(), fifth.x())
+        self.assertGreater(fifth.y(), first.y())
+        ribbon.close()
 
     def test_selector_label_starts_with_placeholder(self) -> None:
         ribbon = CameraVisibilityRibbon(_feeds(2))

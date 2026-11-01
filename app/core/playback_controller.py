@@ -1204,10 +1204,14 @@ class PlaybackController:
             self._state.current_clip_type = (
                 current_clip.type if current_clip is not None else None
             )
+            self._state.current_clip_marked = (
+                current_clip.marked if current_clip is not None else False
+            )
         else:
             self._state.current_play_number = None
             self._state.current_clip_number = None
             self._state.current_clip_type = None
+            self._state.current_clip_marked = False
         if latest_session_time_ns is None:
             self._state.live_lag_behind_replayable_seconds = 0.0
         elif self._session_clock is not None:

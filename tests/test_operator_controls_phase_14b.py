@@ -206,6 +206,81 @@ class RecordingLabelStyleTests(_QtTestCase):
         self.assertIn("background-color: #2c8a3a", style)
 
 
+class LatchedHighlightTests(_QtTestCase):
+    """`set_clip_state` shows the open clip's state on the buttons."""
+
+    def _set(self, controls, clip_type, *, is_marked=False) -> None:
+        controls.set_clip_state(
+            is_recording=True,
+            has_play_started=True,
+            current_clip_type=clip_type,
+            is_marked=is_marked,
+        )
+
+    def test_timeout_lit_only_during_timeout_clip(self) -> None:
+        controls = _make_widget()
+        self._set(controls, CLIP_TYPE_TIMEOUT)
+        self.assertTrue(controls.timeout_button.is_active())
+        self._set(controls, CLIP_TYPE_PLAY)
+        self.assertFalse(controls.timeout_button.is_active())
+
+    def test_challenge_lit_while_disabled_during_challenge_clip(self) -> None:
+        controls = _make_widget()
+        self._set(controls, CLIP_TYPE_CHALLENGE)
+        self.assertTrue(controls.challenge_button.is_active())
+        self.assertFalse(controls.challenge_button.isEnabled())
+
+    def test_next_play_never_latches(self) -> None:
+        # It's a repeated action, not a mode.
+        controls = _make_widget()
+        self._set(controls, CLIP_TYPE_PLAY)
+        self.assertFalse(controls.next_play_button.is_active())
+
+    def test_marked_clip_lights_and_relabels_mark_play(self) -> None:
+        controls = _make_widget()
+        self._set(controls, CLIP_TYPE_PLAY, is_marked=True)
+        self.assertTrue(controls.mark_play_button.is_active())
+        self.assertEqual(controls.mark_play_button.text(), "✓ Marked")
+
+    def test_next_clip_clears_the_mark_highlight(self) -> None:
+        # A mark belongs to one clip; the next one starts unmarked.
+        controls = _make_widget()
+        self._set(controls, CLIP_TYPE_PLAY, is_marked=True)
+        self._set(controls, CLIP_TYPE_PLAY, is_marked=False)
+        self.assertFalse(controls.mark_play_button.is_active())
+        self.assertEqual(controls.mark_play_button.text(), "Mark Play")
+
+    def test_game_end_clears_every_highlight(self) -> None:
+        controls = _make_widget()
+        self._set(controls, CLIP_TYPE_TIMEOUT, is_marked=True)
+        controls.set_clip_state(
+            is_recording=False, has_play_started=False, current_clip_type=None,
+        )
+        self.assertFalse(controls.timeout_button.is_active())
+        self.assertFalse(controls.mark_play_button.is_active())
+
+
+class EndGameFlashTests(_QtTestCase):
+    """The stop blocks the UI thread, so the button has to be lit first."""
+
+    def test_confirmed_end_game_flashes_before_the_toggle(self) -> None:
+        controls = _make_widget(confirm_returns=True)
+        controls.set_recording_state(True)
+        seen: list[bool] = []
+        controls.long_recording_toggle_requested.connect(
+            lambda: seen.append(controls.long_recording_button.is_flashing())
+        )
+        # `clicked.emit` skips `pressed`, isolating the post-modal flash.
+        controls.long_recording_button.clicked.emit()
+        self.assertEqual(seen, [True])
+
+    def test_declined_end_game_does_not_flash(self) -> None:
+        controls = _make_widget(confirm_returns=False)
+        controls.set_recording_state(True)
+        controls.long_recording_button.clicked.emit()
+        self.assertFalse(controls.long_recording_button.is_flashing())
+
+
 class SignalEmissionTests(_QtTestCase):
     """Each transport button emits its signal on click."""
 

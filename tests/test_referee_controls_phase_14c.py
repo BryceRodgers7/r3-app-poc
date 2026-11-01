@@ -72,6 +72,28 @@ class RefereeControlsButtonSurfaceTests(_QtTestCase):
         controls.set_pause_label_for_rate(0.25)
         self.assertIn("Pause", controls.pause_button.text())
 
+    def test_active_rate_lights_only_the_matching_button(self) -> None:
+        controls = RefereeControlsWidget(button_height=72)
+        controls.set_active_rate(0.5)
+        self.assertTrue(controls.half_speed_button.is_active())
+        self.assertFalse(controls.speed_2x_button.is_active())
+        self.assertFalse(controls.quarter_speed_button.is_active())
+        self.assertFalse(controls.eighth_speed_button.is_active())
+
+    def test_active_rate_moves_between_buttons(self) -> None:
+        controls = RefereeControlsWidget(button_height=72)
+        controls.set_active_rate(0.5)
+        controls.set_active_rate(0.125)
+        self.assertFalse(controls.half_speed_button.is_active())
+        self.assertTrue(controls.eighth_speed_button.is_active())
+
+    def test_no_speed_button_lit_at_normal_speed_or_paused(self) -> None:
+        controls = RefereeControlsWidget(button_height=72)
+        for rate in (1.0, 0.0):
+            controls.set_active_rate(0.5)
+            controls.set_active_rate(rate)
+            self.assertFalse(controls.half_speed_button.is_active())
+
 
 if __name__ == "__main__":
     unittest.main()

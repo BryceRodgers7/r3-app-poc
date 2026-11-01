@@ -32,6 +32,8 @@ from PySide6.QtCore import QPoint, QPointF, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import QWidget
 
+from app.ui.control_button import PRESS_FEEDBACK_COLOR
+
 
 _WHEEL_SIZE_PX = 140
 _COAST_INTERVAL_MS = 16  # ~60 Hz repaint + emit cadence
@@ -167,6 +169,7 @@ class JogWheel(QWidget):
         if not self._gesture_engaged:
             self._gesture_engaged = True
             self.jog_engaged.emit()
+            self.update()
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -244,6 +247,7 @@ class JogWheel(QWidget):
         if self._gesture_engaged:
             self._gesture_engaged = False
             self.jog_released.emit()
+            self.update()
 
     # ------------------------------------------------------------------
     # Painting
@@ -253,7 +257,11 @@ class JogWheel(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if self._wheel_enabled:
-            rim_color = QColor("#6daffe")
+            # Same acknowledgement as a pressed ControlButton; held for
+            # the whole gesture, through the inertia coast.
+            rim_color = QColor(
+                PRESS_FEEDBACK_COLOR if self._gesture_engaged else "#6daffe"
+            )
             face_color = QColor("#2a3340")
             tick_color = QColor("#cdd6e0")
             indicator_color = QColor("#ffffff")

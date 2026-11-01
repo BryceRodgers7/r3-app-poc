@@ -1297,6 +1297,56 @@ strip. `is_freeze` still selects the clamped freeze frame to render
 branches (before-earliest / after-latest / in-gap), `False` for exact
 coverage.
 
+### 11.5.1 Control rail and video fit
+
+Both windows put every control in one fixed-width column down the
+right edge (`MainWindow._build_control_rail`), so the video panel gets
+the window's full height. This departs from
+[`window-layouts.pdf`](window-layouts.pdf) page 2, which predates the
+jog wheel: its bottom strip was thin because it held a slider, and the
+140px wheel would have turned it into a large height cost. For a 16:9
+grid on a roughly 16:9 monitor, height is the limiting dimension, so
+the first ~125px of a side rail on a maximized 1080p window is free
+while any bottom strip costs picture size immediately. The one case
+that goes the other way is exactly two feeds on a large window: two
+pictures don't fill a 16:9 panel, so a bottom strip would cost nothing
+while the rail does.
+
+Transient messages render in the rail (`TransientStatusLabel`, still
+held as `MainWindow._status_bar`) rather than in a `QStatusBar`, for
+the same reason.
+
+`MultiFeedVideoPanel` picks its column count with `best_grid_columns`,
+which scores each candidate by the 16:9 picture that fits in its cell.
+It re-runs on resize as well as on camera show/hide, so a change in
+window shape can reflow the grid. Reflows must not hide cells that stay
+in the grid (that would flash the native d3d11 surface), and the frame
+`QLabel` has an `Ignored` size policy because a pixmap otherwise sets
+its minimum size, which would stop a tile from shrinking and let a
+reflow push the window wider than the screen.
+
+### 11.5.2 Button press feedback
+
+Every button in the rail is a `ControlButton`
+(`app/ui/control_button.py`). Two states sit on top of the stock
+pressed look:
+
+- **Flash** (amber, `FLASH_MS`): starts on `pressed`, so a press is
+  acknowledged even when the click is instantaneous, when the click
+  handler blocks the UI thread, or when the press disables the button
+  (Challenge). End Game calls `flash()` again after its confirm modal,
+  because the stop that follows blocks the UI thread for over a second.
+  The jog wheel's rim uses the same color for the whole gesture.
+- **Active** (blue): a latched highlight set from `UiState` in
+  `_render_state`, never from the click, so it shows what the
+  controller did rather than what the button assumed. Current
+  playback rate, open time-out / challenge clip, marked clip
+  (`UiState.current_clip_marked`), and visible camera feeds.
+
+QSS rule order in `control_button_style` is load-bearing; see its
+docstring. `_render_state` runs at up to 25 Hz, so `set_tone` and
+`set_active` no-op when unchanged rather than re-polishing on each tick.
+
 ### 11.6 Referee jog wheel + step transport (Phase 14.F + later)
 
 The referee window's `JogWheel` (replaced the Phase 14.C

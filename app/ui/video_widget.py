@@ -5,7 +5,13 @@ from __future__ import annotations
 import cv2
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QImage, QPixmap, QResizeEvent
-from PySide6.QtWidgets import QLabel, QStackedLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QLabel,
+    QSizePolicy,
+    QStackedLayout,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.core.models import MediaFrame
 
@@ -46,6 +52,13 @@ class VideoWidget(QWidget):
         self._frame_label.setObjectName("framePlaceholderLabel")
         self._frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._frame_label.setStyleSheet("background-color: #101010; color: #f3f3f3;")
+        # A QLabel's minimum size follows its content. The pixmap here
+        # is scaled to the label, so without this a tile could never
+        # shrink again, and a grid reflow would push the window wider
+        # than the screen.
+        self._frame_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
         self._current_image: QImage | None = None
         self._showing_video_surface = False
         # `qimage` (legacy / python_push sources) renders frames into the
@@ -62,18 +75,13 @@ class VideoWidget(QWidget):
         self._surface_stack.setCurrentWidget(self._frame_label)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(self._surface_stack_host, stretch=1)
 
         self.setMinimumHeight(420)
         self.setStyleSheet(
             """
-            QWidget#videoWidgetRoot {
-                background-color: #1f1f1f;
-                border: 2px solid #505050;
-                border-radius: 10px;
-            }
             QWidget#videoSurfaceHost {
                 background-color: #101010;
                 border: none;

@@ -11,8 +11,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QSizePolicy,
-    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
@@ -34,9 +32,12 @@ from app.ui.jog_wheel import JogWheel
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
 from app.ui.referee_controls_widget import RefereeControlsWidget
-from app.ui.status_bar_widget import StatusBarWidget
+from app.ui.status_bar_widget import StatusBarWidget, TransientStatusLabel
 
 _VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
+_CONTROL_RAIL_WIDTH = 220
+_LAYOUT_GAP = 6
+_WINDOW_BACKGROUND = "#14171c"
 
 
 class MainWindow(QMainWindow):
@@ -55,6 +56,11 @@ class MainWindow(QMainWindow):
       `live_only_window=True` it's the persistent operator's pane.
     - `"none"` — no controls (reserved for a future "spectator"
       window).
+
+    Both control roles put everything in one fixed-width rail down the
+    right edge, so the video panel keeps the window's full height. On a
+    typical 16:9-ish monitor the height is the limiting dimension for a
+    16:9 grid, which makes a side rail far cheaper than a bottom strip.
     """
 
     def __init__(
@@ -92,6 +98,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(window_title or settings.window_title)
         self.resize(1280, 860)
+        self.setStyleSheet(f"QMainWindow {{ background-color: {_WINDOW_BACKGROUND}; }}")
 
         enabled_feeds = [f for f in feeds if f.enabled]
         self.video_panel = MultiFeedVideoPanel(enabled_feeds, self)
@@ -165,11 +172,11 @@ class MainWindow(QMainWindow):
         self.status_widget: StatusBarWidget | None = (
             StatusBarWidget(self) if self._show_diagnostics else None
         )
-        # The Qt QStatusBar is always present — it's the only sink for
-        # transient transport messages (rewind status, post-process
-        # placeholder, "Held at end of play (challenge)", etc.).
-        self._status_bar = QStatusBar(self)
-        self.setStatusBar(self._status_bar)
+        # Always present — it's the only sink for transient transport
+        # messages (rewind status, post-process placeholder, "Held at
+        # end of play (challenge)", etc.). Lives in the control rail
+        # rather than a QStatusBar so it doesn't cost the video height.
+        self._status_bar = TransientStatusLabel(self)
 
         # DiagnosticsWidget is referee-only (telemetry / health-event
         # panel). Also gated by Phase 14.F's diagnostics-chrome flag.
@@ -200,54 +207,20 @@ class MainWindow(QMainWindow):
 
         central_widget = QWidget(self)
         layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(16)
+        layout.setContentsMargins(_LAYOUT_GAP, _LAYOUT_GAP, _LAYOUT_GAP, _LAYOUT_GAP)
+        layout.setSpacing(_LAYOUT_GAP)
         if self.alert_banner is not None:
             layout.addWidget(self.alert_banner)
-        if controls_role == "operator":
-            # Phase 14.B operator layout:
-            #   [ video panel | OperatorControlsWidget (right column) ]
-            #   [ CameraVisibilityRibbon | stretch | Post-process link ]
-            middle_row = QHBoxLayout()
-            middle_row.setContentsMargins(0, 0, 0, 0)
-            middle_row.setSpacing(16)
-            middle_row.addWidget(self.video_panel, stretch=1)
-            assert self.operator_controls is not None  # set above
-            self.operator_controls.setSizePolicy(
-                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
-            )
-            self.operator_controls.setMinimumWidth(220)
-            middle_row.addWidget(self.operator_controls)
-            layout.addLayout(middle_row, stretch=1)
-
-            bottom_row = QHBoxLayout()
-            bottom_row.setContentsMargins(0, 0, 0, 0)
-            bottom_row.setSpacing(16)
-            if self.camera_ribbon is not None:
-                bottom_row.addWidget(self.camera_ribbon)
-            bottom_row.addStretch(1)
-            if self.post_process_link is not None:
-                bottom_row.addWidget(self.post_process_link)
-            layout.addLayout(bottom_row)
+        content_row = QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(_LAYOUT_GAP)
+        content_row.addWidget(self.video_panel, stretch=1)
+        if controls_role == "none":
+            layout.addLayout(content_row, stretch=1)
+            layout.addWidget(self._status_bar)
         else:
-            # Phase 14.C / 14.F referee layout:
-            #   [ video panel                                   ]
-            #   [ RefereeControlsWidget transport row | JogWheel ]
-            #   [ CameraVisibilityRibbon                        ]
-            # The jog wheel sits beside the transport buttons because
-            # both controls are part of the same gated transport
-            # surface (Phase 14.F).
-            layout.addWidget(self.video_panel, stretch=1)
-            transport_row = QHBoxLayout()
-            transport_row.setContentsMargins(0, 0, 0, 0)
-            transport_row.setSpacing(16)
-            if self.referee_controls is not None:
-                transport_row.addWidget(self.referee_controls, stretch=1)
-            if self.jog_wheel is not None:
-                transport_row.addWidget(self.jog_wheel)
-            layout.addLayout(transport_row)
-            if self.camera_ribbon is not None:
-                layout.addWidget(self.camera_ribbon)
+            content_row.addWidget(self._build_control_rail())
+            layout.addLayout(content_row, stretch=1)
         if self.status_widget is not None:
             layout.addWidget(self.status_widget)
         if self.diagnostics_widget is not None:
@@ -256,6 +229,40 @@ class MainWindow(QMainWindow):
 
         self._wire_events()
         self._render_state(self._controller.get_state())
+
+    def _build_control_rail(self) -> QWidget:
+        """Lay out the role's controls in the right-edge column.
+
+        Operator (top to bottom):
+            clip readout + ribbon | OperatorControlsWidget | status |
+            Post-process link
+
+        Referee:
+            clip readout + ribbon | stretch | RefereeControlsWidget |
+            JogWheel | status
+
+        The clip readout stays at the top on both windows, and the
+        transport keeps the bottom of the rail. The jog wheel sits with
+        the transport buttons because they're the same gated surface
+        (Phase 14.F).
+        """
+        rail = QWidget(self)
+        rail.setFixedWidth(_CONTROL_RAIL_WIDTH)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 0, 0, 0)
+        rail_layout.setSpacing(8)
+        assert self.camera_ribbon is not None  # set for both control roles
+        rail_layout.addWidget(self.camera_ribbon)
+        if self.operator_controls is not None:
+            rail_layout.addWidget(self.operator_controls, stretch=1)
+            rail_layout.addWidget(self._status_bar)
+            rail_layout.addWidget(self.post_process_link)
+        else:
+            rail_layout.addStretch(1)
+            rail_layout.addWidget(self.referee_controls)
+            rail_layout.addWidget(self.jog_wheel, alignment=Qt.AlignmentFlag.AlignHCenter)
+            rail_layout.addWidget(self._status_bar)
+        return rail
 
     def _wire_events(self) -> None:
         if self.referee_controls is not None:
@@ -345,7 +352,7 @@ class MainWindow(QMainWindow):
                 self.video_panel.set_tile_visible
             )
         self._controller.signals.state_changed.connect(self._render_state)
-        self._controller.signals.status_message.connect(self._status_bar.showMessage)
+        self._controller.signals.status_message.connect(self._status_bar.show_message)
 
     def _render_state(self, state: UiState) -> None:
         if self.status_widget is not None:
@@ -365,6 +372,9 @@ class MainWindow(QMainWindow):
             self.referee_controls.set_pause_label_for_rate(
                 state.playback_overlay.playback_rate
             )
+            self.referee_controls.set_active_rate(
+                state.playback_overlay.playback_rate
+            )
         if self.operator_controls is not None:
             self.operator_controls.set_recording_state(state.is_recording)
             self.operator_controls.set_recording_label(state.is_recording)
@@ -374,6 +384,7 @@ class MainWindow(QMainWindow):
                 is_recording=state.is_recording,
                 has_play_started=state.current_play_number is not None,
                 current_clip_type=state.current_clip_type,
+                is_marked=state.current_clip_marked,
             )
         if self.camera_ribbon is not None:
             self.camera_ribbon.set_selector_label(
@@ -420,7 +431,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_post_process_link(self) -> QLabel:
-        """Bottom-right "Post-process & Exit" hyperlink (Phase 14.B).
+        """"Post-process & Exit" hyperlink at the foot of the rail (Phase 14.B).
 
         Click handler is a placeholder in 14.B: it logs the intent
         and emits a status-bar message. Phase 14.E swaps the handler
@@ -472,7 +483,7 @@ class MainWindow(QMainWindow):
             LOGGER.warning(
                 "Post-process & Exit: no active session — nothing to process"
             )
-            self._status_bar.showMessage(
+            self._status_bar.show_message(
                 "No active session to process.", 4000
             )
             return

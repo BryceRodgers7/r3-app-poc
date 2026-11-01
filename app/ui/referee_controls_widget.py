@@ -18,16 +18,26 @@ the setting at construction time so future tweaks are settings-only.
 The pause button's label flips between `⏸` (rate > 0) and `▶`
 (rate == 0) via `set_playback_rate` — same Qt-signal-driven path
 the recording-state gating uses.
+
+The buttons sit in a two-column grid so the widget fits the window's
+right-hand control rail. The speed button matching the current rate
+stays lit (`set_active_rate`) because rate is otherwise only visible
+in the video itself.
 """
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
+from PySide6.QtWidgets import QGridLayout, QWidget
+
+from app.ui.control_button import ControlButton
 
 
 _PAUSE_LABEL = "⏸ Pause"
 _PLAY_LABEL = "▶ Play"
+_BUTTON_FONT_PX = 16
 
 
 class RefereeControlsWidget(QWidget):
@@ -54,39 +64,39 @@ class RefereeControlsWidget(QWidget):
         super().__init__(parent)
         self._rewind_seconds = max(1, int(rewind_seconds))
 
-        self.pause_button = QPushButton(_PAUSE_LABEL, self)
-        self.speed_2x_button = QPushButton("2x", self)
-        self.half_speed_button = QPushButton("1/2x", self)
-        self.quarter_speed_button = QPushButton("1/4x", self)
-        self.eighth_speed_button = QPushButton("1/8x", self)
-        self.rewind_button = QPushButton(f"Rewind {self._rewind_seconds}s", self)
-        self.step_back_button = QPushButton("Step ◀", self)
-        self.step_forward_button = QPushButton("Step ▶", self)
+        self.pause_button = ControlButton(_PAUSE_LABEL, self, font_px=_BUTTON_FONT_PX)
+        self.speed_2x_button = ControlButton("2x", self, font_px=_BUTTON_FONT_PX)
+        self.half_speed_button = ControlButton("1/2x", self, font_px=_BUTTON_FONT_PX)
+        self.quarter_speed_button = ControlButton("1/4x", self, font_px=_BUTTON_FONT_PX)
+        self.eighth_speed_button = ControlButton("1/8x", self, font_px=_BUTTON_FONT_PX)
+        self.rewind_button = ControlButton(
+            f"Rewind {self._rewind_seconds}s", self, font_px=_BUTTON_FONT_PX
+        )
+        self.step_back_button = ControlButton("Step ◀", self, font_px=_BUTTON_FONT_PX)
+        self.step_forward_button = ControlButton("Step ▶", self, font_px=_BUTTON_FONT_PX)
+        self._rate_buttons = (
+            (self.speed_2x_button, 2.0),
+            (self.half_speed_button, 0.5),
+            (self.quarter_speed_button, 0.25),
+            (self.eighth_speed_button, 0.125),
+        )
 
-        for button in (
-            self.pause_button,
-            self.speed_2x_button,
-            self.half_speed_button,
-            self.quarter_speed_button,
-            self.eighth_speed_button,
-            self.rewind_button,
-            self.step_back_button,
-            self.step_forward_button,
-        ):
-            button.setMinimumHeight(button_height)
-            button.setStyleSheet("font-size: 20px; font-weight: 600; padding: 12px 18px;")
-
-        layout = QHBoxLayout(self)
+        layout = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-        layout.addWidget(self.pause_button)
-        layout.addWidget(self.speed_2x_button)
-        layout.addWidget(self.half_speed_button)
-        layout.addWidget(self.quarter_speed_button)
-        layout.addWidget(self.eighth_speed_button)
-        layout.addWidget(self.rewind_button)
-        layout.addWidget(self.step_back_button)
-        layout.addWidget(self.step_forward_button)
+        layout.setSpacing(8)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        for row, buttons in enumerate(
+            (
+                (self.pause_button, self.rewind_button),
+                (self.speed_2x_button, self.half_speed_button),
+                (self.quarter_speed_button, self.eighth_speed_button),
+                (self.step_back_button, self.step_forward_button),
+            )
+        ):
+            for column, button in enumerate(buttons):
+                button.setMinimumHeight(button_height)
+                layout.addWidget(button, row, column)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
         self.speed_2x_button.clicked.connect(self.speed_2x_requested.emit)
@@ -141,3 +151,11 @@ class RefereeControlsWidget(QWidget):
             self.pause_button.setText(_PLAY_LABEL)
         else:
             self.pause_button.setText(_PAUSE_LABEL)
+
+    def set_active_rate(self, playback_rate: float) -> None:
+        """Light the speed button matching the current playback rate.
+
+        Nothing is lit at 1x (no button for it) or while paused.
+        """
+        for button, rate in self._rate_buttons:
+            button.set_active(math.isclose(playback_rate, rate))

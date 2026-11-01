@@ -3,9 +3,10 @@
 Pins the production-vs-dev chrome split:
 
 - Default (`show_diagnostics=False`): `StatusBarWidget` and
-  `DiagnosticsWidget` are absent. The Qt `QStatusBar` and the
-  operator `AlertBanner` stay present — they're the only sinks for
-  transient transport messages and health-event alerts.
+  `DiagnosticsWidget` are absent. The control rail's
+  `TransientStatusLabel` and the operator `AlertBanner` stay present —
+  they're the only sinks for transient transport messages and
+  health-event alerts.
 - `show_diagnostics=True`: both legacy widgets are built and laid
   out (preserves pre-14.F behavior for developers).
 """
@@ -84,7 +85,7 @@ class DiagnosticsToggleTests(unittest.TestCase):
         )
         self.assertIsNone(window.status_widget)
         self.assertIsNone(window.diagnostics_widget)
-        # Qt status bar is always present — it's the only sink for
+        # The status label is always present — it's the only sink for
         # ad-hoc transport messages.
         self.assertIsNotNone(window._status_bar)
 

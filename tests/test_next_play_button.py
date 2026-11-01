@@ -104,6 +104,26 @@ class CoordinatorMarkNextPlayWiringTests(unittest.TestCase):
         coord.referee_controller.refresh_recording_state.assert_called_once()
         coord.operator_controller.refresh_recording_state.assert_called_once()
 
+    def test_end_game_status_reaches_both_windows(self) -> None:
+        # The operator presses End Game, so the confirmation can't be
+        # referee-only.
+        from app.core.application_coordinator import ApplicationCoordinator
+        coord = ApplicationCoordinator.__new__(ApplicationCoordinator)
+        coord._session_manager = mock.Mock()
+        coord._recording_manager = mock.Mock()
+        coord._recording_manager.is_any_recording.return_value = True
+        coord._feed_runtimes = {}
+        coord.clip_manager = None
+        coord.session_clock = None
+        coord.replay_store = mock.Mock()
+        coord.referee_controller = mock.Mock()
+        coord.operator_controller = mock.Mock()
+        coord.toggle_long_session_recording()
+        for controller in (coord.referee_controller, coord.operator_controller):
+            controller.signals.status_message.emit.assert_called_once_with(
+                "Game recording stopped."
+            )
+
     def test_mark_next_play_no_op_without_clip_manager(self) -> None:
         # Older test/coordinator paths construct without a ClipManager.
         # Method must be a clean no-op.

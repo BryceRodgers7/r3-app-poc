@@ -26,6 +26,11 @@ Gating (see `set_clip_state`):
   - Mark Play: enabled iff recording.
   - Begin/End Game: always enabled — pressing it IS the toggle.
 
+Latched highlights (see `set_clip_state`): Time-out and Challenge stay
+lit while that clip type is open, and Mark Play stays lit (and reads
+"Marked") while the open clip is marked. Mark Play has no other
+on-screen effect, so without this a press looks like it did nothing.
+
 End Game pops a confirmation modal before emitting the toggle. The
 confirmation callable is injected (`confirm_fn`) so tests can stub
 it without driving real Qt dialogs.
@@ -39,36 +44,17 @@ from typing import Optional
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QMessageBox,
-    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from app.core.models import CLIP_TYPE_CHALLENGE
+from app.core.models import CLIP_TYPE_CHALLENGE, CLIP_TYPE_TIMEOUT
+from app.ui.control_button import GO_TONE, STOP_TONE, ControlButton
 
 
-# Color-coded styling. Reused as the "challenge mode" red on the
-# referee window's play-number badge (Phase 14.C / 14.D) so the two
-# windows agree on what "active recording / dangerous action" red
-# looks like.
-_BEGIN_GAME_STYLE = (
-    "QPushButton { background-color: #2c8a3a; color: white; "
-    "font-size: 20px; font-weight: 700; padding: 12px 18px; "
-    "border-radius: 6px; }"
-    "QPushButton:hover { background-color: #34a045; }"
-    "QPushButton:pressed { background-color: #226e2e; }"
-)
-_END_GAME_STYLE = (
-    "QPushButton { background-color: #c33b3b; color: white; "
-    "font-size: 20px; font-weight: 700; padding: 12px 18px; "
-    "border-radius: 6px; }"
-    "QPushButton:hover { background-color: #d24747; }"
-    "QPushButton:pressed { background-color: #a02e2e; }"
-)
-_TRANSPORT_BUTTON_STYLE = (
-    "QPushButton { font-size: 18px; font-weight: 600; padding: 10px 16px; }"
-)
+_MARK_PLAY_LABEL = "Mark Play"
+_MARKED_LABEL = "✓ Marked"
 
 
 ConfirmFn = Callable[[QWidget, str, str], bool]
@@ -110,33 +96,29 @@ class OperatorControlsWidget(QWidget):
         self._confirm_fn: ConfirmFn = confirm_fn or _default_end_game_confirm
         self._is_recording = False
 
-        self.next_play_button = QPushButton("Next Play", self)
-        self.timeout_button = QPushButton("Time-out", self)
-        self.challenge_button = QPushButton("Challenge", self)
-        self.mark_play_button = QPushButton("Mark Play", self)
-        self.long_recording_button = QPushButton("Begin Game", self)
+        self.next_play_button = ControlButton("Next Play", self)
+        self.timeout_button = ControlButton("Time-out", self)
+        self.challenge_button = ControlButton("Challenge", self)
+        self.mark_play_button = ControlButton(_MARK_PLAY_LABEL, self)
+        self.long_recording_button = ControlButton(
+            "Begin Game", self, tone=GO_TONE, font_px=20
+        )
 
         for button in (
             self.next_play_button,
             self.timeout_button,
             self.challenge_button,
             self.mark_play_button,
+            self.long_recording_button,
         ):
             button.setMinimumHeight(button_height)
-            button.setStyleSheet(_TRANSPORT_BUTTON_STYLE)
             button.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
             )
 
-        self.long_recording_button.setMinimumHeight(button_height)
-        self.long_recording_button.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self._apply_recording_button_style(is_recording=False)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         layout.addWidget(self.next_play_button)
         layout.addWidget(self.timeout_button)
         layout.addWidget(self.challenge_button)
@@ -207,12 +189,14 @@ class OperatorControlsWidget(QWidget):
         is_recording: bool,
         has_play_started: bool,
         current_clip_type: str | None,
+        is_marked: bool = False,
     ) -> None:
-        """Re-evaluate per-clip button enables.
+        """Re-evaluate per-clip button enables and latched highlights.
 
         Driven from `MainWindow._render_state` on every UiState tick.
         `has_play_started` is `state.current_play_number is not None`;
-        `current_clip_type` is `state.current_clip_type`.
+        `current_clip_type` is `state.current_clip_type`;
+        `is_marked` is `state.current_clip_marked`.
         """
         self._is_recording = is_recording
         self.next_play_button.setEnabled(is_recording)
@@ -221,6 +205,12 @@ class OperatorControlsWidget(QWidget):
         in_challenge = current_clip_type == CLIP_TYPE_CHALLENGE
         self.challenge_button.setEnabled(play_dependent and not in_challenge)
         self.mark_play_button.setEnabled(is_recording)
+        self.timeout_button.set_active(current_clip_type == CLIP_TYPE_TIMEOUT)
+        self.challenge_button.set_active(in_challenge)
+        self.mark_play_button.set_active(is_marked)
+        self.mark_play_button.setText(
+            _MARKED_LABEL if is_marked else _MARK_PLAY_LABEL
+        )
 
     # ------------------------------------------------------------------
     # Internal click handler — End Game requires confirmation
@@ -236,8 +226,12 @@ class OperatorControlsWidget(QWidget):
             "Are you sure you want to end this game?",
         )
         if confirmed:
+            # Stopping blocks the UI thread for over a second, and the
+            # press flash expired behind the modal.
+            self.long_recording_button.flash()
             self.long_recording_toggle_requested.emit()
 
     def _apply_recording_button_style(self, *, is_recording: bool) -> None:
-        style = _END_GAME_STYLE if is_recording else _BEGIN_GAME_STYLE
-        self.long_recording_button.setStyleSheet(style)
+        self.long_recording_button.set_tone(
+            STOP_TONE if is_recording else GO_TONE
+        )

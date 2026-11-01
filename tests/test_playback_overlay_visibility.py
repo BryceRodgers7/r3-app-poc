@@ -80,5 +80,72 @@ class ControllerPropagatesIsRecordingTests(unittest.TestCase):
         self.assertFalse(controller._state.playback_overlay.is_recording)
 
 
+class ControllerPropagatesClipMarkTests(unittest.TestCase):
+    """The open clip's `marked` flag reaches UiState, so the Mark Play
+    button can show the press took effect."""
+
+    def _controller(self, clip_manager) -> PlaybackController:
+        from app.core.recording_state import RecordingState
+
+        controller = PlaybackController.__new__(PlaybackController)
+        controller._state = UiState()
+        controller._state.current_playback_mode = PlaybackMode.LIVE
+        controller._latest_live_timestamp = None
+        controller._latest_live_overlay = type("F", (), {"feed_id": "f"})()
+        controller._playback_session_time_ns = None
+        controller._playback_rate = 1.0
+        controller._session_clock = None
+        controller._clip_manager = clip_manager
+        controller._replay_store = type(
+            "S", (), {
+                "available_session_time_range": lambda self: (None, None),
+            }
+        )()
+        controller._recording_manager = type(
+            "RM", (), {
+                "recording_state": type(
+                    "S", (), {"state": RecordingState.NOT_RECORDING}
+                )()
+            }
+        )()
+        return controller
+
+    def _clip_manager(self, clip):
+        return type(
+            "CM", (), {
+                "current_play_number": lambda self: None,
+                "current_clip": lambda self: clip,
+            }
+        )()
+
+    def test_marked_clip(self) -> None:
+        clip = type(
+            "C", (), {"clip_number": 3, "type": "play", "marked": True}
+        )()
+        controller = self._controller(self._clip_manager(clip))
+        controller._update_state_timestamps_locked()
+        self.assertTrue(controller._state.current_clip_marked)
+
+    def test_unmarked_clip(self) -> None:
+        clip = type(
+            "C", (), {"clip_number": 3, "type": "play", "marked": False}
+        )()
+        controller = self._controller(self._clip_manager(clip))
+        controller._update_state_timestamps_locked()
+        self.assertFalse(controller._state.current_clip_marked)
+
+    def test_no_open_clip_clears_the_flag(self) -> None:
+        controller = self._controller(self._clip_manager(None))
+        controller._state.current_clip_marked = True
+        controller._update_state_timestamps_locked()
+        self.assertFalse(controller._state.current_clip_marked)
+
+    def test_no_clip_manager_clears_the_flag(self) -> None:
+        controller = self._controller(None)
+        controller._state.current_clip_marked = True
+        controller._update_state_timestamps_locked()
+        self.assertFalse(controller._state.current_clip_marked)
+
+
 if __name__ == "__main__":
     unittest.main()

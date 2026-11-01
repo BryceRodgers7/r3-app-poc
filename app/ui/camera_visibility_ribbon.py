@@ -9,10 +9,12 @@ State is per-window: the operator hiding camera 3 does NOT hide it
 on the referee window, and recording / ingest continue normally for
 hidden feeds. The ribbon is purely a UI toggle.
 
-The PDF mock shows a "Clip selector widget" label to the left of
-the camera buttons. Phase 14.B renders that as a non-interactive
-QLabel showing the current clip type/number; the future enhancement
-(clicking it to browse past clips) is out of scope.
+The PDF mock shows a "Clip selector widget" label beside the camera
+buttons. Phase 14.B renders that as a non-interactive QLabel showing
+the current clip type/number; the future enhancement (clicking it to
+browse past clips) is out of scope. It sits above the buttons now,
+at the top of the window's control rail — the readout is the on-screen
+result of Next Play, so it has to be easy to see.
 """
 
 from __future__ import annotations
@@ -21,35 +23,26 @@ from collections.abc import Sequence
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QHBoxLayout,
+    QGridLayout,
     QLabel,
-    QPushButton,
     QSizePolicy,
+    QVBoxLayout,
     QWidget,
 )
 
 from app.core.models import CLIP_TYPE_PLAY, FeedDefinition
+from app.ui.control_button import ControlButton
 
 
-_RIBBON_BUTTON_STYLE_VISIBLE = (
-    "QPushButton { background-color: #2c5a8a; color: white; "
-    "font-size: 16px; font-weight: 700; padding: 8px 14px; "
-    "min-width: 44px; border-radius: 4px; }"
-    "QPushButton:hover { background-color: #36699e; }"
-)
-_RIBBON_BUTTON_STYLE_HIDDEN = (
-    "QPushButton { background-color: #3a3a3a; color: #b0b0b0; "
-    "font-size: 16px; font-weight: 700; padding: 8px 14px; "
-    "min-width: 44px; border-radius: 4px; }"
-    "QPushButton:hover { background-color: #4a4a4a; }"
-)
+_BUTTONS_PER_ROW = 4
+_BUTTON_HEIGHT = 44
 _SELECTOR_LABEL_STYLE = (
-    "QLabel { color: #c8c8c8; font-size: 13px; font-weight: 600; }"
+    "QLabel { color: #f4f6f8; font-size: 18px; font-weight: 700; }"
 )
 
 
 class CameraVisibilityRibbon(QWidget):
-    """Horizontal ribbon of per-feed visibility toggle buttons."""
+    """Clip readout above a grid of per-feed visibility toggle buttons."""
 
     feed_visibility_toggled = Signal(str, bool)
 
@@ -59,37 +52,43 @@ class CameraVisibilityRibbon(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._buttons_by_feed: dict[str, QPushButton] = {}
+        self._buttons_by_feed: dict[str, ControlButton] = {}
 
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
         self.selector_label = QLabel("Clip selector widget", self)
         self.selector_label.setStyleSheet(_SELECTOR_LABEL_STYLE)
-        self.selector_label.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred
-        )
+        self.selector_label.setWordWrap(True)
         layout.addWidget(self.selector_label)
-        layout.addSpacing(8)
 
-        for index, feed in enumerate(feeds, start=1):
-            button = QPushButton(str(index), self)
+        buttons = QGridLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(6)
+        # Stretch every column, used or not, so buttons are the same
+        # width however many feeds are enabled.
+        for column in range(_BUTTONS_PER_ROW):
+            buttons.setColumnStretch(column, 1)
+        layout.addLayout(buttons)
+
+        for index, feed in enumerate(feeds):
+            button = ControlButton(str(index + 1), self, font_px=16)
             button.setCheckable(True)
             button.setChecked(True)
+            button.set_active(True)
             button.setToolTip(f"Show/hide {feed.display_name}")
-            button.setStyleSheet(_RIBBON_BUTTON_STYLE_VISIBLE)
+            button.setMinimumHeight(_BUTTON_HEIGHT)
             button.setSizePolicy(
-                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
             )
             # Capture `feed.feed_id` at definition time.
             button.toggled.connect(
                 lambda checked, fid=feed.feed_id: self._on_toggled(fid, checked)
             )
             self._buttons_by_feed[feed.feed_id] = button
-            layout.addWidget(button)
-
-        layout.addStretch(1)
+            row, column = divmod(index, _BUTTONS_PER_ROW)
+            buttons.addWidget(button, row, column)
 
     def set_selector_label(
         self,
@@ -121,9 +120,5 @@ class CameraVisibilityRibbon(QWidget):
     def _on_toggled(self, feed_id: str, visible: bool) -> None:
         button = self._buttons_by_feed.get(feed_id)
         if button is not None:
-            button.setStyleSheet(
-                _RIBBON_BUTTON_STYLE_VISIBLE
-                if visible
-                else _RIBBON_BUTTON_STYLE_HIDDEN
-            )
+            button.set_active(visible)
         self.feed_visibility_toggled.emit(feed_id, visible)

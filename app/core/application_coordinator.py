@@ -289,7 +289,7 @@ class ApplicationCoordinator:
                 session_sm.transition_to(SessionState.STOPPED)
             self.referee_controller.refresh_recording_state()
             self.operator_controller.refresh_recording_state()
-            self.referee_controller.signals.status_message.emit("Game recording stopped.")
+            self._emit_clip_status("Game recording stopped.")
             return
         # Phase 10.C: pre-flight disk-space check before any state moves.
         # Refuses Start when free space wouldn't cover one grace window
@@ -396,7 +396,7 @@ class ApplicationCoordinator:
             session_sm.transition_to(SessionState.RECORDING)
         self.referee_controller.refresh_recording_state()
         self.operator_controller.refresh_recording_state()
-        self.referee_controller.signals.status_message.emit("Game recording started.")
+        self._emit_clip_status("Game recording started.")
 
     def _emit_clip_status(self, message: str) -> None:
         """Broadcast a status message to both windows.

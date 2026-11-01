@@ -2,9 +2,36 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QGridLayout, QLabel, QFrame, QWidget
 
 from app.core.app_state import UiState
+
+
+class TransientStatusLabel(QLabel):
+    """Transient transport messages, shown in the window's control rail.
+
+    Stands in for a `QStatusBar`, whose strip along the bottom of the
+    window would come straight off the video panel's height. Wraps
+    rather than truncating because the rail is narrow.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self.setWordWrap(True)
+        self.setStyleSheet("QLabel { color: #aeb6c2; font-size: 13px; }")
+        # Reserve two lines so most messages don't nudge the controls.
+        self.setMinimumHeight(2 * self.fontMetrics().lineSpacing())
+        self._clear_timer = QTimer(self)
+        self._clear_timer.setSingleShot(True)
+        self._clear_timer.timeout.connect(self.clear)
+
+    def show_message(self, message: str, timeout_ms: int = 0) -> None:
+        """Show `message`, until replaced or for `timeout_ms` if non-zero."""
+        self._clear_timer.stop()
+        self.setText(message)
+        if timeout_ms > 0:
+            self._clear_timer.start(timeout_ms)
 
 
 class StatusBarWidget(QFrame):
