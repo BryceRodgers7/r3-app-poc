@@ -34,11 +34,11 @@ from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
 from app.ui.referee_controls_widget import RefereeControlsWidget
 from app.ui.status_bar_widget import StatusBarWidget, TransientStatusLabel
+from app.ui.theme import WINDOW_BACKGROUND as _WINDOW_BACKGROUND
 
 _VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
 _CONTROL_RAIL_WIDTH = 220
 _LAYOUT_GAP = 6
-_WINDOW_BACKGROUND = "#14171c"
 
 
 class MainWindow(QMainWindow):

@@ -74,10 +74,11 @@ class StatusBarWidget(QFrame):
         self.setStyleSheet(
             """
             QFrame {
-                background-color: #f2f2f2;
+                background-color: #1c2027;
                 border-radius: 8px;
             }
             QLabel {
+                color: #f4f6f8;
                 font-size: 14px;
             }
             """

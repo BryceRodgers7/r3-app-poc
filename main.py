@@ -27,6 +27,7 @@ from app.storage.session_recovery import (
 )
 from app.ui.main_window import MainWindow
 from app.ui.recovery_dialog import RecoveryDialog
+from app.ui.theme import apply_dark_theme
 
 
 def build_application() -> tuple[QApplication, ApplicationCoordinator, list[MainWindow]]:
@@ -36,6 +37,9 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName(settings.app_name)
+    # Before any window or dialog — the startup recovery prompt below
+    # included — so nothing renders with the OS light theme.
+    apply_dark_theme(qt_app)
 
     file_manager = FileManager(settings)
     metadata_db = MetadataDb(settings.metadata_db_path)
