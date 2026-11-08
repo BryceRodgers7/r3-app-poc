@@ -77,6 +77,27 @@ class StopAllRemembersRecordingTests(unittest.TestCase):
         # submitted; it must not survive into the new pipeline.
         self.assertEqual(calls, ["teardown", "finalize", "submit"])
 
+    def test_stop_all_does_not_index_a_segment_file_that_never_got_data(self) -> None:
+        # A feed that froze right after Start: one counted frame, 0 bytes.
+        pm, calls = self._stoppable(recording=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "segment_00000.mkv"
+            empty.write_bytes(b"")
+            pm._pending_segment = {"file_path": str(empty), "frame_count": 1}
+            pm.stop_all()
+        self.assertNotIn("finalize", calls)
+        self.assertIsNone(pm._pending_segment)
+        self.assertTrue(pm._recording_resume_after_rebuild)
+
+    def test_stop_all_indexes_a_segment_file_that_has_data(self) -> None:
+        pm, calls = self._stoppable(recording=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = Path(tmp) / "segment_00003.mkv"
+            partial.write_bytes(b"segment-data" * 100)
+            pm._pending_segment = {"file_path": str(partial), "frame_count": 90}
+            pm.stop_all()
+        self.assertIn("finalize", calls)
+
     def test_stop_all_when_not_recording_does_not_flag_a_resume(self) -> None:
         pm, calls = self._stoppable(recording=False)
         pm._pending_segment = {"stale": True}

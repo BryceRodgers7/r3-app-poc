@@ -714,8 +714,19 @@ class PipelineManager:
             # has to go before the new pipeline starts: the encoder probe
             # updates `_pending_segment` in place, and the new pipeline's
             # PTS restart at 0, which would overwrite this segment's
-            # last_pts. Empty segments are dropped by the finalizer.
-            self._finalize_pending_segment_locked()
+            # last_pts.
+            pending = self._pending_segment
+            if pending is not None and self._bytes_written(pending) <= 0:
+                # A feed that froze right after Start has a segment file
+                # that never got any data (and one counted frame). Indexing
+                # it would only hand replay a file it can't open.
+                LOGGER.info(
+                    "not indexing %s after teardown: nothing was written to it",
+                    pending.get("file_path"),
+                )
+                self._pending_segment = None
+            else:
+                self._finalize_pending_segment_locked()
         else:
             self._pending_segment = None
         # The pipeline is at NULL, so every fragment file is closed and
@@ -738,6 +749,13 @@ class PipelineManager:
         self._segment_validator_worker = SegmentValidatorWorker(
             self._source.get_feed_id()
         )
+
+    @staticmethod
+    def _bytes_written(pending: dict[str, Any]) -> int:
+        try:
+            return Path(pending["file_path"]).stat().st_size
+        except (OSError, KeyError):
+            return 0
 
     def is_source_connected(self) -> bool:
         """Return whether the underlying ingest source is connected."""
