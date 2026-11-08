@@ -4,14 +4,33 @@ Date: 2026-10-25
 Hardware under test: one Zowietek POV 4K camera (`POVZOOM-47800 (POVZoom-47800)`),
 wired 1 Gb Ethernet to the dev PC (Intel I219-LM), GStreamer 1.28.2 on MSYS2 UCRT64.
 
-> **Status (2026-10-27):** recommendations 1 and 4 are implemented on branch
-> `ndi-timestamp-mode`, pending the section 6 validation with the camera.
-> `ndisrc` now gets `timestamp-mode=receive-time-vs-timestamp` by default, with
-> a per-feed `ndi_timestamp_mode` override on `[[feeds]]` (and `[source]`).
-> `source_fps` is counted ahead of `videorate`, and the 1Hz telemetry line
-> gained `vrate_drop_per_s` / `vrate_dup_per_s`. Recommendations 2 and 3 are
-> not done. The "no config-file equivalent" notes below describe the code before
-> that branch.
+> **Status: RESOLVED (2026-11-07).** The root cause was fixed in commit
+> `2885c6f` (2026-10-27, now on `main`). Recommendations 1 and 4 are
+> implemented: `ndisrc` gets `timestamp-mode=receive-time-vs-timestamp` by
+> default, with a per-feed `ndi_timestamp_mode` override on `[[feeds]]` (and
+> `[source]`); `source_fps` is counted ahead of `videorate`; and the 1Hz
+> telemetry line gained `vrate_drop_per_s` / `vrate_dup_per_s`. The "no
+> config-file equivalent" notes below describe the code before that fix.
+>
+> **Confirmed on 2026-11-07** with two Zowietek POV cameras at 1280x720@60:
+> - `app.log` shows `timestamp_mode=receive-time-vs-timestamp` on every NDI
+>   chain, and `source_fps` / `preview_fps` / `recording_fps` all read about
+>   60 (previously 9-16).
+> - Recorded segments hold 240 frames per 3.98 s (about 60 fps). Frames
+>   identical to the previous frame fell from 76-85% (section 3.5) to
+>   3.4-7.5% in three sampled segments.
+>
+> **Not done, and not needed to close this:** recommendations 2 and 3 (skip
+> `videorate` when rates already match; make the per-window preview queues use
+> the configurable policy). The residual 3-7 drops and duplicates per second at
+> 60 fps come from `videorate` and match those few percent of repeated frames.
+> Section 6 items 3 (audio/video sync) and 5 (other NDI senders) were not
+> re-checked.
+>
+> This fix is unrelated to the Begin Game freeze (tracked in
+> [`NDI_OPEN_BUGS.md`](NDI_OPEN_BUGS.md)). The few percent of repeated frames
+> left here are too few to explain choppy 1x replay, which was measured
+> separately as a replay-decode cost.
 
 No application code or settings were changed during this investigation. Every
 result below comes from reading the code, today's `C:\SportsReplay\logs\app.log`
