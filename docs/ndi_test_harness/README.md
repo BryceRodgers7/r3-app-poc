@@ -6,7 +6,9 @@ reference tooling, not product code, and `C:/git/r3-app` is hard-coded in the
 
 | Script | What it does | Takes the mouse? |
 |---|---|---|
-| `cycle.py` | Repeats Begin/End Game and counts feeds that freeze | No |
+| `launch_once.py` | One fresh launch, one Begin Game (a game 1), stall check, native stack dumps if a feed stalls | No |
+| `run_launches.sh` | Runs `launch_once.py` N times, wiping the data folder between launches | No |
+| `cycle.py` | Repeats Begin/End Game in one session. **Cannot reproduce the Begin Game freeze** (only its first cycle is a game 1); useful for games 2+ | No |
 | `drive_ndi.py` | Full transport run, reading pictures from the screen | No |
 | `drive_zoom.py` | Zoom, pan, seek bar with real Win32 input | **Yes** |
 | `compare.py` | Same transitions on either code version | No |
@@ -53,6 +55,21 @@ python=C:/msys64/ucrt64/bin/python.exe
 ```
 
 ## Reproduce the Begin Game freeze
+
+The freeze happens at the first Begin Game after a launch (bug 1 in
+[`../NDI_OPEN_BUGS.md`](../NDI_OPEN_BUGS.md)). Each trial therefore has to be a
+fresh launch:
+
+```bash
+cd C:/temp/r3-harness            # holds app_settings.toml (base_data_dir under r3-harness)
+R3_REPO=C:/git/r3-app/r3-app-poc DATA_DIR=C:/temp/r3-harness/data LAUNCHES=12 \n    bash <harness>/run_launches.sh
+```
+
+It prints one `RESULT` line per launch and, for any stalled feed, leaves two
+native stack dumps in `stacks/`. Run it on the branch under test and on `main`
+and compare. Don't run anything else on the same cameras at the same time. The
+script wipes `DATA_DIR` before each launch and refuses unless the path contains
+`r3-harness`.
 
 `cycle.py` and `compare.py` take the code version from `R3_REPO`:
 

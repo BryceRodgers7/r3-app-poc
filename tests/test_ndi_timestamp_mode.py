@@ -108,6 +108,11 @@ def _bare_pipeline_manager() -> tuple[PipelineManager, FeedMetrics]:
     pm._preview_running = True
     pm._live_sample_callback = None
     pm._ingest_rate_element = None
+    # The ingest probe also counts frames (the recording-resume worker waits
+    # on it) and runs the one-shot audio-missing check; that check is
+    # already spent here.
+    pm._ingest_frame_count = 0
+    pm._audio_missing_warned = True
     return pm, metrics
 
 
@@ -119,6 +124,12 @@ class PipelineManagerIngestTelemetryTests(unittest.TestCase):
         snap = metrics.snapshot()
         self.assertGreater(snap.source_fps, 0.0)
         self.assertEqual(snap.preview_fps, 0.0)
+
+    def test_ingest_probe_counts_frames_for_the_recording_resume_worker(self) -> None:
+        pm, _ = _bare_pipeline_manager()
+        for _ in range(5):
+            pm._on_ingest_frame_probe(None, None, None)
+        self.assertEqual(pm._ingest_frame_count, 5)
 
     def test_preview_probe_no_longer_ticks_source(self) -> None:
         # source_fps used to be ticked here, past the leaky preview queue,

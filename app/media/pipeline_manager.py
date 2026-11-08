@@ -395,6 +395,19 @@ class PipelineManager:
         # once a fresh-PTS buffer flows so steady-state recording isn't
         # taxed by per-buffer comparisons.
         self._audio_stale_pts_drop_floor_ns: int | None = None
+        # Mid-game rebuild support. `stop_all` (called by
+        # `FeedRuntime.rebuild` after a feed is declared lost) tears the
+        # pipeline down and clears `_recording_running`; without these the
+        # rebuilt pipeline kept writing segment files that no probe
+        # counted, so the feed's footage never reached the metadata DB.
+        # `_recording_resume_after_rebuild` records that recording was armed
+        # when the old pipeline went away; `connect_source` then starts a
+        # worker that re-arms it once the new pipeline is delivering.
+        # `_pipeline_generation` lets that worker notice it was superseded;
+        # `_ingest_frame_count` is how it knows video is flowing again.
+        self._recording_resume_after_rebuild: bool = False
+        self._pipeline_generation: int = 0
+        self._ingest_frame_count: int = 0
 
     def describe_architecture(self) -> str:
         """Describe the current tee/fan-out architecture."""
@@ -430,11 +443,23 @@ class PipelineManager:
         (fresh session) preserves the original behavior.
         """
         if self._splitmuxsink is None:
+            # No pipeline right now: the feed is between `stop_all` and
+            # `connect_source` (rebuilding), or has not connected yet.
+            # Remember the request so the (re)connect arms recording for
+            # this game instead of silently leaving the feed out of it.
             LOGGER.warning(
                 "enable_file_recording called but recording branch is not "
-                "configured; ignoring."
+                "configured (feed down?); will arm recording when it connects."
             )
+            self._recording_session_paths = session_paths
+            self._recording_feed_id = feed_id or self._source.get_feed_id()
+            self._recording_game_subdir = game_subdir
+            self._recording_segment_counter = max(0, int(start_fragment_index))
+            self._recording_resume_after_rebuild = True
             return
+        # An explicit Start supersedes any automatic re-arm still pending
+        # from a mid-game rebuild.
+        self._recording_resume_after_rebuild = False
         self._recording_session_paths = session_paths
         self._recording_feed_id = feed_id or self._source.get_feed_id()
         self._recording_game_subdir = game_subdir
@@ -535,6 +560,12 @@ class PipelineManager:
         the rotation + async-finalize worker thread complete, we close
         the valve and drop the new (post-split) pending segment.
         """
+        # The operator is ending the game: a resume still pending from a
+        # mid-game rebuild must not restart recording afterwards.
+        self._recording_resume_after_rebuild = False
+        # Lets an in-flight resume worker notice a Stop that landed while
+        # it was inside `enable_file_recording`.
+        self._recording_disable_count = getattr(self, "_recording_disable_count", 0) + 1
         counter_before = self._recording_segment_counter
 
         # 1. Emit split-now while buffers can still reach splitmuxsink.
@@ -645,6 +676,12 @@ class PipelineManager:
     def stop_all(self) -> None:
         """Stop all branches, tear down the pipeline, and disconnect the source."""
         self._preview_running = False
+        # If recording was armed, remember it: `FeedRuntime.rebuild` calls
+        # this mid-game, and `connect_source` re-arms recording on the new
+        # pipeline (see `_schedule_recording_resume`).
+        was_recording = bool(getattr(self, "_recording_running", False))
+        if was_recording:
+            self._recording_resume_after_rebuild = True
         self._recording_running = False
         self._stop_event.set()
 
@@ -671,6 +708,27 @@ class PipelineManager:
 
         self._teardown_pipeline()
         self._source.disconnect_source()
+        if was_recording:
+            # Index the partial segment the old pipeline was writing so the
+            # footage recorded before the dropout stays replayable. It also
+            # has to go before the new pipeline starts: the encoder probe
+            # updates `_pending_segment` in place, and the new pipeline's
+            # PTS restart at 0, which would overwrite this segment's
+            # last_pts.
+            pending = self._pending_segment
+            if pending is not None and self._bytes_written(pending) <= 0:
+                # A feed that froze right after Start has a segment file
+                # that never got any data (and one counted frame). Indexing
+                # it would only hand replay a file it can't open.
+                LOGGER.info(
+                    "not indexing %s after teardown: nothing was written to it",
+                    pending.get("file_path"),
+                )
+                self._pending_segment = None
+            else:
+                self._finalize_pending_segment_locked()
+        else:
+            self._pending_segment = None
         # The pipeline is at NULL, so every fragment file is closed and
         # the bus thread that would have read their close messages has
         # exited — validate whatever was still waiting.
@@ -692,6 +750,13 @@ class PipelineManager:
             self._source.get_feed_id()
         )
 
+    @staticmethod
+    def _bytes_written(pending: dict[str, Any]) -> int:
+        try:
+            return Path(pending["file_path"]).stat().st_size
+        except (OSError, KeyError):
+            return 0
+
     def is_source_connected(self) -> bool:
         """Return whether the underlying ingest source is connected."""
         return self._source.is_connected()
@@ -705,14 +770,138 @@ class PipelineManager:
             self._ensure_gstreamer_loaded()
             self._build_pipeline()
             self._start_pipeline_threads()
-            # Keep the record branch draining the tee even when not writing to disk; closing
-            # it can block preroll and stall preview/replay on multi-branch pipelines.
-            self._set_branch_enabled("record", True)
+            # The record valve stays CLOSED until `enable_file_recording`.
+            # It used to be opened here "to keep the branch draining the
+            # tee, because closing it can block preroll and stall the
+            # preview". That worry was real: a closed valve left the
+            # pipeline's PAUSED->PLAYING change pending and the preview got
+            # no frames. `_build_splitmuxsink_element` now sets
+            # `async-handling` on splitmuxsink, which removes that
+            # dependency. Leaving the valve open instead had made
+            # splitmuxsink encode and write throwaway files all session and
+            # left Begin Game splicing an audio pad onto an element that
+            # was already mid-file; that splice is what deadlocked a feed
+            # (docs/NDI_OPEN_BUGS.md, bug 1). Closed, the first Start takes
+            # the same fresh-splitmuxsink path as every later game.
         except Exception:
             self._teardown_pipeline()
             self._source.disconnect_source()
             raise
+        if self._recording_resume_after_rebuild:
+            self._schedule_recording_resume()
         return True
+
+    # Mid-game rebuild: how long the resume worker waits for the new
+    # pipeline to deliver video, and for the audio decision to settle,
+    # before re-arming recording.
+    RESUME_VIDEO_FRAMES = 30
+    RESUME_AUDIO_GRACE_SECONDS = 2.0
+    RESUME_GIVE_UP_SECONDS = 45.0
+
+    def _schedule_recording_resume(self) -> None:
+        """Re-arm recording on a rebuilt pipeline once it is delivering.
+
+        `stop_all` + `connect_source` replace the whole pipeline when a
+        feed is declared lost, but the operator's game is still running.
+        Nothing used to re-enable recording on the new pipeline, so its
+        splitmuxsink wrote files that no probe counted and the feed's
+        segments never reached the DB. The audio branch can only be added
+        before video flows into splitmuxsink, so this waits until video is
+        arriving and audio has either been seen or given up on, then runs
+        the normal `enable_file_recording` path on a worker thread.
+        """
+        generation = self._pipeline_generation
+        feed_id = self._recording_feed_id or self._source.get_feed_id()
+        threading.Thread(
+            target=self._resume_recording_worker,
+            args=(generation,),
+            name=f"recording-resume-{feed_id}",
+            daemon=True,
+        ).start()
+
+    def _resume_recording_worker(self, generation: int) -> None:
+        started = time.monotonic()
+        video_flowing_since: float | None = None
+        while time.monotonic() - started < self.RESUME_GIVE_UP_SECONDS:
+            if (
+                generation != self._pipeline_generation
+                or self._stop_event.is_set()
+                or not self._recording_resume_after_rebuild
+            ):
+                # Superseded by another rebuild (which schedules its own
+                # worker), a shutdown, or an explicit Start/Stop.
+                return
+            if self._ingest_frame_count >= self.RESUME_VIDEO_FRAMES:
+                now = time.monotonic()
+                if video_flowing_since is None:
+                    video_flowing_since = now
+                audio_settled = (
+                    not self._recording_audio_enabled
+                    or self._audio_format is None
+                    or self._audio_present_observed
+                    or now - video_flowing_since >= self.RESUME_AUDIO_GRACE_SECONDS
+                )
+                if audio_settled:
+                    break
+            time.sleep(0.1)
+        else:
+            LOGGER.warning(
+                "recording resume for feed_id=%s gave up after %.0fs: no video "
+                "from the rebuilt pipeline",
+                self._recording_feed_id,
+                self.RESUME_GIVE_UP_SECONDS,
+            )
+            record_health_event(
+                severity=HealthSeverity.WARNING,
+                category="recording_resume_failed",
+                message=(
+                    f"feed={self._recording_feed_id}: no video from the rebuilt "
+                    f"pipeline within {self.RESUME_GIVE_UP_SECONDS:.0f}s; this "
+                    f"feed is not recording."
+                ),
+                feed_id=self._recording_feed_id,
+            )
+            return
+
+        session_paths = self._recording_session_paths
+        if session_paths is None or generation != self._pipeline_generation:
+            return
+        feed_id = self._recording_feed_id
+        disables_before = getattr(self, "_recording_disable_count", 0)
+        try:
+            # `enable_file_recording` clears the pending flag; the segment
+            # counter carries on from the old pipeline so no filename is
+            # reused.
+            self.enable_file_recording(
+                session_paths,
+                feed_id,
+                start_fragment_index=self._recording_segment_counter,
+                game_subdir=self._recording_game_subdir,
+            )
+        except Exception:
+            LOGGER.exception("recording resume failed for feed_id=%s", feed_id)
+            record_health_event(
+                severity=HealthSeverity.ERROR,
+                category="recording_resume_failed",
+                message=f"feed={feed_id}: re-arming recording after a rebuild raised.",
+                feed_id=feed_id,
+            )
+            return
+        if getattr(self, "_recording_disable_count", 0) != disables_before:
+            # The operator pressed Stop while we were re-arming; undo it.
+            LOGGER.info(
+                "recording resume for feed_id=%s raced with Stop; disabling again",
+                feed_id,
+            )
+            self.disable_file_recording()
+            return
+        LOGGER.info("recording re-armed after rebuild for feed_id=%s", feed_id)
+        record_health_event(
+            severity=HealthSeverity.INFO,
+            category="recording_resumed",
+            message=f"feed={feed_id}: recording re-armed after a pipeline rebuild.",
+            feed_id=feed_id,
+        )
 
     def set_frame_callback(self, callback: Callable[[MediaFrame], None]) -> None:
         """Register the legacy preview-frame callback."""
@@ -1115,6 +1304,16 @@ class PipelineManager:
             # this anchor and emits a health event if `recording_audio_enabled`
             # is True but no audio buffer has arrived after the grace.
             self._pipeline_started_monotonic_ns = time.monotonic_ns()
+            self._pipeline_generation += 1
+            self._ingest_frame_count = 0
+            # The splitmuxsink built above has never seen data. Treating it
+            # as "previously disabled" makes the first Start take the same
+            # path as every later game: `enable_file_recording` replaces it
+            # with a fresh element that gets its audio_%u pad (and video
+            # link) BEFORE any video flows. Adding the audio pad to an
+            # element already mid-file is what deadlocked a feed at Begin
+            # Game (docs/NDI_OPEN_BUGS.md, bug 1).
+            self._recording_was_disabled = True
 
     def _configure_preview_queue(self, queue: Any, branch_name: str) -> None:
         """Apply the §4.3 preview queue policy.
@@ -1474,6 +1673,11 @@ class PipelineManager:
         """
         if self._feed_metrics is not None:
             self._feed_metrics.tick_source()
+        self._ingest_frame_count += 1
+        # The record branch's own probe used to run this check, but the
+        # record valve is now closed until Start, so run it here too.
+        # `_maybe_warn_audio_missing` fires at most once.
+        self._maybe_warn_audio_missing()
         return self._Gst.PadProbeReturn.OK
 
     def _add_record_branch_via_splitmuxsink(self, branch_name: str) -> None:
@@ -1780,6 +1984,14 @@ class PipelineManager:
         # `async-finalize=True` finalizes closed segments on a worker thread
         # so the streaming thread never blocks on disk flush.
         self._set_property_if_supported(sink, "async-finalize", True)
+        # splitmuxsink is a bin whose output only prerolls once a buffer
+        # reaches it, and the record valve stays closed until Start. Left
+        # alone, the parent pipeline reports its PAUSED->PLAYING change as
+        # ASYNC forever and a live preview sink (d3d11videosink is async)
+        # receives no frames at all. `async-handling` makes the bin absorb
+        # its children's async state changes instead of passing them up.
+        # Measured: preview 0 fps without it, ~58 fps with it.
+        self._set_property_if_supported(sink, "async-handling", True)
         sink.connect("format-location", self._on_splitmuxsink_format_location)
         return sink
 
@@ -1907,13 +2119,22 @@ class PipelineManager:
         # branch now so this game's segments get audio. No-op when
         # the branch is already built (the second helper below
         # re-links it) or when audio still hasn't been seen.
+        audio_chain_existed = self._audio_record_encoder is not None
         self._ensure_audio_record_branch_built_locked()
         # Phase 7.G: re-attach the existing audio_record chain BEFORE
         # the element is brought up. Order matters for matroskamux
         # caps negotiation (see comment in
         # `_add_audio_record_branch_to_splitmuxsink`). No-op when
         # `_audio_record_encoder` is None (audio never observed).
-        self._link_audio_encoder_to_splitmuxsink_locked(new_sink)
+        #
+        # Skipped when the chain was only just built above: that build
+        # already requested `audio_%u` on `new_sink` and linked the
+        # encoder. Requesting a second pad would leave the first one
+        # empty, and splitmuxsink holds the video back until every
+        # stream (including an empty audio one) has data. The first
+        # Start of a session now reaches this path with no chain built.
+        if audio_chain_existed:
+            self._link_audio_encoder_to_splitmuxsink_locked(new_sink)
         link_ok = encoder.link(new_sink)
         LOGGER.info(
             "rebuild_splitmuxsink: encoder.link(new) returned %s element=%s",
@@ -3525,5 +3746,18 @@ class PipelineManager:
             self._stream_start_timestamp = None
             self._audio_stream_start_timestamp = None
             self._audio_format = None
+            # Per-pipeline recording state. These all reference elements of
+            # the pipeline that was just torn down. Leaving them set made
+            # the rebuilt pipeline's next Start try to link the DEAD
+            # pipeline's opusenc into the new splitmuxsink
+            # (PadLinkReturn.WRONG_HIERARCHY), so that feed recorded zero
+            # segments in the following game. The new pipeline re-detects
+            # audio and rebuilds the chain itself.
+            self._audio_record_encoder = None
+            self._audio_present_observed = False
+            self._audio_record_first_buffer_at_ns = None
+            self._audio_stale_pts_drop_floor_ns = None
+            self._splitmuxsink = None
+            self._record_branch_encoder = None
             with self._metadata_lock:
                 self._frame_metadata.clear()

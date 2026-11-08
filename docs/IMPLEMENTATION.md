@@ -501,13 +501,21 @@ in this exact order:
 
 `pipeline_manager.enable_file_recording` itself:
 
-- Branches on `_recording_was_disabled`:
-  - Flag false (first Start): call
-    `_ensure_audio_record_branch_built_locked` (Phase 9.C late-build).
-  - Flag true (Start after Stop): call `_rebuild_splitmuxsink_locked`
-    — see §5.5 below.
+- Branches on `_recording_was_disabled`. `_build_pipeline` sets it `True`
+  for every new pipeline and the record valve stays closed until Start,
+  so **every** Start, the first included, calls
+  `_rebuild_splitmuxsink_locked` — see §5.5 below. (The non-rebuild
+  branch, which late-builds the audio chain via
+  `_ensure_audio_record_branch_built_locked`, is now a fallback only.)
+  This matters: the first Start used to splice an `audio_%u` pad onto a
+  splitmuxsink that was already mid-file, which could deadlock the feed
+  ([GSTREAMER_INVARIANTS.md §12](GSTREAMER_INVARIANTS.md)).
 - Open the record valve (`_set_branch_enabled("record", True)`).
 - Set `_recording_running = True`, clear `_recording_was_disabled`.
+
+If the feed has no pipeline at that moment (it is rebuilding, see §5.8)
+`enable_file_recording` records the request and the reconnect arms
+recording itself.
 
 ### 5.3 Stop (coordinator orchestration)
 
@@ -603,11 +611,14 @@ element from scratch, in this exact order:
 5. Point `self._splitmuxsink` at the new element. *(critical — the
    helpers below operate on whatever this attribute references.)*
 6. Call `_ensure_audio_record_branch_built_locked` (Phase 9.C —
-   late-build the audio chain if audio appeared between games and
-   the chain wasn't built yet).
+   late-build the audio chain if audio appeared since the pipeline was
+   built and the chain wasn't built yet; this is how game 1 gets audio).
 7. Call `_link_audio_encoder_to_splitmuxsink_locked` (Phase 7.G —
    re-link the existing audio encoder's src pad to the new
-   splitmuxsink's `audio_%u` pad).
+   splitmuxsink's `audio_%u` pad). **Only if the chain existed before
+   step 6**: a chain just built in step 6 already requested and linked
+   its own pad, and a second request would leave an empty audio stream
+   that holds the video back.
 8. `<encoder>.link(new_sink)`.
 9. `new_sink.sync_state_with_parent()`.
 
@@ -703,6 +714,36 @@ Edge cases:
   with NewTek's "NDI Studio Monitor" that the same `ndi_name` carries
   audio. The `ndi_receiver` log line `NDI demux pad-added: pad='audio'`
   is the canary: if it never appears, the source has no audio.
+
+### 5.8 Mid-game rebuild (a feed is lost and reconnected)
+
+`ReconnectSupervisor` → `FeedRuntime.rebuild` calls
+`PipelineManager.stop_all()` then `connect_source()`, replacing the whole
+GStreamer pipeline while the operator's game carries on. Recording is
+carried across the gap like this:
+
+1. `stop_all` notes that recording was armed
+   (`_recording_resume_after_rebuild`), tears the pipeline down, and
+   indexes the partial segment the old pipeline was writing (it has to be
+   cleared before the new pipeline starts: the encoder probe updates
+   `_pending_segment` in place and the new pipeline's PTS restart at 0).
+2. `_teardown_pipeline` drops every reference into the dead pipeline
+   (`_audio_record_encoder`, `_splitmuxsink`, the audio-present flag…).
+   Leaving the encoder set made the *next* game's rebuild try to link the
+   dead pipeline's opusenc and fail with `WRONG_HIERARCHY`.
+3. `connect_source` builds the new pipeline (record valve closed, as for
+   any new pipeline) and, because the resume flag is set, starts
+   `_resume_recording_worker`. It waits until video is arriving and audio
+   has been seen or given up on (`RESUME_AUDIO_GRACE_SECONDS`), then calls
+   the normal `enable_file_recording` with the old session paths, game
+   folder and **segment counter** (so no filename is reused). Health events
+   `recording_resumed` / `recording_resume_failed`.
+4. An operator Start or Stop supersedes a pending resume; a Stop that lands
+   while the worker is inside `enable_file_recording` is undone.
+
+Each resumed segment stamps its own `pts_to_session_offset_ns`, so replay
+(which works in session time) is unaffected by the PTS restart. The
+PTS-time queries (`resolve`) can mis-rank segments across the rebuild.
 
 ---
 
@@ -813,10 +854,25 @@ feed. The clamp keeps replay tracking the live edge naturally.
 
 1. Look up `nearest_frame_location(feed_id, target, recording_state)`.
 2. Decode via the per-feed `SegmentDecoder` (one
-   `cv2.VideoCapture` per feed).
-3. Push the frame into `OutputRenderer.show_frame` (which routes by
-   `frame.feed_id`).
+   `cv2.VideoCapture` per feed). With more than one feed the decodes run
+   in parallel on a small thread pool (`_decode_jobs`; cv2 releases the
+   GIL) and the results come back in feed order.
+3. Push the frames into `OutputRenderer.show_frame` (which routes by
+   `frame.feed_id`), in feed order, on the Qt thread.
 4. Track `is_freeze=True` results into `feeds_in_freeze_frame`.
+
+**Cost, and why it matters.** The whole loop runs on the Qt thread, so
+its cost bounds the replay frame rate. `SegmentDecoder` reads (or skips up
+to 8 frames) forward instead of seeking — an OpenCV seek steps back ~16
+frames and re-decodes forward, ~49 ms per feed per tick on 720p60 MJPEG
+against ~4.5 ms for a read — and `VideoWidget.display_frame` scales with
+cv2 to the tile before building a pixmap. The timer interval follows the
+measured tick cost (`_adapt_replay_interval`): the median of the last 15
+ticks, in whole 60 fps frame steps, aiming for ~60% duty, with hysteresis.
+Measured on two 720p60 feeds: ~118 ms/tick before, ~17–26 ms after
+(≈30 replay frames/s). One feed can run at 60 Hz. Opening the next
+segment's file (~85 ms) still happens inside the tick at each 4 s segment
+boundary; prefetching it is not done.
 
 Every operator tile renders something on every tick during replay.
 Feeds with no replayable segment yet are the only blank-tile state —
