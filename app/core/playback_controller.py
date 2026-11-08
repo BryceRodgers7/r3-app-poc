@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import math
+import statistics
 import threading
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 
 from app.core.app_state import UiState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
@@ -38,6 +42,24 @@ _DEFAULT_REWIND_SECONDS = 5
 # `AppSettings.target_fps` in 12.B; tests and any caller that doesn't
 # configure it fall back to the 30 fps assumption.
 _DEFAULT_FRAME_PERIOD_NS = 33_333_333
+
+# Replay pacing. Each tick decodes every feed and draws it on the Qt thread,
+# so the tick rate has to follow what that costs on this machine and feed
+# count. The interval moves in whole frames of 60 fps footage (16.7 ms
+# steps), which keeps the cadence even (2 frames per tick at 33 ms, never
+# 1-2-1-2), and is re-aimed so a tick takes ~60% of its interval. A fixed
+# 40 ms timer capped replay at 25 ticks/s and, with a ~118 ms two-feed tick,
+# really delivered ~8.
+_REPLAY_FRAME_MS = 1000.0 / 60.0
+_REPLAY_START_INTERVAL_MS = 33
+_REPLAY_TARGET_DUTY = 0.6   # aim for a tick to fill this much of its interval
+_REPLAY_BUSY_DUTY = 0.8     # slow the timer down above this
+_REPLAY_IDLE_DUTY = 0.4     # speed it up below this
+# The tick cost is the median of the last few ticks, so one slow tick (the
+# ~85 ms file open at each 4 s segment boundary) can't move the interval but
+# a real change in cost is followed within a few ticks.
+_REPLAY_COST_WINDOW = 15
+_REPLAY_COST_MIN_SAMPLES = 8
 
 
 class PlaybackController:
@@ -154,7 +176,14 @@ class PlaybackController:
         self._replay_clock_anchor_monotonic: float | None = None
         self._session_id: str | None = None
         self._replay_timer = QTimer(self.signals)
-        self._replay_timer.setInterval(40)
+        # Precise: Windows coarse timers quantize to ~15.6 ms, which would
+        # make a 17 or 33 ms interval uneven.
+        self._replay_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._replay_interval_ms = _REPLAY_START_INTERVAL_MS
+        self._replay_tick_costs: deque[float] = deque(maxlen=_REPLAY_COST_WINDOW)
+        self._replay_timer.setInterval(self._replay_interval_ms)
+        # Created on first multi-feed render; see `_decode_jobs`.
+        self._decode_pool: ThreadPoolExecutor | None = None
         self._replay_timer.timeout.connect(self._on_replay_timer_tick)
         self._overlay_timer = QTimer(self.signals)
         self._overlay_timer.setInterval(250)
@@ -838,6 +867,12 @@ class PlaybackController:
         self._shutting_down = True
         self._replay_timer.stop()
         self._overlay_timer.stop()
+        pool = getattr(self, "_decode_pool", None)
+        if pool is not None:
+            # Ticks run on the Qt thread and wait for their decodes, so none
+            # can be in flight here.
+            pool.shutdown(wait=False)
+            self._decode_pool = None
         for decoder in self._segment_decoders.values():
             decoder.close()
 
@@ -1098,7 +1133,9 @@ class PlaybackController:
                 self._state.current_playback_mode = PlaybackMode.PAUSED
                 self._stop_replay_clock_locked()
             self._update_state_timestamps_locked()
+        render_started = time.perf_counter()
         self._render_at_session_time_ns(target_session_time_ns)
+        self._adapt_replay_interval((time.perf_counter() - render_started) * 1000.0)
         if fence_high:
             self._emit_state("Held at end of play (challenge)")
         else:
@@ -1136,6 +1173,7 @@ class PlaybackController:
             return
         recording_state = self._recording_manager.recording_state.state
         feeds_in_freeze: list[str] = []
+        jobs: list[tuple[SegmentDecoder, object]] = []
         for runtime in self._feed_runtimes:
             decoder = self._segment_decoders.get(runtime.feed.feed_id)
             if decoder is None:
@@ -1149,13 +1187,68 @@ class PlaybackController:
                 continue
             if location.is_freeze:
                 feeds_in_freeze.append(runtime.feed.feed_id)
-            frame = decoder.decode(location)
+            jobs.append((decoder, location))
+        for frame in self._decode_jobs(jobs):
             if frame is None:
                 continue
             self._output_renderer.show_frame(frame)
         # Phase 6: surface per-tile freeze state for the operator UI.
         with self._lock:
             self._state.feeds_in_freeze_frame = tuple(feeds_in_freeze)
+
+    def _decode_jobs(
+        self, jobs: list[tuple[SegmentDecoder, object]]
+    ) -> list[MediaFrame | None]:
+        """Decode each (decoder, location) pair; results come back in order.
+
+        Each feed has its own decoder and cv2 releases the GIL while it
+        decodes, so with more than one feed they run side by side and the
+        tick pays for the slowest decode rather than the sum. The frames
+        are still drawn one by one, in feed order, on the calling (Qt)
+        thread.
+        """
+        if len(jobs) < 2:
+            return [decoder.decode(location) for decoder, location in jobs]
+        pool = self._decode_pool
+        if pool is None:
+            pool = self._decode_pool = ThreadPoolExecutor(
+                max_workers=max(2, len(self._segment_decoders)),
+                thread_name_prefix="replay-decode",
+            )
+        futures = [pool.submit(decoder.decode, location) for decoder, location in jobs]
+        return [future.result() for future in futures]
+
+    def _adapt_replay_interval(self, tick_cost_ms: float) -> None:
+        """Re-aim the replay timer so a tick fills ~60% of its interval.
+
+        Slows down (rather than starving the UI) when ticks get expensive,
+        and speeds back up when there's headroom. It acts on the median of
+        recent ticks, and the gap between the busy and idle thresholds stops
+        it flapping.
+        """
+        self._replay_tick_costs.append(tick_cost_ms)
+        if len(self._replay_tick_costs) < _REPLAY_COST_MIN_SAMPLES:
+            return
+        cost = statistics.median(self._replay_tick_costs)
+        interval = self._replay_interval_ms
+        too_busy = cost > interval * _REPLAY_BUSY_DUTY
+        has_headroom = cost < interval * _REPLAY_IDLE_DUTY and interval > _REPLAY_FRAME_MS
+        if not (too_busy or has_headroom):
+            return
+        steps = max(1, math.ceil(cost / _REPLAY_TARGET_DUTY / _REPLAY_FRAME_MS))
+        new_interval = round(steps * _REPLAY_FRAME_MS)
+        if new_interval == interval:
+            return
+        self._replay_interval_ms = new_interval
+        self._replay_timer.setInterval(new_interval)
+        # The old costs were measured at the old interval; start a fresh window.
+        self._replay_tick_costs.clear()
+        LOGGER.info(
+            "replay tick interval %d -> %d ms (tick cost %.1f ms)",
+            interval,
+            new_interval,
+            cost,
+        )
 
     def _update_state_timestamps_locked(self) -> None:
         self._state.last_frame_timestamp = self._latest_live_timestamp

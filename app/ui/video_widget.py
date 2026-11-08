@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import cv2
 from PySide6.QtCore import QPointF, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QResizeEvent, QWheelEvent
@@ -78,6 +80,12 @@ class VideoWidget(QWidget):
         self._frame_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
         )
+        # The frame on screen, kept as the BGR array it arrived as. The
+        # normal (unzoomed) path scales it with cv2 straight to the tile, so
+        # no full-resolution QImage is needed per frame; `_current_image`
+        # is that QImage, built on demand for the zoom path and cleared on
+        # every new frame.
+        self._current_bgr: Any = None
         self._current_image: QImage | None = None
         self._showing_video_surface = False
         # `qimage` (legacy / python_push sources) renders frames into the
@@ -284,16 +292,11 @@ class VideoWidget(QWidget):
         """
         if self._render_mode == "native" and self._showing_video_surface:
             self._surface_stack.setCurrentWidget(self._frame_label)
-        rgb_image = cv2.cvtColor(frame.image_bgr, cv2.COLOR_BGR2RGB)
-        height, width, channels = rgb_image.shape
-        bytes_per_line = channels * width
-        self._current_image = QImage(
-            rgb_image.data,
-            width,
-            height,
-            bytes_per_line,
-            QImage.Format.Format_RGB888,
-        ).copy()
+        # Replay runs this once per feed per tick on the UI thread, so it
+        # is the hot path: no full-resolution RGB conversion, QImage copy or
+        # Qt smooth-scale here (see `_fit_pixmap`).
+        self._current_bgr = frame.image_bgr
+        self._current_image = None
         self._refresh_pixmap()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -304,29 +307,67 @@ class VideoWidget(QWidget):
         if self._showing_video_surface:
             self.video_surface_resized.emit()
 
+    def _full_image(self) -> QImage | None:
+        """The current frame as a full-resolution QImage (zoom path only)."""
+        if self._current_image is None and self._current_bgr is not None:
+            rgb_image = cv2.cvtColor(self._current_bgr, cv2.COLOR_BGR2RGB)
+            height, width, channels = rgb_image.shape
+            self._current_image = QImage(
+                rgb_image.data,
+                width,
+                height,
+                channels * width,
+                QImage.Format.Format_RGB888,
+            ).copy()
+        return self._current_image
+
+    def _fit_pixmap(self) -> QPixmap:
+        """The current frame scaled to fit the tile, aspect ratio kept.
+
+        Scaled with cv2 before it becomes a QImage/QPixmap, so the colour
+        conversion and pixmap upload work on tile-sized data. INTER_AREA is
+        the quality choice for shrinking, which is almost always the case
+        (720p footage in a tile smaller than the window).
+        """
+        bgr = self._current_bgr
+        source_height, source_width = bgr.shape[:2]
+        fitted = QSize(source_width, source_height).scaled(
+            self._frame_label.size(), Qt.AspectRatioMode.KeepAspectRatio
+        )
+        width, height = fitted.width(), fitted.height()
+        if width <= 0 or height <= 0:
+            return QPixmap()  # nothing to draw into (a zero-size tile)
+        if (width, height) != (source_width, source_height):
+            shrinking = width < source_width or height < source_height
+            bgr = cv2.resize(
+                bgr,
+                (width, height),
+                interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
+            )
+        rgb_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return QPixmap.fromImage(
+            QImage(rgb_image.data, width, height, 3 * width, QImage.Format.Format_RGB888)
+        )
+
     def _scaled_display_pixmap(self) -> QPixmap | None:
-        if self._current_image is None:
+        if self._current_bgr is None:
             return None
         if self._view.is_zoomed and self._has_area():
+            image = self._full_image()
             source, target = visible_source_rect(
                 self._shown_view(),
                 self._tile(),
-                self._current_image.width(),
-                self._current_image.height(),
+                image.width(),
+                image.height(),
             )
             return QPixmap.fromImage(
-                self._current_image.copy(QRect(*source)).scaled(
+                image.copy(QRect(*source)).scaled(
                     QSize(*target),
                     Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
             )
-        pixmap = QPixmap.fromImage(self._current_image)
-        return pixmap.scaled(
-            self._frame_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        return self._fit_pixmap()
 
     def _refresh_pixmap(self) -> None:
         scaled_pixmap = self._scaled_display_pixmap()
