@@ -7,10 +7,16 @@ first round used one camera; the second used two, at 1280x720@60.
 
 > **Status (2026-11-07):** the cause of bug 1 is found and fixes for it, for the
 > recording-recovery bugs it exposes, and for choppy replay are on branch
-> `fix/begin-game-freeze-recovery-replay`. They are unit-tested but **not yet
-> verified in the real app**. Do that first: run the fresh-launch harness
-> ([`ndi_test_harness/README.md`](ndi_test_harness/README.md)) on that branch and
-> on `main`, and compare the stall rate. Bug 2 (exit hang) is unchanged.
+> `fix/begin-game-freeze-recovery-replay`. Verified in the real app with an
+> interleaved A/B of the fresh-launch harness (12 launches of each tree, same
+> cameras): **`main` stalled 13 of 24 feed starts (9 of 12 launches); the branch
+> stalled 1 of 24 (1 of 12 launches)**, and every stalled feed on `main` left
+> files with no database rows while the branch's feeds all indexed normally
+> (section 1.4). **The freeze is much rarer but not gone**: the one branch stall
+> has the same stack signature. Closing the rest needs ingest to push audio and
+> video from separate threads (1.5, not done). Replay timings in 3.1 were
+> measured offline, not yet by eye in the real app. Bug 2 (exit hang) is
+> unchanged.
 
 Four-feed numbers in the older notes come from one camera configured as four
 `[[feeds]]`. "Original code" means commit `0a894f1`, before any of the UI work.
@@ -72,6 +78,8 @@ Evidence for it, from the real app (harness, 2 cameras, 1280x720@60):
 |---|---|
 | Game 1 after a fresh launch (`launch_once.py`), the clean trials | **9 of 14** |
 | Games 2-14 in one session (`cycle.py`) | **0 of 28** |
+| Interleaved A/B, game 1 after a fresh launch: `main` | **13 of 24** (9 of 12 launches) |
+| Interleaved A/B, game 1 after a fresh launch: the branch | **1 of 24** (1 of 12 launches) |
 
 The headless GStreamer repro (real camera, no UI) **never** reproduced it: 0 of 42
 recorded trials, with and without an injected upstream RECONFIGURE. What
@@ -136,20 +144,52 @@ placeholder ("Awaiting video...", or the stale "Unable to connect to source.",
 which is only ever set at startup). Fixed by the rows existing; the stale
 placeholder text is still in section 3.
 
-### 1.4 How to verify
+### 1.4 Verification (2026-11-07) and what is left
 
-Not yet done. On the branch and on `main`, with the fresh-launch harness:
+Interleaved A/B on the real app, two cameras at 1280x720@60, 12 fresh launches of
+each tree (same random 5-20 s pre-click delay per pair), `run_ab`-style driver
+around `launch_once.py` + `check_rows.py`:
 
-```
-bash ndi_test_harness/run_launches.sh      # see its README: one launch = one game 1
-```
+| | `main` | branch |
+|---|---|---|
+| Launches with a stalled feed | **9 of 12** | **1 of 12** |
+| Feed starts stalled | **13 of 24** | **1 of 24** |
+| Feed footage vs database rows | every stalled feed that had written files: **files, 0 rows** (7 feeds in 6 launches; the other 6 stalled feeds had written nothing yet) | every feed: rows = files - 1, as for a healthy feed |
+| Live preview rate before Begin Game | 60 and 60 in all 12 | 60 and 60 in all 12 |
 
-Expect a stall rate near zero on the branch against roughly half on `main`. Then
-check, per feed, that segment files and `metadata.db` rows agree after a stall
-(`STOP_ON_STALL`-style: let the rebuilt feed record 20 s), and that the *next* game
-records for that feed. File sizes prove nothing; only rows do. Also confirm the
-live preview is not stalled at idle (the `async-handling` risk): all tiles should
-show picture before Begin Game.
+- **The `async-handling` risk did not show up:** the preview branch ran at 60 fps
+  at idle with the record valve closed in all 12 branch launches. That number is
+  counted on the preview branch ahead of the d3d11 sinks, so it is not a look at
+  the picture; eyeball the tiles too.
+- **Recovery worked once for real.** In the branch's stalled launch the frozen feed
+  was rebuilt after ~10 s, logged `recording re-armed after rebuild`
+  (`recording_resumed`), wrote a new segment and indexed it. Its file for the
+  frozen stretch was empty (0 bytes, one counted frame); the mid-session validator
+  quarantined the row it was given. `stop_all` now skips indexing a segment file
+  that has no data, so that row is no longer created.
+- **Not yet exercised:** that the *next game* records for a rebuilt feed (the
+  stale-encoder fix) is covered by unit tests only; and no zoom, replay-by-eye or
+  Challenge pass was done on the branch.
+
+### 1.5 What is left: the freeze is rarer, not gone
+
+The one branch stall has the identical stack signature (the `ndisrc` thread in a
+queue query wait, the record thread inside `splitmuxsink`'s input, output threads
+asleep) and began within ~2 s of the click, i.e. while the new audio stream had not
+yet delivered its first buffer. So the window is narrower, not closed. The fix
+treats the condition for the circular wait (a stream added to a running
+`splitmuxsink`) but not the other half: **one thread delivers both streams, and a
+serialized query into the record queue can block it.**
+
+The standard cure, not done here because it changes the live ingest chain and
+needs another real-app run: give each demuxed stream its own thread, by putting a
+`queue` after each `ndisrcdemux` pad in `NDIReceiver.build_native_chain` (video:
+`queue ! videoconvert`, audio: `queue ! audioconvert`, linked in
+`_on_ndisrcdemux_pad_added`). A query would then block only that stream's thread,
+audio keeps reaching `splitmuxsink`, and the wait resolves. Decide whether the
+video queue is leaky (a stalled record branch could never back up ingest, at the
+price of dropping frames) and check it against `source_fps`/`vrate` telemetry and
+latency. Verify with the same A/B.
 
 ---
 

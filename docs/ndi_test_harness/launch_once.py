@@ -93,6 +93,9 @@ def run():
         return
     healthy_after = time.perf_counter() - launched
     wait(int(EXTRA * 1000))
+    # Idle preview rate, before Begin Game: proves the live picture is flowing
+    # with the record valve closed (the async-handling risk in NDI_OPEN_BUGS.md 1.2).
+    idle_preview = [round(s.preview_fps) for s in coordinator.telemetry_hub.snapshot()]
     QTest.mouseClick(controls.long_recording_button, LEFT)
     wait(3500)
     early = [s.feed_id for s in coordinator.telemetry_hub.snapshot() if s.source_fps < 40]
@@ -108,7 +111,7 @@ def run():
     stalled = [s.feed_id for s in snaps if s.source_fps < 10]
     print(
         f"RESULT trial={TRIAL} tree={REPO} healthy_after={healthy_after:.1f}s extra={EXTRA:.1f}s "
-        f"src={[round(s.source_fps) for s in snaps]} rec={[round(s.recording_fps) for s in snaps]} "
+        f"idle_preview={idle_preview} src={[round(s.source_fps) for s in snaps]} rec={[round(s.recording_fps) for s in snaps]} "
         f"early_stall={early} stalled_at_7s={stalled}",
         flush=True,
     )
