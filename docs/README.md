@@ -32,13 +32,14 @@ implementation actually does, and where the two differ.
 ### "I'm fixing the open NDI bugs"
 
 Start with [`NDI_OPEN_BUGS.md`](NDI_OPEN_BUGS.md): a feed freezing at
-Begin Game and its footage going unindexed, exit hanging inside the NDI
-library, how to reproduce both, and the test traps that fake failures.
+Begin Game (cause found, fix on a branch awaiting real-app verification),
+its footage going unindexed, choppy replay, exit hanging inside the NDI
+library, how to reproduce them, and the test traps that fake failures.
 
 ### "I'm refactoring the GStreamer pipeline"
 
 1. [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) — first.
-   Eight construction rules with file:line refs. Each rule was
+   Twelve construction rules with file:line refs. Each rule was
    learned from a concrete failure (silent color shift, pipeline
    freeze, video-only segments, etc.) — easy to re-break.
 2. [`IMPLEMENTATION.md` §5 (Recording lifecycle)](IMPLEMENTATION.md#5-recording-lifecycle)

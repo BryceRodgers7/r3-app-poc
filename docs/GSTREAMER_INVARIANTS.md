@@ -307,6 +307,60 @@ chain handling, before `_set_branch_enabled("record", True)`).
 
 ---
 
+## 12. Never give a running splitmuxsink a new stream; keep the record valve closed with `async-handling`
+
+**Rule.** Every stream a splitmuxsink will mux (its `video` pad **and** its
+`audio_%u` pad) must be requested on a fresh element **before** any data
+flows into it. Do not request a pad on a splitmuxsink that has already
+received buffers. And because the record valve stays closed until Start,
+build splitmuxsink with `async-handling=TRUE`.
+
+**Why — the freeze.** splitmuxsink 1.28 gathers input in GOPs: the
+reference (video) stream waits in `check_completed_gop` until *every*
+stream, including a just-added audio stream that has no data yet, has
+delivered past the end of the GOP. A new audio pad therefore holds the
+video back until its first buffer arrives. That is harmless on its own,
+but here audio and video both come from **one** `ndisrc` streaming thread
+(`ndisrcdemux` pushes them in turn). If that thread is, at that moment,
+inside a *serialized downstream query* (an ALLOCATION query after any
+upstream RECONFIGURE), it blocks in the record `queue` until the queue
+drains; the queue is stuck behind splitmuxsink's video wait; the audio the
+video is waiting for can only come from the blocked thread. A circular wait
+no one breaks: preview and recording freeze together and only the health
+check's rebuild ~8 s later clears it. Native stacks taken during a freeze
+showed exactly this: the `ndisrc` thread in a queue-query condition wait,
+the `jpegenc` thread inside splitmuxsink's input, splitmuxsink's output
+threads asleep, `matroskamux`'s aggregator thread waiting for data.
+
+The always-open record valve made this the normal case at the first Begin
+Game: the splitmuxsink was already mid-file when the audio pad was
+requested. Games 2+ requested both pads on a fresh element and never
+stalled (0 of 28 feed starts, against 9 of 14 for game 1 under the same
+harness).
+
+**Why `async-handling`.** A splitmuxsink with a closed valve never receives
+a buffer, so never prerolls. Left alone, the parent pipeline's
+PAUSED→PLAYING change stays pending and an async preview sink (d3d11videosink
+is) is never started: measured 0 frames in 6 s, against ~58 fps with the
+property. This is why the old code kept the valve open, and why simply
+closing it is wrong. A headless repro using `fakesink async=False` for the
+preview does not show it; use an async sink.
+
+**Do not** reintroduce:
+
+- `connect_source` opening the record valve (it also made splitmuxsink
+  encode and write throwaway files to the temp "unrouted" folder all
+  session);
+- a second `audio_%u` request when the audio chain was only just built (an
+  empty stream stalls the video the same way).
+
+**Code:** `pipeline_manager.py:_build_splitmuxsink_element` (property),
+`connect_source` (valve), `_build_pipeline` (sets `_recording_was_disabled`),
+`_rebuild_splitmuxsink_locked` (`audio_chain_existed`). Tests:
+`tests/test_rebuild_recovery.py`. Investigation: [`NDI_OPEN_BUGS.md`](NDI_OPEN_BUGS.md) bug 1.
+
+---
+
 ## When to add a new invariant here
 
 If you introduce a GStreamer rule whose violation causes a non-obvious
