@@ -2,13 +2,38 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import Any
 
+from app.config.prematch_config import CameraSetting, initial_viewport_orders
 from app.config.settings import AppSettings
 from app.core.models import FeedDefinition
 
 _MAX_ENABLED_FEEDS = 8
+
+
+def apply_camera_layout(
+    feeds: list[FeedDefinition], layout: Mapping[str, CameraSetting]
+) -> list[FeedDefinition]:
+    """Layer the pre-match camera layout over `feeds`.
+
+    A feed with a setting takes its `short_name` as `display_name`. The
+    list is then ordered by `viewport_order`; feeds without a setting keep
+    their relative order and follow the ones with one. Settings for
+    feeds that no longer exist are ignored. An empty layout returns the
+    feeds unchanged.
+    """
+    if not layout:
+        return list(feeds)
+    positions = initial_viewport_orders([feed.feed_id for feed in feeds], layout)
+    renamed = [
+        replace(feed, display_name=layout[feed.feed_id].short_name)
+        if feed.feed_id in layout
+        else feed
+        for feed in feeds
+    ]
+    return sorted(renamed, key=lambda feed: positions[feed.feed_id])
 
 
 @dataclass(slots=True)
@@ -19,7 +44,19 @@ class FeedRegistry:
 
     @classmethod
     def build_default(cls, settings: AppSettings) -> "FeedRegistry":
-        """Build feeds from [[feeds]] in TOML when present, else legacy [source]."""
+        """Build feeds from [[feeds]] in TOML when present, else legacy [source].
+
+        `settings.camera_layout` (the pre-match camera setup) is layered
+        on top: short names replace display names and `viewport_order`
+        sets the feed order. Validation runs on the configured feeds
+        before the layout is applied.
+        """
+        registry = cls._build_configured(settings)
+        registry.feeds = apply_camera_layout(registry.feeds, settings.camera_layout)
+        return registry
+
+    @classmethod
+    def _build_configured(cls, settings: AppSettings) -> "FeedRegistry":
         if settings.feeds_table_rows:
             feeds = [_feed_from_settings_row(row) for row in settings.feeds_table_rows]
             enabled = [f for f in feeds if f.enabled]

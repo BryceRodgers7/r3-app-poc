@@ -41,8 +41,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Optional
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QLabel,
     QMessageBox,
     QSizePolicy,
     QVBoxLayout,
@@ -50,11 +51,26 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.models import CLIP_TYPE_CHALLENGE, CLIP_TYPE_TIMEOUT
+from app.ui import theme
 from app.ui.control_button import GO_TONE, STOP_TONE, ControlButton
 
 
 _MARK_PLAY_LABEL = "Mark Play"
 _MARKED_LABEL = "✓ Marked"
+
+
+def format_elapsed(seconds: float | None) -> str:
+    """Render game time as `Elapsed: h:mm` (whole minutes, seconds dropped).
+
+    `None` (no game has begun yet) reads as `Elapsed: 0:00`.
+    """
+    total = max(0, int(seconds)) if seconds is not None else 0
+    hours, rest = divmod(total, 3600)
+    return f"Elapsed: {hours}:{rest // 60:02d}"
+
+
+def _elapsed_style(color: str) -> str:
+    return f"QLabel {{ color: {color}; font-size: 22px; font-weight: 600; }}"
 
 
 ConfirmFn = Callable[[QWidget, str, str], bool]
@@ -95,6 +111,9 @@ class OperatorControlsWidget(QWidget):
         super().__init__(parent)
         self._confirm_fn: ConfirmFn = confirm_fn or _default_end_game_confirm
         self._is_recording = False
+        # True while the challenge details screen is open: Challenge stays
+        # off until that challenge is finished or discarded.
+        self._challenge_record_open = False
 
         self.next_play_button = ControlButton("Next Play", self)
         self.timeout_button = ControlButton("Time-out", self)
@@ -125,6 +144,13 @@ class OperatorControlsWidget(QWidget):
         layout.addSpacing(16)
         layout.addWidget(self.mark_play_button)
         layout.addStretch(1)
+        # Time since Begin Game was pressed; sits above the button that
+        # starts it. Muted while no game is recording.
+        self.elapsed_label = QLabel(format_elapsed(None), self)
+        self.elapsed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.elapsed_label.setStyleSheet(_elapsed_style(theme.TEXT_MUTED))
+        self._elapsed_running = False
+        layout.addWidget(self.elapsed_label)
         layout.addWidget(self.long_recording_button)
 
         self.next_play_button.clicked.connect(self.next_play_requested.emit)
@@ -203,7 +229,9 @@ class OperatorControlsWidget(QWidget):
         play_dependent = is_recording and has_play_started
         self.timeout_button.setEnabled(play_dependent)
         in_challenge = current_clip_type == CLIP_TYPE_CHALLENGE
-        self.challenge_button.setEnabled(play_dependent and not in_challenge)
+        self.challenge_button.setEnabled(
+            play_dependent and not in_challenge and not self._challenge_record_open
+        )
         self.mark_play_button.setEnabled(is_recording)
         self.timeout_button.set_active(current_clip_type == CLIP_TYPE_TIMEOUT)
         self.challenge_button.set_active(in_challenge)
@@ -211,6 +239,28 @@ class OperatorControlsWidget(QWidget):
         self.mark_play_button.setText(
             _MARKED_LABEL if is_marked else _MARK_PLAY_LABEL
         )
+
+    def set_challenge_record_open(self, is_open: bool) -> None:
+        """Hold Challenge off while the challenge details screen is open.
+
+        `set_clip_state` (every UiState tick) applies the flag; this also
+        applies it right away so the button cannot be pressed twice before
+        the next tick.
+        """
+        self._challenge_record_open = is_open
+        if is_open:
+            self.challenge_button.setEnabled(False)
+
+    def set_elapsed(self, seconds: float | None, *, running: bool) -> None:
+        """Show `Elapsed: h:mm`; `running` False mutes it (no game recording)."""
+        text = format_elapsed(seconds)
+        if text != self.elapsed_label.text():
+            self.elapsed_label.setText(text)
+        if running != self._elapsed_running:
+            self._elapsed_running = running
+            self.elapsed_label.setStyleSheet(
+                _elapsed_style(theme.TEXT if running else theme.TEXT_MUTED)
+            )
 
     # ------------------------------------------------------------------
     # Internal click handler — End Game requires confirmation

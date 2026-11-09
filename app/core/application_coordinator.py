@@ -26,6 +26,12 @@ class _CoordinatorSignals(QObject):
     """
 
     challenge_state_changed = Signal(bool)
+    # The challenge details screen's lifetime: started when the operator
+    # presses Challenge, finished on Challenge Done or Discard. Separate
+    # from `challenge_state_changed`, which tracks the referee lockout
+    # (that one also ends on Next Play, Time-out and End Game).
+    challenge_details_started = Signal()
+    challenge_details_finished = Signal()
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +51,14 @@ class _ResumeContinuation:
     game_subdir: str
     game_start_session_time_ns: int
 from app.core.application_state import AppState, compute_app_state
+from app.core.challenge_manager import (
+    TEAM_A,
+    TEAM_B,
+    ChallengeManager,
+    ChallengeRecord,
+    ChallengeStore,
+    challenges_path,
+)
 from app.core.clip_manager import ClipManager
 from app.core.disk_budget import (
     BudgetVerdict,
@@ -193,6 +207,16 @@ class ApplicationCoordinator:
         # the referee controller, so the lockout-clear paths only
         # emit when state actually changes.
         self._challenge_active = False
+        # The challenge details screen's state: who challenged, category,
+        # outcome and the timer. Independent of the clip / lockout above.
+        self.challenge_manager = ChallengeManager(
+            settings.challenge_categories, settings.challenge_outcomes
+        )
+        # The "Elapsed: h:mm" readout on the operator window: session-clock
+        # time of the last Begin Game press, and of the End Game press once
+        # the game has stopped (None while it is running).
+        self._game_started_ns: int | None = None
+        self._game_ended_ns: int | None = None
 
     def get_feed_pipeline_mode(self, feed_id: str) -> PipelineMode:
         """Return the configured ingest pipeline mode for `feed_id`.
@@ -281,6 +305,9 @@ class ApplicationCoordinator:
                 runtime.pipeline_manager.disable_file_recording()
             recording_sm.transition_to(RecordingState.FINALIZING)
             recording_sm.transition_to(RecordingState.NOT_RECORDING)
+            # The operator window's Elapsed readout stops counting here.
+            if self.session_clock is not None:
+                self._game_ended_ns = self.session_clock.now_session_time_ns()
             # Phase 14.A: close the currently-open clip (whatever
             # type). Captured AFTER recording stops so the clip's
             # end aligns with the last frame the operator saw
@@ -362,6 +389,11 @@ class ApplicationCoordinator:
                 start_fragment_index=start_index,
                 game_subdir=game_subdir,
             )
+        # The Elapsed readout counts from the Begin Game press (for a
+        # Phase 7.D resume, from the crashed game's start).
+        if game_start_session_time_ns is not None:
+            self._game_started_ns = game_start_session_time_ns
+            self._game_ended_ns = None
         # Phase 7.B-ext: scope replay queries to this game. For the
         # resume continuation case (Phase 7.D), this is the crashed
         # game's earliest start so pre-crash segments stay visible.
@@ -526,9 +558,16 @@ class ApplicationCoordinator:
             return
         if self.clip_manager is None or self.session_clock is None:
             return
-        next_clip = self.clip_manager.mark_challenge(
-            self.session_clock.now_session_time_ns()
-        )
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is not None and challenges.is_active:
+            # The details screen of the previous challenge is still open;
+            # it must be finished (or discarded) first.
+            self._emit_clip_status(
+                "Finish the open challenge (Challenge Done) before starting another."
+            )
+            return
+        now_ns = self.session_clock.now_session_time_ns()
+        next_clip = self.clip_manager.mark_challenge(now_ns)
         if next_clip is not None:
             self._emit_clip_status("Challenge started.")
             # Phase 14.D: fence the referee at the just-closed play's
@@ -541,11 +580,132 @@ class ApplicationCoordinator:
                 self.referee_controller.replay_current_play(start_ns, end_ns)
                 self._challenge_active = True
                 self.signals.challenge_state_changed.emit(True)
+            # Open the details screen's record: the timer starts now.
+            self._start_challenge_record(next_clip, now_ns)
         else:
             self._emit_clip_status(
                 "Challenge unavailable (no play started, or already in a challenge)."
             )
         self._refresh_clip_state()
+
+    # ------------------------------------------------------------------
+    # Challenge details (who challenged, category, outcome, timer)
+    # ------------------------------------------------------------------
+
+    def _start_challenge_record(self, challenge_clip: Any, now_ns: int) -> None:
+        """Open the details record for the challenge that just started."""
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is None:
+            return
+        challenges.start(
+            session_id=challenge_clip.session_id,
+            game_subdir=challenge_clip.game_subdir,
+            clip_number=challenge_clip.clip_number,
+            # The challenge clip has no play number of its own; the play
+            # that was just reviewed is the last one opened.
+            play_number=self.clip_manager.current_play_number(),
+            now_session_time_ns=now_ns,
+        )
+        self.signals.challenge_details_started.emit()
+
+    def challenge_team_names(self) -> dict[str, str]:
+        """Names offered as "team who challenged", keyed by side ("A" / "B").
+
+        These are the Team A / Team B values stored by the pre-match
+        dialog. A blank or missing name falls back to "Team A" / "Team B"
+        so the operator always has two buttons to press.
+        """
+        match = getattr(self._settings, "match_details", None)
+        team_a = (match.team_a if match is not None else None) or "Team A"
+        team_b = (match.team_b if match is not None else None) or "Team B"
+        return {TEAM_A: team_a, TEAM_B: team_b}
+
+    def challenge_elapsed_seconds(self) -> float | None:
+        """Seconds on the open challenge's timer, or None if none is open."""
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is None or self.session_clock is None:
+            return None
+        return challenges.elapsed_seconds(self.session_clock.now_session_time_ns())
+
+    def complete_challenge(
+        self, team_side: str, category: str, outcome: str
+    ) -> ChallengeRecord | None:
+        """Finish the open challenge: stop the timer and store the details.
+
+        Wired to the Challenge Done button. Returns the stored record, or
+        None when no challenge is open. Raises `ChallengeError` for a
+        missing or unknown choice and `OSError` when `challenges.json`
+        cannot be written; in both cases the challenge stays open so the
+        operator can fix it and press Done again (the timer stays frozen
+        at the first press).
+
+        Also ends the referee's challenge lockout and returns the referee
+        to live, the same as Next Play does. The `challenge` clip itself
+        is untouched: it still ends on Next Play or Time-out.
+        """
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is None or not challenges.is_active:
+            return None
+        paths = self._session_manager.get_active_session_paths()
+        if paths is None or self.session_clock is None:
+            return None
+        store = ChallengeStore(challenges_path(paths.root_dir), paths.session_id)
+        active = challenges.active
+        assert active is not None
+        names = self.challenge_team_names()
+        record = challenges.build_record(
+            challenge_number=store.next_number(active.game_subdir),
+            team_side=team_side,
+            team_name=names.get(team_side, ""),
+            category=category,
+            outcome=outcome,
+            now_session_time_ns=self.session_clock.now_session_time_ns(),
+        )
+        store.append(record)  # raises OSError; the challenge stays open
+        challenges.finish()
+        LOGGER.info(
+            "challenge recorded: %s #%d play=%s team=%s category=%r outcome=%r "
+            "elapsed=%.3fs",
+            record.game_subdir,
+            record.challenge_number,
+            record.play_number,
+            record.team,
+            record.category,
+            record.outcome,
+            record.elapsed_seconds,
+        )
+        self._clear_challenge_lockout()
+        self.signals.challenge_details_finished.emit()
+        self._emit_clip_status(
+            f"Challenge recorded: {record.team}, {record.outcome} "
+            f"({int(record.elapsed_seconds // 60)}:{int(record.elapsed_seconds % 60):02d})."
+        )
+        self._refresh_clip_state()
+        return record
+
+    def discard_challenge(self) -> None:
+        """Drop the open challenge without storing anything (a mis-press)."""
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is None or challenges.discard() is None:
+            return
+        LOGGER.info("challenge discarded without a record")
+        self._clear_challenge_lockout()
+        self.signals.challenge_details_finished.emit()
+        self._emit_clip_status("Challenge discarded; nothing was recorded.")
+        self._refresh_clip_state()
+
+    def game_elapsed_seconds(self) -> float | None:
+        """Seconds since the operator pressed Begin Game, for "Elapsed: h:mm".
+
+        Counts while the game is recording and holds its final value after
+        End Game. None until a game has begun.
+        """
+        started = getattr(self, "_game_started_ns", None)
+        if started is None or self.session_clock is None:
+            return None
+        ended = getattr(self, "_game_ended_ns", None)
+        end = ended if ended is not None else self.session_clock.now_session_time_ns()
+        return max(0.0, (end - started) / 1e9)
 
     def _clear_challenge_lockout(self) -> None:
         """Phase 14.D: drop the challenge fence if one is installed.
@@ -862,6 +1022,14 @@ class ApplicationCoordinator:
         recovery path on next launch as before.
         """
         self._shutting_down = True
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is not None and challenges.is_active:
+            # Nothing has been written for an unfinished challenge, so it
+            # is lost at exit. Say so in the log rather than silently.
+            LOGGER.warning(
+                "shutdown with an unfinished challenge; its details were "
+                "not recorded"
+            )
         self.telemetry_hub.stop()
         self.referee_controller.shutdown()
         self.operator_controller.shutdown()

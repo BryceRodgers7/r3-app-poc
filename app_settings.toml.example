@@ -128,6 +128,21 @@ disk_budget_mb_s = 200.0
 # [ui]
 # show_diagnostics = false
 
+# Challenge details screen (opens when the operator presses Challenge). The
+# category and outcome pick-lists rarely change, so they live here. Either key
+# may be left out to keep the built-in list shown below. Categories are
+# char(40) and outcomes char(15); entries must be non-blank and unique. The
+# records themselves go to <session>/challenges.json, not the database.
+# See docs/CHALLENGES.md.
+# [challenge]
+# categories = [
+#     "Ball Ruled In or Out",
+#     "Player/Ball Contact",
+#     "Net / Antenna Faults & Interference",
+#     "Center-line Faults",
+# ]
+# outcomes = ["Confirmed", "Reversed", "Inconclusive"]
+
 # Production deployments use NDI (`kind = "ndi"`). The `synthetic` kind is the
 # dev-time fallback for machines without NDI hardware. USB / OpenCV camera
 # ingest was removed in Phase 2.5 — `kind = "auto"` is now an error.
@@ -139,6 +154,13 @@ disk_budget_mb_s = 200.0
 # fps — see docs/NDI_LOW_FPS_INVESTIGATION.md. Other values: "auto",
 # "receive-time-vs-timecode", "timecode", "timestamp", "receive-time",
 # "clocked".
+
+# The pre-match dialog (shown at startup) lets the operator give each active
+# feed a short name and a viewport position. They are saved to
+# `camera_layout.toml` in base_data_dir (not here) and layered over these
+# rows: the short name replaces `display_name`, and `viewport_order` sets the
+# feed order. `display_name` below is still shown in that dialog as the
+# configured source. See docs/PREMATCH.md.
 
 [[feeds]]
 feed_id = "ndi_main"

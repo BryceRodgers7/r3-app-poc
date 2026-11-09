@@ -68,6 +68,15 @@ main.py
 object except the two `MainWindow`s (which `main.py` builds so the
 coordinator stays UI-agnostic).
 
+When started through `main()` (`build_application(prematch_setup=True)`),
+two steps wrap the construction above: after the crash-recovery prompt the
+**pre-match dialog** collects the match details and the camera layout
+(skipped on Resume), and a **"Starting cameras…" window** is up while the
+coordinator, the windows and the feeds are built and started. The camera
+layout (`camera_layout.toml`) is layered over `[[feeds]]` inside
+`FeedRegistry.build_default`, so it must be on `AppSettings.camera_layout`
+before the coordinator is built. See [`PREMATCH.md`](PREMATCH.md).
+
 ### 1.1 Builder phase
 
 `build_default_application_coordinator` runs **before** `initialize()`.
@@ -1519,10 +1528,19 @@ current behavior; on the architecture-doc "Still open" list.
 - **`app/config/`** — `AppSettings` dataclass + TOML loader. `[source]`
   legacy single-feed, `[[feeds]]` multi-feed. See
   `r3_app_architecture.md` §13 for the shipped TOML schema.
+  `prematch_config.py` — match details and camera layout data classes and
+  their two app-owned config files (`match_details.toml`,
+  `camera_layout.toml`); standard library only. See `PREMATCH.md`.
+  `challenge_options.py` — the `[challenge]` category / outcome lists and
+  their limits (40 / 15). See `CHALLENGES.md`.
 - **`app/core/`**
   - `application_coordinator.py` — coordinator, recovery flow,
     Phase 7.D continuation.
-  - `feed_registry.py` — `FeedDefinition` / `FeedRegistry`.
+  - `feed_registry.py` — `FeedDefinition` / `FeedRegistry`;
+    `apply_camera_layout` layers the pre-match short names and order.
+  - `challenge_manager.py` — the open challenge's timer + validation and
+    the `<session>/challenges.json` store (no database). Independent of
+    `ClipManager`; see `CHALLENGES.md`.
   - `playback_controller.py` — per-output transport, replay clock,
     multi-feed render. Replay-state machine lives here; one per
     operator output.
@@ -1578,7 +1596,10 @@ current behavior; on the architecture-doc "Still open" list.
   flags), `operator_controls_widget` / `referee_controls_widget`,
   `jog_wheel` (referee transport), `multi_feed_video_panel`,
   `status_bar_widget`, `video_widget`, `diagnostics_widget`,
-  `recovery_dialog`. No widget draws over the video tiles (§11.5).
+  `recovery_dialog`, the startup-only `prematch_dialog` /
+  `prematch_flow` / `starting_cameras_window`, and the operator-only
+  `challenge_dialog` (non-modal; opens on Challenge). No widget draws over
+  the video tiles (§11.5).
 - **`tests/`** — fast unit tests using stdlib `unittest`. They mock or
   stub GStreamer where needed. Notable test contracts:
   - `test_replay_safety_invariants.py` — locks in §15.2 / §15.7

@@ -7,6 +7,20 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
+from app.config.challenge_options import (
+    CATEGORY_MAX_LENGTH,
+    DEFAULT_CATEGORIES,
+    DEFAULT_OUTCOMES,
+    OUTCOME_MAX_LENGTH,
+    parse_options,
+)
+from app.config.prematch_config import (
+    CAMERA_LAYOUT_FILENAME,
+    MATCH_DETAILS_FILENAME,
+    CameraSetting,
+    MatchDetails,
+)
+
 CONFIG_FILENAME = "app_settings.toml"
 
 _VALID_SOURCE_KINDS = {"ndi", "synthetic"}
@@ -444,6 +458,23 @@ class AppSettings:
     ui_show_diagnostics: bool = False
     # Rows from optional [[feeds]] in TOML; empty means use legacy [source] only.
     feeds_table_rows: list[dict[str, Any]] = field(default_factory=list)
+    # Pre-match camera layout, keyed by feed_id, layered over the feeds
+    # above by `FeedRegistry.build_default`. Not read from
+    # app_settings.toml: the startup flow in `main.py` fills it from
+    # `camera_layout.toml` (see `app/config/prematch_config.py`). Empty
+    # means every feed keeps its [[feeds]] name and file order.
+    camera_layout: dict[str, CameraSetting] = field(default_factory=dict)
+    # The match entered in the pre-match dialog (or, after a Resume, the
+    # last saved one). Set by the startup flow in `main.py`, not read from
+    # app_settings.toml. The challenge screen offers its Team A / Team B
+    # as the team that challenged. None when no pre-match step ran.
+    match_details: MatchDetails | None = None
+    # [challenge] block — the pick-lists on the challenge details screen.
+    # Both are NOT NULL in the stored record: category is char(40) and
+    # outcome char(15). They rarely change, so they are edited by hand
+    # here (see `app/config/challenge_options.py`).
+    challenge_categories: tuple[str, ...] = DEFAULT_CATEGORIES
+    challenge_outcomes: tuple[str, ...] = DEFAULT_OUTCOMES
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> "AppSettings":
@@ -594,6 +625,22 @@ class AppSettings:
         if "show_diagnostics" in ui_config:
             settings.ui_show_diagnostics = bool(ui_config["show_diagnostics"])
 
+        # [challenge] block — categories and outcomes for the challenge
+        # details screen. A missing key keeps the built-in list.
+        challenge_config = cls._as_dict(data.get("challenge"))
+        settings.challenge_categories = parse_options(
+            challenge_config.get("categories"),
+            name="categories",
+            max_length=CATEGORY_MAX_LENGTH,
+            default=DEFAULT_CATEGORIES,
+        )
+        settings.challenge_outcomes = parse_options(
+            challenge_config.get("outcomes"),
+            name="outcomes",
+            max_length=OUTCOME_MAX_LENGTH,
+            default=DEFAULT_OUTCOMES,
+        )
+
         # Phase 12.B / 14.C: [replay] block — frame-step button
         # cadence and rewind-button duration.
         replay_config = cls._as_dict(data.get("replay"))
@@ -690,3 +737,13 @@ class AppSettings:
     def metadata_db_path(self) -> Path:
         """Return the SQLite file used for lightweight session metadata."""
         return self.base_data_dir / "metadata.db"
+
+    @property
+    def match_details_path(self) -> Path:
+        """Return the config file holding pre-match defaults and the last match."""
+        return self.base_data_dir / MATCH_DETAILS_FILENAME
+
+    @property
+    def camera_layout_path(self) -> Path:
+        """Return the config file holding camera short names and viewport order."""
+        return self.base_data_dir / CAMERA_LAYOUT_FILENAME

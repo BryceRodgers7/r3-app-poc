@@ -65,6 +65,20 @@ library, how to reproduce them, and the test traps that fake failures.
 2. [`r3_app_architecture.md` §11.4](r3_app_architecture.md) —
    target-spec rules for the recovery dialog.
 
+### "I'm touching startup, the pre-match dialog, or camera names / order"
+
+1. [`PREMATCH.md`](PREMATCH.md) — the pre-match dialog (match details,
+   camera setup), its two config files, the startup order, and how the
+   camera layout is layered over `[[feeds]]`.
+
+### "I'm touching the Challenge button, challenge records, or the Elapsed readout"
+
+1. [`CHALLENGES.md`](CHALLENGES.md) — the challenge details screen (team,
+   category, outcome, timer), where records are stored (a JSON file, not the
+   database), the `[challenge]` config, and the `Elapsed: h:mm` readout.
+2. [`IMPLEMENTATION.md` Phase 14](IMPLEMENTATION.md) — the clip rows and the
+   referee lockout that Challenge also drives.
+
 ### "I'm planning a schema migration"
 
 1. [`IMPLEMENTATION.md` §8 (Schema evolution)](IMPLEMENTATION.md#8-schema-evolution)
@@ -95,6 +109,8 @@ library, how to reproduce them, and the test traps that fake failures.
 |---|---|---|
 | [`r3_app_architecture.md`](r3_app_architecture.md) | Target production architecture spec. Authoritative for what the system *should* be. | A design decision changes the target. Phased plan progress is tracked here. |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | Current implementation reference. Authoritative for what the system *is*. | A state machine, lifecycle step, lock, thread, recovery edge case, or schema changes. |
+| [`PREMATCH.md`](PREMATCH.md) | The pre-match dialog, its config files, startup order, and the camera layout layering. | The dialog's fields, the config file shape, or the startup order changes. |
+| [`CHALLENGES.md`](CHALLENGES.md) | The challenge details screen, its JSON record store, the `[challenge]` pick-lists, and the operator `Elapsed: h:mm` readout. | The challenge fields, the record shape, or the game-clock behavior changes. |
 | [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) | GStreamer construction rules, each tied to a known failure mode. | A new GStreamer rule whose violation causes a non-obvious failure is introduced. |
 | [`VIDEO_QUALITY_AND_CODECS.md`](VIDEO_QUALITY_AND_CODECS.md) | The quality-loss stages from NDI source to MP4, and ProRes/DNxHR viability (export-only). | Quality behavior, resolution/CRF defaults, or codec support changes. |
 | [`../ARCHITECTURE.md`](../ARCHITECTURE.md) | Status snapshot of the current code's object graph. Older framing than `IMPLEMENTATION.md`; substantial overlap. | "Implemented today" / "Still open" lists need refreshing. |

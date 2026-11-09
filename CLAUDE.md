@@ -90,6 +90,18 @@ is ignored and at least one feed must have `enabled = true`. See
   feed's `PreviewOutput` is its own ingest sink, while referee and
   operator windows render via `MultiFeedOutputRenderer`. Don't
   collapse them.
+- **Startup runs a pre-match dialog before the windows exist.**
+  `main()` calls `build_application(prematch_setup=True)`; the default is
+  `False` so scripted callers (`docs/ndi_test_harness`) get no dialog.
+  Camera names and order come from `camera_layout.toml`, layered over
+  `[[feeds]]` in `FeedRegistry`; never rewrite `app_settings.toml`. See
+  `docs/PREMATCH.md`.
+- **Challenge details are stored in a JSON file, not the database.**
+  `ChallengeManager` / `ChallengeStore` own the timer and
+  `<session>/challenges.json`; the `challenge` clip row and referee lockout
+  are separate and unchanged. The category / outcome lists come from
+  `[challenge]` in `app_settings.toml`. The challenge screen must stay
+  non-modal (the referee window is in use). See `docs/CHALLENGES.md`.
 - **The synthetic source in `app/media/test_source.py` is the only
   non-NDI path the app builds.** It is the dev fallback for
   camera-less environments — don't remove it as part of unrelated work.

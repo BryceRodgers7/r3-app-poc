@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
@@ -22,11 +23,13 @@ LOGGER = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from app.core.application_coordinator import ApplicationCoordinator
 from app.core.app_state import UiState
+from app.core.challenge_manager import ChallengeError
 from app.core.models import FeedDefinition, PlaybackMode
 from app.core.playback_controller import PlaybackController
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.ui.alert_banner import AlertBanner
 from app.ui.camera_visibility_ribbon import CameraVisibilityRibbon
+from app.ui.challenge_dialog import ChallengeDialog
 from app.ui.diagnostics_widget import DiagnosticsWidget
 from app.ui.jog_wheel import JogWheel
 from app.ui.review_seek_bar import ReviewSeekBar
@@ -39,6 +42,9 @@ from app.ui.theme import WINDOW_BACKGROUND as _WINDOW_BACKGROUND
 _VALID_CONTROLS_ROLES = frozenset({"referee", "operator", "none"})
 _CONTROL_RAIL_WIDTH = 220
 _LAYOUT_GAP = 6
+# How often the operator window's "Elapsed: h:mm" readout is refreshed. The
+# readout shows whole minutes, so a second is plenty.
+_ELAPSED_REFRESH_MS = 1000
 
 
 class MainWindow(QMainWindow):
@@ -96,6 +102,11 @@ class MainWindow(QMainWindow):
         )
         self._live_only_window = live_only_window
         self._application_coordinator = application_coordinator
+        # Operator window only: the open challenge details screen, and the
+        # last recording state seen (drives the Elapsed readout's styling).
+        self._challenge_dialog: ChallengeDialog | None = None
+        self._is_recording = False
+        self._elapsed_timer: QTimer | None = None
 
         self.setWindowTitle(window_title or settings.window_title)
         self.resize(1280, 860)
@@ -379,6 +390,21 @@ class MainWindow(QMainWindow):
             self.operator_controls.mark_play_toggle_requested.connect(
                 self._application_coordinator.toggle_clip_mark
             )
+            # Challenge details screen: opens when a challenge starts and
+            # closes when it is finished or discarded.
+            coordinator_signals = self._application_coordinator.signals
+            coordinator_signals.challenge_details_started.connect(
+                self._open_challenge_dialog
+            )
+            coordinator_signals.challenge_details_finished.connect(
+                self._close_challenge_dialog
+            )
+            # "Elapsed: h:mm" since Begin Game. A timer, not _render_state,
+            # so the readout keeps counting if no frames are arriving.
+            self._elapsed_timer = QTimer(self)
+            self._elapsed_timer.setInterval(_ELAPSED_REFRESH_MS)
+            self._elapsed_timer.timeout.connect(self._refresh_elapsed)
+            self._elapsed_timer.start()
         if self.camera_ribbon is not None:
             self.camera_ribbon.feed_visibility_toggled.connect(
                 self.video_panel.set_tile_visible
@@ -412,6 +438,9 @@ class MainWindow(QMainWindow):
                 state.review_range_ns, state.playback_position_ns
             )
         if self.operator_controls is not None:
+            if state.is_recording != self._is_recording:
+                self._is_recording = state.is_recording
+                self._refresh_elapsed()
             self.operator_controls.set_recording_state(state.is_recording)
             self.operator_controls.set_recording_label(state.is_recording)
             # Phase 14.B: gate Time-out / Challenge / Mark Play on
@@ -443,8 +472,78 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release widget bindings when the window closes."""
+        # An open challenge dialog is its own top-level window and cannot be
+        # dismissed by the operator; close it or the app would never quit.
+        self._close_challenge_dialog()
         self._output_renderer.detach_all()
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Operator window: challenge details + game elapsed readout
+    # ------------------------------------------------------------------
+
+    def _open_challenge_dialog(self) -> None:
+        """Show the challenge details screen for the challenge that just began."""
+        coordinator = self._application_coordinator
+        if coordinator is None or self.operator_controls is None:
+            return
+        if self._challenge_dialog is not None:
+            self._challenge_dialog.raise_()
+            return
+        manager = coordinator.challenge_manager
+        dialog = ChallengeDialog(
+            coordinator.challenge_team_names(),
+            manager.categories,
+            manager.outcomes,
+            coordinator.challenge_elapsed_seconds,
+            parent=self,
+        )
+        dialog.finish_requested.connect(self._on_challenge_finish_requested)
+        dialog.discard_requested.connect(coordinator.discard_challenge)
+        self._challenge_dialog = dialog
+        self.operator_controls.set_challenge_record_open(True)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_challenge_finish_requested(
+        self, team_side: str, category: str, outcome: str
+    ) -> None:
+        """Challenge Done: store the details. On failure the dialog stays open."""
+        coordinator = self._application_coordinator
+        if coordinator is None:
+            return
+        try:
+            coordinator.complete_challenge(team_side, category, outcome)
+        except ChallengeError as exc:
+            QMessageBox.warning(self._challenge_dialog or self, "Challenge", str(exc))
+        except OSError as exc:
+            LOGGER.exception("could not save the challenge details")
+            QMessageBox.warning(
+                self._challenge_dialog or self,
+                "Challenge not saved",
+                "The challenge details could not be saved:\n"
+                f"{exc}\n\nPress Challenge Done again to retry.",
+            )
+
+    def _close_challenge_dialog(self) -> None:
+        """Close the details screen and let Challenge be pressed again."""
+        dialog, self._challenge_dialog = self._challenge_dialog, None
+        if self.operator_controls is not None:
+            self.operator_controls.set_challenge_record_open(False)
+        if dialog is not None:
+            dialog.close_challenge()
+            dialog.deleteLater()
+
+    def _refresh_elapsed(self) -> None:
+        """Update "Elapsed: h:mm" from the coordinator's game clock."""
+        coordinator = self._application_coordinator
+        if coordinator is None or self.operator_controls is None:
+            return
+        seconds = coordinator.game_elapsed_seconds()
+        if not isinstance(seconds, (int, float)):
+            seconds = None
+        self.operator_controls.set_elapsed(seconds, running=self._is_recording)
 
     # ------------------------------------------------------------------
     # Phase 14.F helpers

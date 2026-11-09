@@ -13,6 +13,7 @@ from app.core.application_coordinator import (
     ApplicationCoordinator,
     build_default_application_coordinator,
 )
+from app.core.feed_registry import FeedRegistry
 from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import purge_unrouted_segments
 from app.storage.file_manager import FileManager
@@ -26,12 +27,34 @@ from app.storage.session_recovery import (
     run_startup_scan,
 )
 from app.ui.main_window import MainWindow
+from app.ui.prematch_flow import (
+    load_saved_camera_layout,
+    load_saved_match_details,
+    run_prematch_flow,
+)
 from app.ui.recovery_dialog import RecoveryDialog
+from app.ui.starting_cameras_window import StartingCamerasWindow
 from app.ui.theme import apply_dark_theme
 
 
-def build_application() -> tuple[QApplication, ApplicationCoordinator, list[MainWindow]]:
-    """Create the Qt application and wire the coordinator and windows together."""
+class StartupCancelled(Exception):
+    """The operator quit from the pre-match dialog; the app should exit cleanly."""
+
+
+def build_application(
+    *, prematch_setup: bool = False
+) -> tuple[QApplication, ApplicationCoordinator, list[MainWindow]]:
+    """Create the Qt application and wire the coordinator and windows together.
+
+    With `prematch_setup=True` (what `main()` passes) the startup adds the
+    pre-match steps: the match / camera dialog after crash recovery
+    (skipped when a crashed session is resumed), then a "Starting
+    cameras…" window while the coordinator, the windows and the feeds come
+    up. Raises `StartupCancelled` if the operator quits the dialog.
+
+    The default is False so scripted callers (the NDI test harnesses in
+    `docs/ndi_test_harness`) still start without any dialog.
+    """
     settings = AppSettings.load()
     _configure_logging(settings)
 
@@ -53,43 +76,84 @@ def build_application() -> tuple[QApplication, ApplicationCoordinator, list[Main
     # never has to think about dirty manifests on disk.
     resume_session_id = _run_startup_recovery_flow(settings, metadata_db)
 
-    referee_output = MultiFeedOutputRenderer()
-    operator_output = MultiFeedOutputRenderer()
-    coordinator = build_default_application_coordinator(
-        settings,
-        session_manager,
-        referee_renderer=referee_output,
-        operator_renderer=operator_output,
-    )
-    enabled_feeds = coordinator.feed_registry.get_enabled_feeds()
+    starting_window: StartingCamerasWindow | None = None
+    if prematch_setup:
+        try:
+            _apply_prematch_setup(settings, resume_session_id)
+        except StartupCancelled:
+            metadata_db.close()
+            raise
+        camera_names = [
+            feed.display_name
+            for feed in FeedRegistry.build_default(settings).get_enabled_feeds()
+        ]
+        starting_window = StartingCamerasWindow(camera_names)
+        starting_window.show_and_paint()
 
-    referee_window = MainWindow(
-        settings=settings,
-        controller=coordinator.referee_controller,
-        output_renderer=referee_output,
-        feeds=enabled_feeds,
-        window_title=settings.referee_window_title,
-        controls_role="referee",
-        live_only_window=False,
-        application_coordinator=coordinator,
-    )
-    operator_window = MainWindow(
-        settings=settings,
-        controller=coordinator.operator_controller,
-        output_renderer=operator_output,
-        feeds=enabled_feeds,
-        window_title=settings.operator_window_title,
-        controls_role="operator",
-        live_only_window=True,
-        # Slice 3.A.3 retry: the operator window also needs the coordinator
-        # so its MainWindow.__init__ runs the native-preview bind path.
-        # Without this, only the referee sink got a window handle and the
-        # operator sink fell back to creating its own d3d11 top-level window.
-        application_coordinator=coordinator,
-    )
-    coordinator.initialize(resume_session_id=resume_session_id)
+    try:
+        referee_output = MultiFeedOutputRenderer()
+        operator_output = MultiFeedOutputRenderer()
+        coordinator = build_default_application_coordinator(
+            settings,
+            session_manager,
+            referee_renderer=referee_output,
+            operator_renderer=operator_output,
+        )
+        enabled_feeds = coordinator.feed_registry.get_enabled_feeds()
+
+        referee_window = MainWindow(
+            settings=settings,
+            controller=coordinator.referee_controller,
+            output_renderer=referee_output,
+            feeds=enabled_feeds,
+            window_title=settings.referee_window_title,
+            controls_role="referee",
+            live_only_window=False,
+            application_coordinator=coordinator,
+        )
+        operator_window = MainWindow(
+            settings=settings,
+            controller=coordinator.operator_controller,
+            output_renderer=operator_output,
+            feeds=enabled_feeds,
+            window_title=settings.operator_window_title,
+            controls_role="operator",
+            live_only_window=True,
+            # Slice 3.A.3 retry: the operator window also needs the coordinator
+            # so its MainWindow.__init__ runs the native-preview bind path.
+            # Without this, only the referee sink got a window handle and the
+            # operator sink fell back to creating its own d3d11 top-level window.
+            application_coordinator=coordinator,
+        )
+        coordinator.initialize(resume_session_id=resume_session_id)
+    finally:
+        if starting_window is not None:
+            starting_window.close()
     qt_app.aboutToQuit.connect(coordinator.shutdown)
     return qt_app, coordinator, [referee_window, operator_window]
+
+
+def _apply_prematch_setup(settings: AppSettings, resume_session_id: str | None) -> None:
+    """Run the pre-match dialog and layer the camera layout onto `settings`.
+
+    Order matters: this must run before the coordinator is built, because
+    `FeedRegistry.build_default` reads `settings.camera_layout` to name
+    and order the feeds, and before any window exists, so no live video
+    sits behind the dialog.
+
+    A resumed crashed session skips the dialog: its match was entered
+    before the crash. The saved camera layout and the last saved match
+    (whose teams the challenge screen offers) still apply.
+    """
+    if resume_session_id is not None:
+        settings.camera_layout = load_saved_camera_layout(settings)
+        settings.match_details = load_saved_match_details(settings)
+        return
+    result = run_prematch_flow(settings)
+    if result is None:
+        raise StartupCancelled
+    settings.camera_layout = result.camera_layout()
+    settings.match_details = result.details
 
 
 def _configure_logging(settings: AppSettings) -> None:
@@ -194,7 +258,10 @@ def _prompt_for_recovery(
 
 def main() -> int:
     """Launch the desktop application."""
-    app, _coordinator, windows = build_application()
+    try:
+        app, _coordinator, windows = build_application(prematch_setup=True)
+    except StartupCancelled:
+        return 0
     for window in windows:
         window.show()
     return app.exec()
