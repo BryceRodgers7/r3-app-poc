@@ -12,7 +12,9 @@ hidden feeds. The ribbon is purely a UI toggle.
 The PDF mock shows a "Clip selector widget" label beside the camera
 buttons. Phase 14.B renders that as a non-interactive QLabel showing
 the current clip type/number; the future enhancement (clicking it to
-browse past clips) is out of scope. It sits above the buttons now,
+browse past clips) is out of scope. (Reviewing an earlier play during a
+challenge is the referee window's `PlaySelectorWidget`, not this label.)
+It sits above the buttons now,
 at the top of the window's control rail — the readout is the on-screen
 result of Next Play, so it has to be easy to see.
 """

@@ -32,6 +32,10 @@ class _CoordinatorSignals(QObject):
     # (that one also ends on Next Play, Time-out and End Game).
     challenge_details_started = Signal()
     challenge_details_finished = Signal()
+    # The play under review during a challenge changed (or the challenge
+    # just opened): (play number under review, every reviewable play
+    # number, oldest first). Drives the referee window's play selector.
+    challenge_review_changed = Signal(int, list)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -607,6 +611,69 @@ class ApplicationCoordinator:
             now_session_time_ns=now_ns,
         )
         self.signals.challenge_details_started.emit()
+        self._announce_review_plays(challenges.active.play_number)
+
+    def _closed_play_numbers(self) -> list[int]:
+        """Play numbers the referee can review, oldest first.
+
+        A failure reading the clips is logged and gives an empty list: it
+        must never break the Challenge press that is asking.
+        """
+        try:
+            return [
+                int(clip.play_number)
+                for clip in self.clip_manager.closed_plays()
+                if clip.play_number is not None
+            ]
+        except Exception:
+            LOGGER.exception("could not list the plays available for review")
+            return []
+
+    def _announce_review_plays(
+        self, selected_play_number: int | None, plays: list[int] | None = None
+    ) -> None:
+        """Tell the referee's play selector what can be reviewed."""
+        if plays is None:
+            plays = self._closed_play_numbers()
+        if selected_play_number is None and plays:
+            selected_play_number = plays[-1]
+        if selected_play_number is None:
+            return
+        self.signals.challenge_review_changed.emit(int(selected_play_number), plays)
+
+    def review_challenge_play(self, play_number: int) -> bool:
+        """Point the referee at another play of the game during a challenge.
+
+        Wired to the referee's play selector. The operator may have pressed
+        Next Play before the challenge was called, so the play to review is
+        often an earlier one than the challenge opened on. Re-installs the
+        referee's replay fence on that play (paused at its start, like the
+        Challenge press does) and records it as the play under review on
+        the open challenge.
+
+        Only works while the challenge lockout is active; returns False
+        (and does nothing) otherwise or when the play is unknown.
+        """
+        if getattr(self, "_shutting_down", False):
+            return False
+        if not getattr(self, "_challenge_active", False):
+            return False
+        closed = self.clip_manager.closed_plays()
+        match = next((clip for clip in closed if clip.play_number == play_number), None)
+        if match is None:
+            self._emit_clip_status(f"Play {play_number} is not available to review.")
+            return False
+        self.referee_controller.replay_current_play(
+            match.start_session_time_ns, match.end_session_time_ns
+        )
+        challenges = getattr(self, "challenge_manager", None)
+        if challenges is not None:
+            challenges.set_play_number(play_number)
+        self._emit_clip_status(f"Reviewing play {play_number}.")
+        self._announce_review_plays(
+            play_number, [int(clip.play_number) for clip in closed if clip.play_number is not None]
+        )
+        return True
 
     def challenge_team_names(self) -> dict[str, str]:
         """Names offered as "team who challenged", keyed by side ("A" / "B").

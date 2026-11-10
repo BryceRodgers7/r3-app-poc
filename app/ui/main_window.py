@@ -35,6 +35,7 @@ from app.ui.jog_wheel import JogWheel
 from app.ui.review_seek_bar import ReviewSeekBar
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.operator_controls_widget import OperatorControlsWidget
+from app.ui.play_selector_widget import PlaySelectorWidget
 from app.ui.referee_controls_widget import RefereeControlsWidget
 from app.ui.status_bar_widget import StatusBarWidget, TransientStatusLabel
 from app.ui.theme import WINDOW_BACKGROUND as _WINDOW_BACKGROUND
@@ -182,6 +183,8 @@ class MainWindow(QMainWindow):
         self.post_process_link: QLabel | None = None
         self.jog_wheel: JogWheel | None = None
         self.review_seek_bar: ReviewSeekBar | None = None
+        # Referee only: pick which play to review during a challenge.
+        self.play_selector: PlaySelectorWidget | None = None
         if controls_role == "operator":
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.post_process_link = self._build_post_process_link()
@@ -189,6 +192,7 @@ class MainWindow(QMainWindow):
             self.camera_ribbon = CameraVisibilityRibbon(enabled_feeds, self)
             self.jog_wheel = JogWheel(self)
             self.review_seek_bar = ReviewSeekBar(self)
+            self.play_selector = PlaySelectorWidget(parent=self)
 
         # Phase 14.F: StatusBarWidget is the legacy diagnostic strip
         # (recording state / source name / behind-live counter). The
@@ -294,6 +298,7 @@ class MainWindow(QMainWindow):
             rail_layout.addWidget(self.post_process_link)
         else:
             rail_layout.addStretch(1)
+            rail_layout.addWidget(self.play_selector)
             rail_layout.addWidget(self.referee_controls)
             rail_layout.addWidget(self.jog_wheel, alignment=Qt.AlignmentFlag.AlignHCenter)
             rail_layout.addWidget(self._status_bar)
@@ -369,6 +374,16 @@ class MainWindow(QMainWindow):
             self._application_coordinator.signals.challenge_state_changed.connect(
                 self._set_referee_transport_enabled
             )
+            # Play selector: the coordinator is the single source of truth
+            # for which play is under review. A press asks it to re-pin the
+            # replay; it answers with the new selection.
+            if self.play_selector is not None:
+                self._application_coordinator.signals.challenge_review_changed.connect(
+                    self.play_selector.set_plays
+                )
+                self.play_selector.play_selected.connect(
+                    self._application_coordinator.review_challenge_play
+                )
         if self.operator_controls is not None and self._application_coordinator is not None:
             self.operator_controls.long_recording_toggle_requested.connect(
                 self._application_coordinator.toggle_long_session_recording
@@ -558,6 +573,8 @@ class MainWindow(QMainWindow):
         """
         if self.referee_controls is not None:
             self.referee_controls.set_transport_enabled(active)
+        if self.play_selector is not None:
+            self.play_selector.set_challenge_active(active)
         if self.jog_wheel is not None:
             self.jog_wheel.set_wheel_enabled(active)
         if self.review_seek_bar is not None:

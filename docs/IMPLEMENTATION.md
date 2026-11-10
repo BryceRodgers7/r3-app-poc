@@ -1598,8 +1598,9 @@ current behavior; on the architecture-doc "Still open" list.
   `status_bar_widget`, `video_widget`, `diagnostics_widget`,
   `recovery_dialog`, the startup-only `prematch_dialog` /
   `prematch_flow` / `starting_cameras_window`, and the operator-only
-  `challenge_dialog` (non-modal; opens on Challenge). No widget draws over
-  the video tiles (§11.5).
+  `challenge_dialog` (non-modal; opens on Challenge), and the referee-only
+  `play_selector_widget` (step to an earlier play during a challenge). No
+  widget draws over the video tiles (§11.5).
 - **`tests/`** — fast unit tests using stdlib `unittest`. They mock or
   stub GStreamer where needed. Notable test contracts:
   - `test_replay_safety_invariants.py` — locks in §15.2 / §15.7

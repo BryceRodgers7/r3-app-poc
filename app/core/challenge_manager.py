@@ -182,6 +182,17 @@ class ChallengeManager:
         )
         return self._active
 
+    def set_play_number(self, play_number: int | None) -> None:
+        """Record which play is actually under review.
+
+        The challenge opens on the last play, but the referee can step back
+        to an earlier one (the operator may have pressed Next Play before
+        the challenge was called). The stored record names the play that
+        was reviewed. No-op when no challenge is open.
+        """
+        if self._active is not None:
+            self._active.play_number = play_number
+
     def elapsed_seconds(self, now_session_time_ns: int) -> float | None:
         """Seconds on the challenge timer, or None when none is open.
 

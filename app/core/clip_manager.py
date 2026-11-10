@@ -411,6 +411,32 @@ class ClipManager:
         with self._lock:
             return self._last_play_bounds
 
+    def closed_plays(self) -> list[Clip]:
+        """Every finished play of the current game, oldest first.
+
+        The referee's play selector during a challenge: the operator may
+        have pressed Next Play before the challenge was called, so the play
+        to review can be earlier than the one `last_play_bounds()` points
+        at. Only `play` clips with an end time are returned (a timeout or
+        challenge clip is not a play, and an open clip has no bounds yet).
+        Empty when no game is recording.
+
+        Reads the `clips` table, outside the manager lock (the database
+        has its own).
+        """
+        with self._lock:
+            current = self._current
+        if current is None:
+            return []
+        clips = self._db.clips_for_game(current.session_id, current.game_subdir)
+        return [
+            clip
+            for clip in clips
+            if clip.type == CLIP_TYPE_PLAY
+            and clip.play_number is not None
+            and clip.end_session_time_ns is not None
+        ]
+
     def current_clip_number(self) -> int | None:
         """Convenience for the operator-window clip counter."""
         with self._lock:
