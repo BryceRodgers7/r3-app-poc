@@ -1,9 +1,10 @@
-# Replay glitch at segment seams — findings, and how it scales to 6-8 feeds and 60 fps
+# Replay glitch at segment seams — findings, scaling to 6-8 feeds / 60 fps, and segment length
 
-Date: 2026-11-10. Status: **investigated, not fixed.** Nothing under `app/` was
-changed. Read this before touching segment bookkeeping in `PipelineManager`,
-`RecordingSegmentReplayStore.nearest_frame_location`, `SegmentDecoder`, or
-`PlaybackController.step_frames`.
+Date: 2026-11-10 (section 6 added 2026-11-11). Status: **investigated, not fixed.**
+Nothing under `app/` was changed. Read this before touching segment bookkeeping in
+`PipelineManager`, `RecordingSegmentReplayStore.nearest_frame_location`,
+`SegmentDecoder`, or `PlaybackController.step_frames`, or before changing
+`[recording] segment_duration_seconds` (section 6).
 
 Hardware for every measurement here: Intel i7-1165G7 (4 cores / 8 threads), Windows 11,
 GStreamer 1.28 on MSYS2 UCRT64. On this machine every recording uses **software**
@@ -328,3 +329,196 @@ Recommended order: the resolver change is the cheapest visible win at 30 fps; th
 muxer-derived bounds plus frame-index stepping are what keep 6-8 feeds and 60 fps from
 making it worse. Any change goes through the per-feed seams in `CLAUDE.md`, with
 `unittest` cases beside `tests/test_segment_replay_store.py` and the decoder tests.
+
+---
+
+## 6. Segment length: 4 s versus 30 s, and variable-length segments
+
+Date: 2026-11-11. Question asked: what happens if each mkv is extended from 4 s to 30 s,
+and can segment length vary? Investigated only; nothing in `app/` was changed. All tests
+below used scratch GStreamer pipelines outside the repo (see 6.7 for what that does and
+does not cover).
+
+### 6.1 Short answer
+
+- **30 s is a one-line config change** and nothing in the code rejects it, but it badly
+  hurts the referee's "review what just happened" workflow: replay can only reach the
+  newest *finished* segment, so the lag behind live goes from 0-4 s (average 2 s) to
+  0-30 s (average 15 s).
+- **It does reduce seam glitches in proportion**: 7.5x fewer seams, so about 7.5x fewer
+  glitched clicks and lost frames. Each individual seam is no better (section 2 is
+  unchanged).
+- **Seek and open cost does not change**, finished-file timing does not change, and
+  clock drift stays small. The real costs are the live-edge lag, more footage unindexed
+  after a crash, and more memory at risk when the encoder stalls.
+- **Segments can vary in length, and already do.** A GStreamer test showed the length
+  changing mid-recording and `split-now` / `split-at-running-time` cutting on demand,
+  with no frames lost. The most promising design is a long cap plus a cut at Next Play /
+  Timeout / Challenge (6.5).
+
+### 6.2 Where the length is set and used
+
+| Place | What it does |
+|---|---|
+| `settings.py:572-575` | Reads `[recording] segment_duration_seconds` as a float. No range check |
+| `pipeline_manager.py:299-300` | Clamps to at least 0.5 s |
+| `pipeline_manager.py:1981-1982` | `splitmuxsink max-size-time` |
+| `pipeline_manager.py:1343-1378` | Record-queue time cap defaults to one segment's worth |
+| `encoder_factory.py:299-319` | `validate_segment_duration`: any value > 0 is valid for MJPEG / ProRes / DNxHR (all intra-frame) |
+| `tests/test_playback_controller.py:813` | An 8 s segment case; `tests/test_encoder_factory.py:355` accepts 60 s |
+
+The replay layer (`RecordingSegmentReplayStore`, `SegmentDecoder`) works from each
+segment's own recorded start/end session times and has no fixed-length assumption. Only
+comments, the status-bar text (`latest finalized -4s`, `r3_app_architecture.md` §15.7 and
+the "Phase 7" section) and the default in `app_settings.toml` mention 4 s.
+
+### 6.3 What gets worse at 30 s
+
+**Replay cannot reach the newest segment** (`r3_app_architecture.md` §15.7: coverage is
+`[recording_start, end_of_latest_finalized_segment]`). Everything that anchors on the live
+edge inherits the lag:
+
+| Feature | Code | At 4 s | At 30 s |
+|---|---|---|---|
+| Pause from LIVE freezes on the newest finalized frame | `playback_controller.py:965-979` | up to 4 s stale | up to 30 s stale |
+| Rewind 10 s from LIVE counts back from that edge | `:981-1010` | 10-14 s behind now | 10-40 s behind now |
+| Stepping / slow-motion from LIVE snaps to that edge | `:632-641` | same | same |
+| First replay after Begin Game needs one finalized segment | `:1282-1289` (`replay_available`) | up to 4 s | up to 30 s |
+| Challenge review: the fence end is clamped to the last finalized frame | `:647-650`, `:955-963` | a just-finished play waits up to 4 s | waits up to 30 s; a play shorter than the open segment cannot be reviewed at all until it closes |
+| `live_lag_behind_replayable_seconds`, status-bar "latest finalized -Ns" | `:1319-1333` | up to 4 s | up to 30 s |
+
+The wait for a play's last frame to become reviewable is the time to the next segment
+boundary: uniform over 0 to the segment length. This is the largest functional cost, and
+the same effect `NDI_OPEN_BUGS.md` §4 already lists for the seek bar at the end of a
+just-finished play, made 7.5x bigger.
+
+**More footage unindexed after a crash.** Database rows exist only for finalized
+segments, so up to one segment of footage has none. Tested by killing a recording
+process mid-segment (a crash, not a power cut):
+
+| Segment | Killed at | Readable afterwards | Seekable |
+|---|---|---|---|
+| 4 s | 2.5 s in | 70 frames (2.3 s) | yes |
+| 30 s | 18 s in | 535 frames (17.8 s) | yes, 19 ms per seek at 0-17 s |
+
+The bytes survive, but the app's recovery validator would probably reject the file:
+with an unbounded live-style source, cv2 reports a garbage `FRAME_COUNT` for an
+unfinished file (observed `-276701161105643264`), and the validator treats
+`frame_count <= 0` as corrupt (`session_recovery.py:358-363`), which moves the file to
+`quarantine/` (`:222-226`). Nothing is deleted, but up to 30 s instead of 4 s would be
+quarantined. A recovered "dirty" row also carries no session time (`start_pts_ns=0`,
+`:297-337`), so it is not replay-addressable. Caveat: tested with a synthetic live
+source (`videotestsrc is-live=true`), not NDI.
+
+**More memory at risk if the encoder stalls.** The record queue is non-leaky, sits
+before `videoconvert` so it holds raw BGR frames, and is capped by the smaller of 256
+buffers (`settings.py:62-63`) and one segment of time:
+
+| | Cap at 30 fps | Per feed, 720p (2.64 MiB/frame) | 8 feeds | Per feed, 1080p (5.93 MiB/frame) |
+|---|---|---|---|---|
+| 4 s | 120 buffers (time cap binds) | 316 MiB | 2.5 GiB | 712 MiB |
+| 30 s | 256 buffers (buffer cap binds) | 675 MiB | 5.3 GiB | 1.48 GiB |
+
+At 60 fps the 4 s cap is 240 buffers, so it is already near 256 and nothing changes.
+Related, by arithmetic and not observed: the `recording_branch_saturated` alarm trips at
+75% of 256, i.e. 192 buffers, for two ticks (`telemetry.py:810-817`; depth is counted in
+buffers). At 4 s and 30 fps the queue stops at 120 (47%), so the alarm cannot trip; at
+30 s it can. It never fired in sessions 010-022 (`health_events.jsonl`).
+
+### 6.4 What gets better, and what stays the same
+
+**Better.** Seam events scale with 1 / segment length, and so do the glitches they cause.
+Using the per-seam figure from section 3.3.2 (1.27 glitched clicks per seam):
+
+| Segment length | Average lag behind live | Worst lag | Seams per feed-hour | Chance a given tile glitches on a click | 8 feeds: chance some tile glitches |
+|---|---|---|---|---|---|
+| 4 s (today) | 2 s | 4 s | 900 | 1.06% | 8.2% |
+| 8 s | 4 s | 8 s | 450 | 0.53% | 4.2% |
+| 15 s | 7.5 s | 15 s | 240 | 0.28% | 2.2% |
+| 30 s | 15 s | 30 s | 120 | 0.14% | 1.1% |
+
+These are arithmetic from measured per-seam values, assuming the seams of different
+feeds do not coincide. File and database-row counts drop by the same factor, and the
+~85 ms next-file-open hitch (`NDI_OPEN_BUGS.md` §3) happens every 30 s instead of 4 s.
+
+**The same.** Measured on a 30 s versus a 4 s file written by the app's record-chain
+shape:
+
+| | 4 s file | 30 s file |
+|---|---|---|
+| Frames / size (synthetic ball, 720p30) | 120 / 1.9 MB | 900 / 14.0 MB (real content: 5-15 MB per 4 s) |
+| Open + first read | 6-20 ms | 6-20 ms |
+| Seek + read, median / p95 (40 random offsets) | 18.9 / 20.1 ms | 19.6 / 21.3 ms |
+| Seeks landing on the wrong frame | 0 of 40 | 0 of 40 |
+| Has an index (Cues) | yes | yes; real production files too |
+| File complete after the rotation point where the app adds it to the index | 9.5-19 ms | 21-24 ms |
+
+So a longer file does not widen the window in which the app has indexed a segment whose
+file is not yet closed (the "no video, time keeps counting" case noted at
+`pipeline_manager.py:546`), at least with one feed on an idle disk.
+
+**Clock drift stays small.** `end_session_time_ns = last_pts + one offset` sampled at the
+segment start (`pipeline_manager.py:2338-2342`) assumes the source and session clocks
+advance together. On the recorded runs the offset moves by -1.3 to +4.3 ms per 30 s
+(median magnitude 1.3 ms), so a 30 s segment ends up to about 0.13 frame off at the
+far end. This adds a little to the jitter in section 3.2.
+
+### 6.5 Variable-length segments
+
+**Already happening.** The last segment of every game is cut short by `split-now` at Stop
+(`pipeline_manager.py:555-615`): in session_022 `segment_00068.mkv` has 30 frames (1.04 s).
+First segments differ by a frame, and a 28 fps feed gives 109-113 frames per segment.
+Replay copes with all of these.
+
+**Tested on GStreamer 1.28.1**, the app's chain shape (BGR to I420 bt601, `jpegenc
+quality=85`, `splitmuxsink muxer-factory=matroskamux async-finalize=true`), 62 s of
+720p30, one run:
+
+| Segment | Length | Frames | How it was cut |
+|---|---|---|---|
+| 1 | 4.00 s | 120 | normal rotation |
+| 2 | 4.00 s | 120 | normal rotation |
+| 3 | 30.00 s | 900 | `max-size-time` set to 30 s **while PLAYING** at 10 s; the open segment (begun at 8 s) ran to 38 s |
+| 4 | 1.93 s | 58 | `split-now` at 40 s |
+| 5 | 10.07 s | 302 | `split-at-running-time(50 s)` scheduled at 39.8 s |
+| 6 | 12.00 s | 360 | rest of the stream |
+
+The frames add up to 1860 (62 s x 30): none lost, every file has its index.
+
+**One caution.** `gst-inspect-1.0 splitmuxsink` documents `max-size-time` as "changeable
+only in NULL or READY state", yet it took effect while PLAYING. Do not build on that.
+The `split-now`, `split-after` and `split-at-running-time` signals are the supported
+runtime controls, and the app already rebuilds the element at every Start
+(`_rebuild_splitmuxsink_locked`, `pipeline_manager.py:1998`), which is the natural place
+to apply a per-game length.
+
+**Designs, none built:**
+
+| Design | Gives | Costs |
+|---|---|---|
+| Per-game length, applied at the Start rebuild | Different length for e.g. practice vs match | Trivial; does not fix the live-edge lag |
+| **Long cap (e.g. 30 s) plus `split-now` at Next Play, Timeout and Challenge** | Few seams normally, and the end of each play is replayable within about 0.1-0.3 s, the same mechanism the Stop path uses | The end of the reviewed play then sits exactly on a seam, so it meets the section 2 bugs where the referee looks. New code must not block the Qt thread (Stop sleeps 0.3 s, `:589`) and must keep the post-split segment (Stop discards it, `:601-603`) |
+| Short segments near live, merged into long ones in the background (`ffmpeg -c copy`) | Low lag and few old files | Rows and index entries must be swapped, and Windows will not let a file be replaced while `SegmentDecoder` holds it open. Not tested |
+
+If the goal is only fewer seam glitches, the section 5 fixes remove the cause for any
+length; changing the length alone trades the glitch for a worse live edge.
+
+### 6.6 What the recorded data says about the current length
+
+Nothing in `C:\SportsReplay` uses any other length: of the 1181 complete segments in the
+database none is longer than 4.10 s, 1165 are 3.0-4.2 s, and the 16 shorter ones are
+game-ending or partial cuts. So the 8 s and 30 s figures above come from the arithmetic
+and the scratch tests, not from app recordings.
+
+### 6.7 Method, and what was not measured
+
+- Scratch scripts (not in the repo) recorded synthetic video through a standalone
+  GStreamer pipeline shaped like the app's record branch, for fixed 4 s, fixed 30 s and
+  variable lengths; read the files back with `ffprobe` and `cv2`; and timed seeks with
+  `CAP_PROP_POS_MSEC`. The crash test used `Process.kill()` on a live (real-time) pipeline.
+  File-completion timing used `splitmuxsink-fragment-closed` bus messages against the
+  `format-location` callback.
+- The drift figures come from `pts_to_session_offset_ns` in `metadata.db`, read-only.
+- **Not measured:** the real NDI chain, more than one feed, disk load, power loss (only a
+  process kill), post-session export with 30 s files (`long_form_export`,
+  `clips_json_export`; no 4 s constants were found in them), or the UI strings.

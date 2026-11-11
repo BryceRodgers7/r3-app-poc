@@ -57,15 +57,18 @@ library, how to reproduce them, and the test traps that fake failures.
 3. [`r3_app_architecture.md` §15 / §10.4](r3_app_architecture.md) —
    target-spec rules for replay availability.
 
-### "Stepping across a segment seam repeats or skips frames, or I'm planning for 6-8 feeds / 60 fps"
+### "Stepping across a segment seam repeats or skips frames, I'm planning for 6-8 feeds / 60 fps, or I'm changing the segment length"
 
 1. [`REPLAY_SEAM_GLITCH.md`](REPLAY_SEAM_GLITCH.md) — why a single-step click
    across the boundary between two mkv segments repeats a frame and then
    skips 0-2 (segment times that don't match the files, a hole between
    segments, reads past the end of a file), measured evidence, how it gets
-   worse with more feeds and at 60 fps, and which fixes survive scale. Read it
-   before changing segment bookkeeping, `nearest_frame_location`,
-   `SegmentDecoder`, or `step_frames`.
+   worse with more feeds and at 60 fps, and which fixes survive scale. Section 6
+   covers `segment_duration_seconds`: what 30 s instead of 4 s costs (replay lag
+   behind live, crash recovery, queue memory) and gains, and how variable-length
+   segments work. Read it before changing segment bookkeeping,
+   `nearest_frame_location`, `SegmentDecoder`, `step_frames`, or the segment
+   length.
 
 ### "I'm touching crash recovery or the recovery dialog"
 
@@ -121,7 +124,7 @@ library, how to reproduce them, and the test traps that fake failures.
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | Current implementation reference. Authoritative for what the system *is*. | A state machine, lifecycle step, lock, thread, recovery edge case, or schema changes. |
 | [`PREMATCH.md`](PREMATCH.md) | The pre-match dialog, its config files, startup order, and the camera layout layering. | The dialog's fields, the config file shape, or the startup order changes. |
 | [`CHALLENGES.md`](CHALLENGES.md) | The challenge details screen, its JSON record store, the `[challenge]` pick-lists, and the operator `Elapsed: h:mm` readout. | The challenge fields, the record shape, or the game-clock behavior changes. |
-| [`REPLAY_SEAM_GLITCH.md`](REPLAY_SEAM_GLITCH.md) | The repeat/skip glitch when stepping across a segment seam: causes, evidence, and the 6-8 feed / 60 fps outlook. | The seam bookkeeping, resolver, decoder or step logic changes, or a multi-feed / 60 fps measurement is taken. |
+| [`REPLAY_SEAM_GLITCH.md`](REPLAY_SEAM_GLITCH.md) | The repeat/skip glitch when stepping across a segment seam: causes, evidence, the 6-8 feed / 60 fps outlook, and the effect of the segment length (4 s vs 30 s, variable lengths). | The seam bookkeeping, resolver, decoder or step logic changes, a multi-feed / 60 fps measurement is taken, or the segment length or cutting policy changes. |
 | [`GSTREAMER_INVARIANTS.md`](GSTREAMER_INVARIANTS.md) | GStreamer construction rules, each tied to a known failure mode. | A new GStreamer rule whose violation causes a non-obvious failure is introduced. |
 | [`VIDEO_QUALITY_AND_CODECS.md`](VIDEO_QUALITY_AND_CODECS.md) | The quality-loss stages from NDI source to MP4, and ProRes/DNxHR viability (export-only). | Quality behavior, resolution/CRF defaults, or codec support changes. |
 | [`../ARCHITECTURE.md`](../ARCHITECTURE.md) | Status snapshot of the current code's object graph. Older framing than `IMPLEMENTATION.md`; substantial overlap. | "Implemented today" / "Still open" lists need refreshing. |
