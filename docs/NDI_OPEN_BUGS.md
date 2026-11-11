@@ -242,6 +242,7 @@ produce these.
 | Maximize/restore dark frame | One or two frames of the window mid-resize, pictures intact. Flagged more on the new layout (7 of 12 against 3 of 12), though the score counts dark clothing and the new layout has more letterbox, so that isn't a clean comparison |
 | Clicks block during replay | About 180 ms at four feeds, 55 ms at one, measured before the replay fix in 3.1. Each seek renders every feed on the UI thread. Likely much better now; re-measure |
 | Segment boundary hitch in replay | Opening the next segment's file costs ~85 ms and happens inside the tick every 4 s per feed. Prefetching it in the decoder is not done |
+| Repeated / skipped frames when stepping across a segment seam | Not NDI-specific. Segment times disagree with the files and a hole sits between segments. Causes, measurements and the 6-8 feed / 60 fps outlook are in [`REPLAY_SEAM_GLITCH.md`](REPLAY_SEAM_GLITCH.md) |
 | Stale "Unable to connect to source." | Set once in `PlaybackController.initialize` and never cleared; shows on any tile that has no replay frame. Clear it when a feed connects |
 | False error at startup | `recording_branch_saturated` (ERROR) can fire while feeds connect, before any recording. The queue drains in about 3 s and nothing is lost. May no longer happen now the record valve is closed at startup |
 | `audio_missing` warning timing | The check now runs from the ingest probe, since the record branch's probe no longer sees buffers before Start |
