@@ -81,9 +81,7 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
         pm._recording_codec = codec
         pm._recording_container = container
         pm._recording_segment_counter = 0
-        # Slice 4.B fields touched by `_on_splitmuxsink_format_location`
-        # via the `_finalize_pending_segment_locked` call:
-        pm._pending_segment = None
+        # Slice 4.B fields touched when a finished segment is indexed:
         pm._metadata_db = None
         pm._segment_index = None
         # Slice 5+ fields used by enable_file_recording / disable_file_recording.
@@ -258,7 +256,6 @@ class SplitmuxsinkFormatLocationTests(unittest.TestCase):
 
             # Disable: splitmuxsink emits split-now (so the OLD muxer
             # writes its trailer) and then transitions to NULL.
-            pm._finalize_pending_segment_locked = lambda: None
             PipelineManager.disable_file_recording(pm)
             self.assertTrue(pm._recording_was_disabled)
             self.assertEqual(pm._splitmuxsink.emit_calls, ["split-now"])

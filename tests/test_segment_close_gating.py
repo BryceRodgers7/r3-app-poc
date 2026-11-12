@@ -1,17 +1,16 @@
-"""Segment validation waits for splitmuxsink to close the file.
+"""A segment is indexed only once splitmuxsink has closed its file, with exact bounds.
 
-With `async-finalize`, `format-location` for fragment N+1 fires while
-fragment N's muxer is still writing its trailer. Validating at that
-point failed on good files and quarantined them, leaving holes in
-replay. `PipelineManager` now holds each finalized segment until
-`splitmuxsink-fragment-closed` arrives for its file. These tests pin
-that hand-off, the bus routing, and (with real GStreamer) the message
-contract it relies on.
+`PipelineManager` takes each segment's start from the first buffer that
+`format-location-full` hands over, ends it where the next one starts, and
+writes it to the DB / index / validator when `splitmuxsink-fragment-closed`
+arrives for its file (or when splitmuxsink goes to NULL).
+docs/REPLAY_SEAM_GLITCH.md §7.4 step 1. These tests pin that hand-off, the
+bus routing and, with real GStreamer, the contract it relies on: consecutive
+segments meet exactly and each row's frame count matches its file.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
@@ -20,8 +19,13 @@ from types import SimpleNamespace
 import unittest
 
 from app.core.models import SessionPaths
+from app.core.session_clock import SessionClock
 from app.media.pipeline_manager import PipelineManager
+from app.storage.metadata_db import MetadataDb
+from app.storage.segment_index import SegmentIndex
 from app.storage.session_recovery import _default_segment_validator
+
+FRAME_NS = 33_333_333
 
 
 def _load_gst() -> object | None:
@@ -42,6 +46,8 @@ _HAS_RECORD_ELEMENTS = _GST is not None and all(
     _GST.ElementFactory.find(name) is not None
     for name in ("videotestsrc", "jpegenc", "splitmuxsink", "matroskamux")
 )
+# Just what `_sample_running_time` reads when the sample carries no segment.
+_FAKE_GST = SimpleNamespace(CLOCK_TIME_NONE=2**64 - 1, Format=SimpleNamespace(TIME=3))
 
 
 class _RecordingWorker:
@@ -62,6 +68,19 @@ class _RecordingWorker:
                 self.results.append((Path(segment.file_path).name, ok))
 
 
+class _FakeClock:
+    """A pipeline clock running 7 ms behind `time.monotonic_ns()`."""
+
+    def get_time(self) -> int:
+        return time.monotonic_ns() - 7_000_000
+
+
+def _sample(pts_ns: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        get_buffer=lambda: SimpleNamespace(pts=pts_ns), get_segment=lambda: None
+    )
+
+
 def _session_paths(root: Path) -> SessionPaths:
     recording_dir = root / "recording"
     recording_dir.mkdir(parents=True, exist_ok=True)
@@ -76,29 +95,34 @@ def _stub_pm(session_paths: SessionPaths, worker: _RecordingWorker) -> PipelineM
     pm._recording_container = "mkv"
     pm._recording_segment_counter = 0
     pm._recording_game_subdir = None
-    pm._pending_segment = None
+    pm._recording_segment_duration_seconds = 0.4
     pm._metadata_db = None
-    pm._segment_index = None
+    pm._segment_index = SegmentIndex()
     pm._recording_running = True
     pm._feed_metrics = None
     pm._session_clock = None
     pm._segment_validator_worker = worker
-    pm._segment_close_lock = threading.Lock()
-    pm._segments_awaiting_close = {}
-    pm._closed_segment_paths = set()
     pm._source = SimpleNamespace(get_feed_id=lambda: "ndi_1")
-    pm._Gst = _GST
+    pm._pipeline = None
+    pm._pipeline_generation = 1
+    pm._frame_duration_ns = FRAME_NS
+    pm._Gst = _FAKE_GST
     return pm
 
 
-def _open_segment(pm: PipelineManager, fragment_id: int) -> str:
-    """Run format-location and fake the buffers the encoder probe would count."""
-    path = PipelineManager._on_splitmuxsink_format_location(pm, None, fragment_id)
-    pending = pm._pending_segment
-    pending["first_pts_ns"] = fragment_id * 4_000_000_000
-    pending["last_pts_ns"] = fragment_id * 4_000_000_000 + 3_966_000_000
-    pending["frame_count"] = 120
+def _open(pm: PipelineManager, frame: int) -> str:
+    """Run format-location-full for a segment whose first buffer is `frame`."""
+    path = PipelineManager._on_splitmuxsink_format_location(
+        pm, None, frame, _sample(frame * FRAME_NS)
+    )
+    Path(path).write_bytes(b"segment")
     return path
+
+
+def _feed(pm: PipelineManager, first: int, last: int) -> None:
+    keeper = pm._segment_bookkeeper_or_new()
+    for k in range(first, last + 1):
+        keeper.note_buffer(k * FRAME_NS)
 
 
 class SegmentCloseGatingTests(unittest.TestCase):
@@ -110,63 +134,103 @@ class SegmentCloseGatingTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_finalize_waits_for_close_message(self) -> None:
-        path = _open_segment(self.pm, 0)
-        PipelineManager._finalize_pending_segment_locked(self.pm)
+    def test_segment_is_indexed_and_validated_only_after_its_close(self) -> None:
+        path0 = _open(self.pm, 0)
+        _feed(self.pm, 0, 121)  # the probe runs ahead of the cut
+        _open(self.pm, 120)
         self.assertEqual(self.worker.submitted, [])
+        self.assertEqual(self.pm._segment_index.all_for_feed("ndi_1"), [])
 
-        self.pm._on_segment_file_closed(path)
-        self.assertEqual(self.worker.submitted, [path])
-        self.assertEqual(self.pm._segments_awaiting_close, {})
-
-    def test_next_format_location_finalizes_but_does_not_submit(self) -> None:
-        # Mirrors splitmuxsink's rotation: opening segment 1 finalizes
-        # segment 0 while its file may still be mid-trailer.
-        path0 = _open_segment(self.pm, 0)
-        _open_segment(self.pm, 1)
-        self.assertEqual(self.worker.submitted, [])
-        self.pm._on_segment_file_closed(path0)
+        self.pm._on_segment_file_closed(path0, 120 * FRAME_NS)
         self.assertEqual(self.worker.submitted, [path0])
+        (segment,) = self.pm._segment_index.all_for_feed("ndi_1")
+        self.assertTrue(segment.end_exclusive)
+        self.assertEqual(segment.start_pts_ns, 0)
+        self.assertEqual(segment.end_pts_ns, 120 * FRAME_NS)
+        self.assertEqual(segment.duration_ns, 120 * FRAME_NS)
+        self.assertEqual(segment.frame_count_estimate, 120)
 
-    def test_close_before_finalize_submits_at_finalize(self) -> None:
-        path = _open_segment(self.pm, 0)
-        self.pm._on_segment_file_closed(path)
+    def test_format_location_does_no_db_or_index_work(self) -> None:
+        _open(self.pm, 0)
+        _feed(self.pm, 0, 10)
+        _open(self.pm, 8)
+        _open(self.pm, 16)
+        self.assertEqual(self.pm._segment_index.all_for_feed("ndi_1"), [])
         self.assertEqual(self.worker.submitted, [])
 
-        PipelineManager._finalize_pending_segment_locked(self.pm)
-        self.assertEqual(self.worker.submitted, [path])
-        self.assertEqual(self.pm._closed_segment_paths, set())
+    def test_session_times_use_one_pipeline_constant(self) -> None:
+        clock_ns = 50_000_000_000
+        self.pm._session_clock = SessionClock(clock_ns=lambda: clock_ns)
+        base_time = 40_000_000_000
+        self.pm._pipeline = SimpleNamespace(
+            get_clock=lambda: _FakeClock(), get_base_time=lambda: base_time
+        )
+        paths = [_open(self.pm, 0)]
+        _feed(self.pm, 0, 250)
+        paths.append(_open(self.pm, 120))
+        paths.append(_open(self.pm, 240))
+        for path in paths[:2]:
+            self.pm._on_segment_file_closed(path)
+        first, second = self.pm._segment_index.all_for_feed("ndi_1")
+        # running time + base time + clock offset (7 ms) - session start
+        expected_start = 0 + base_time + 7_000_000 - clock_ns
+        self.assertAlmostEqual(first.start_session_time_ns, expected_start, delta=200_000)
+        self.assertEqual(first.end_session_time_ns, second.start_session_time_ns)
+        self.assertEqual(first.pts_to_session_offset_ns, second.pts_to_session_offset_ns)
+        self.assertEqual(
+            second.end_session_time_ns - second.start_session_time_ns, 120 * FRAME_NS
+        )
 
-    def test_duplicate_close_message_submits_once(self) -> None:
-        path = _open_segment(self.pm, 0)
-        PipelineManager._finalize_pending_segment_locked(self.pm)
-        self.pm._on_segment_file_closed(path)
-        self.pm._on_segment_file_closed(path)
-        self.assertEqual(self.worker.submitted, [path])
+    def test_no_session_clock_leaves_session_times_empty(self) -> None:
+        path0 = _open(self.pm, 0)
+        _feed(self.pm, 0, 30)
+        _open(self.pm, 30)
+        self.pm._on_segment_file_closed(path0)
+        (segment,) = self.pm._segment_index.all_for_feed("ndi_1")
+        self.assertIsNone(segment.start_session_time_ns)
+        self.assertIsNone(segment.end_session_time_ns)
+        self.assertIsNone(segment.pts_to_session_offset_ns)
 
-    def test_location_spelling_differences_still_match(self) -> None:
-        path = _open_segment(self.pm, 0)
-        PipelineManager._finalize_pending_segment_locked(self.pm)
-        directory, name = os.path.split(path)
-        location = os.path.join(directory, ".", name).replace("\\", "/")
-        self.pm._on_segment_file_closed(location)
-        self.assertEqual(self.worker.submitted, [path])
+    def test_rows_round_trip_through_the_db(self) -> None:
+        db = MetadataDb(Path(self._tmp.name) / "metadata.db")
+        db.create_session("session_001", "Test", "2026-11-11T00:00:00+00:00")
+        self.pm._metadata_db = db
+        path0 = _open(self.pm, 0)
+        _feed(self.pm, 0, 130)
+        _open(self.pm, 119)
+        self.pm._on_segment_file_closed(path0)
+        (row,) = db.segments_for_session("session_001")
+        self.assertTrue(row.end_exclusive)
+        self.assertEqual(row.frame_count_estimate, 119)
+        self.assertEqual(row.end_pts_ns - row.start_pts_ns, 119 * FRAME_NS)
+        db.close()
 
-    def test_drain_submits_waiting_and_forgets_unmatched_closes(self) -> None:
-        path0 = _open_segment(self.pm, 0)
-        path1 = _open_segment(self.pm, 1)
-        PipelineManager._finalize_pending_segment_locked(self.pm)
-        self.pm._on_segment_file_closed(str(Path(self._tmp.name) / "throwaway.mkv"))
+    def test_null_drain_indexes_segments_still_waiting_and_the_open_one(self) -> None:
+        path0 = _open(self.pm, 0)
+        _feed(self.pm, 0, 70)
+        path1 = _open(self.pm, 60)
+        self.pm._finalize_closed_fragments(include_current=True)
+        self.assertEqual(self.worker.submitted, [path0, path1])
+        last = self.pm._segment_index.all_for_feed("ndi_1")[-1]
+        # No next segment: ends one frame after its last buffer.
+        self.assertEqual(last.end_pts_ns, 71 * FRAME_NS)
+        self.assertEqual(last.frame_count_estimate, 11)
 
-        self.pm._submit_segments_awaiting_close()
-        self.assertCountEqual(self.worker.submitted, [path0, path1])
-        self.assertEqual(self.pm._segments_awaiting_close, {})
-        self.assertEqual(self.pm._closed_segment_paths, set())
+    def test_drain_without_current_drops_nothing_else(self) -> None:
+        _open(self.pm, 0)
+        _feed(self.pm, 0, 40)
+        _open(self.pm, 30)
+        self.pm._segment_bookkeeper_or_new().drop_current()
+        self.pm._finalize_closed_fragments(include_current=False)
+        self.assertEqual(len(self.worker.submitted), 1)
 
-    def test_drain_on_uninitialized_stub_is_noop(self) -> None:
-        # `disable_file_recording` is driven on bare `__new__` stubs in
-        # other test modules; the drain must tolerate that.
-        PipelineManager._submit_segments_awaiting_close(PipelineManager.__new__(PipelineManager))
+    def test_format_location_without_a_first_sample_indexes_nothing(self) -> None:
+        _open(self.pm, 0)
+        _feed(self.pm, 0, 20)
+        with self.assertLogs("app.media.pipeline_manager", level="WARNING"):
+            PipelineManager._on_splitmuxsink_format_location(self.pm, None, 1)
+        self.pm._finalize_closed_fragments(include_current=True)
+        self.assertEqual(self.worker.submitted, [])
 
 
 @unittest.skipIf(_GST is None, "GStreamer (gi) not available")
@@ -175,6 +239,7 @@ class BusFragmentClosedRoutingTests(unittest.TestCase):
         self._tmp = TemporaryDirectory()
         self.worker = _RecordingWorker()
         self.pm = _stub_pm(_session_paths(Path(self._tmp.name)), self.worker)
+        self.pm._Gst = _GST
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -187,46 +252,66 @@ class BusFragmentClosedRoutingTests(unittest.TestCase):
             bus, Gst.MessageType.ELEMENT, 0, pipeline_role="live", fatal=True
         )
 
-    def test_fragment_closed_message_releases_validation(self) -> None:
-        path = _open_segment(self.pm, 0)
-        PipelineManager._finalize_pending_segment_locked(self.pm)
+    def test_fragment_closed_message_indexes_the_segment(self) -> None:
+        path0 = _open(self.pm, 0)
+        _feed(self.pm, 0, 12)
+        _open(self.pm, 12)
         structure = _GST.Structure.new_empty("splitmuxsink-fragment-closed")
-        structure.set_value("location", path)
+        structure.set_value("location", path0)
+        structure.set_value("running-time", 12 * FRAME_NS)
         self.assertFalse(self._poll(structure))
-        self.assertEqual(self.worker.submitted, [path])
+        self.assertEqual(self.worker.submitted, [path0])
 
     def test_other_element_messages_are_ignored(self) -> None:
-        path = _open_segment(self.pm, 0)
-        PipelineManager._finalize_pending_segment_locked(self.pm)
+        path0 = _open(self.pm, 0)
+        _feed(self.pm, 0, 12)
+        _open(self.pm, 12)
         structure = _GST.Structure.new_empty("splitmuxsink-fragment-opened")
-        structure.set_value("location", path)
+        structure.set_value("location", path0)
         self.assertFalse(self._poll(structure))
         self.assertEqual(self.worker.submitted, [])
-        self.assertEqual(self.pm._closed_segment_paths, set())
+
+
+def _count_frames(path: str) -> int:
+    import cv2
+
+    capture = cv2.VideoCapture(path)
+    count = 0
+    while capture.grab():
+        count += 1
+    capture.release()
+    return count
 
 
 @unittest.skipUnless(_HAS_RECORD_ELEMENTS, "GStreamer recording elements not available")
-class SplitmuxsinkCloseContractTests(unittest.TestCase):
-    """Real splitmuxsink with the app's settings (async-finalize, matroskamux)."""
+class SplitmuxsinkBoundsContractTests(unittest.TestCase):
+    """Real splitmuxsink built by `_build_splitmuxsink_element` (app settings)."""
 
-    def test_every_segment_validated_once_after_close(self) -> None:
+    def test_segments_meet_exactly_and_counts_match_the_files(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("cv2 not available")
         Gst = _GST
         with TemporaryDirectory() as tmp:
             worker = _RecordingWorker(validator=_default_segment_validator)
             pm = _stub_pm(_session_paths(Path(tmp)), worker)
+            pm._Gst = Gst
+            pm._session_clock = SessionClock()
             pipeline = Gst.parse_launch(
                 "videotestsrc is-live=true pattern=ball ! "
-                "video/x-raw,width=640,height=360,framerate=30/1 ! videoconvert ! "
-                "video/x-raw,format=I420 ! jpegenc name=enc ! "
-                "splitmuxsink name=s max-size-time=400000000 "
-                "muxer-factory=matroskamux async-finalize=true"
+                "video/x-raw,width=320,height=180,framerate=30000/1001 ! videoconvert ! "
+                "video/x-raw,format=I420 ! jpegenc name=enc"
             )
-            pipeline.get_by_name("s").connect(
-                "format-location", pm._on_splitmuxsink_format_location
-            )
+            sink = PipelineManager._build_splitmuxsink_element(pm, "record")
+            pipeline.add(sink)
+            self.assertTrue(pipeline.get_by_name("enc").link(sink))
             pipeline.get_by_name("enc").get_static_pad("src").add_probe(
-                Gst.PadProbeType.BUFFER, pm._on_record_encoder_buffer_probe, None
+                Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM,
+                pm._on_record_encoder_buffer_probe,
+                None,
             )
+            pm._pipeline = pipeline
             bus = pipeline.get_bus()
 
             def pump(seconds: float) -> None:
@@ -242,26 +327,70 @@ class SplitmuxsinkCloseContractTests(unittest.TestCase):
 
             try:
                 pipeline.set_state(Gst.State.PLAYING)
-                pump(1.6)
-                pipeline.send_event(Gst.Event.new_eos())
-                pump(0.6)
-                # What `disable_file_recording` does after its split:
-                # finalize the last segment, go to NULL, drain.
-                PipelineManager._finalize_pending_segment_locked(pm)
+                pump(2.0)
+                # What `disable_file_recording` does: split, let the split
+                # happen, drop the throwaway, NULL, drain.
+                sink.emit("split-now")
+                pump(0.3)
+                pm._segment_bookkeeper_or_new().drop_current()
             finally:
                 pipeline.set_state(Gst.State.NULL)
             released_by_close_message = len(worker.submitted)
-            pm._submit_segments_awaiting_close()
+            pm._finalize_closed_fragments(include_current=False)
 
-            # The close message, not the teardown drain, should release
-            # (nearly) every segment.
-            self.assertGreaterEqual(released_by_close_message, 3)
-            self.assertLessEqual(len(worker.submitted) - released_by_close_message, 1)
-            self.assertEqual(len(worker.submitted), len(set(worker.submitted)))
-            self.assertEqual(
-                [name for name, ok in worker.results if not ok], [],
-                "segments failed validation at submit time",
+            segments = sorted(
+                pm._segment_index.all_for_feed("ndi_1"), key=lambda s: s.start_pts_ns
             )
+            self.assertGreaterEqual(len(segments), 4)
+            self.assertGreaterEqual(released_by_close_message, len(segments) - 1)
+            self.assertEqual(len(worker.submitted), len(set(worker.submitted)))
+            self.assertEqual([n for n, ok in worker.results if not ok], [])
+            for earlier, later in zip(segments, segments[1:]):
+                self.assertEqual(earlier.end_pts_ns, later.start_pts_ns)
+                self.assertEqual(earlier.end_session_time_ns, later.start_session_time_ns)
+            self.assertEqual(len({s.pts_to_session_offset_ns for s in segments}), 1)
+            for segment in segments:
+                self.assertTrue(segment.end_exclusive)
+                self.assertEqual(
+                    segment.frame_count_estimate, _count_frames(segment.file_path),
+                    f"{Path(segment.file_path).name}: DB frame count vs file",
+                )
+                period = segment.duration_ns / segment.frame_count_estimate
+                self.assertAlmostEqual(period, 1e9 * 1001 / 30000, delta=1_000)
+            # The decoder lands on the requested frame going backwards and
+            # at random, as replay stepping does (pictures move: "ball").
+            self._check_decoder_positions(segments[1].file_path)
+
+    def _check_decoder_positions(self, path: str) -> None:
+        import hashlib
+        import random
+
+        import cv2
+
+        from app.media.segment_decoder import SegmentDecoder
+        from app.storage.segment_replay_store import SegmentReplayLocation
+
+        capture = cv2.VideoCapture(path)
+        truth = []
+        while True:
+            ok, image = capture.read()
+            if not ok:
+                break
+            truth.append(hashlib.md5(image.tobytes()).hexdigest())
+        capture.release()
+        order = list(range(len(truth) - 1, -1, -1)) + random.Random(7).sample(range(len(truth)), len(truth))
+        decoder = SegmentDecoder("ndi_1", "ndi_1")
+        segment = SimpleNamespace(file_path=path)
+        try:
+            wrong = [
+                k for k in order
+                if (frame := decoder.decode(
+                    SegmentReplayLocation(segment=segment, offset_in_segment_ns=0, frame_index=k)
+                )) is None or hashlib.md5(frame.image.tobytes()).hexdigest() != truth[k]
+            ]
+        finally:
+            decoder.close()
+        self.assertEqual(wrong, [], "frames the decoder got wrong")
 
 
 if __name__ == "__main__":

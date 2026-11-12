@@ -47,6 +47,11 @@ from app.media.encoder_factory import (
 )
 from app.media.frame_overlay import render_frame_overlay
 from app.media.gst_bus_log import log_bus_message
+from app.media.segment_bookkeeping import (
+    FinishedFragment,
+    FragmentRecord,
+    SegmentBookkeeper,
+)
 from app.media.source_interface import PipelineMode
 from app.media.preview_output import PreviewOutput
 from app.media.source_interface import SourceInterface
@@ -126,9 +131,44 @@ def purge_unrouted_segments() -> None:
             LOGGER.exception("could not remove unrouted segment %s", entry)
 
 
-def _segment_path_key(path: str) -> str:
-    """Normalize a segment path so splitmuxsink's `location` matches `Segment.file_path`."""
-    return os.path.normcase(os.path.normpath(str(path)))
+# matroskamux stores timestamps in steps of `timecodescale` (default 1 ms).
+# 100 us keeps file timestamps within 0.05 ms of the GStreamer timestamps,
+# so positioning by container timestamp stays exact at 30 and 60 fps
+# (docs/REPLAY_SEAM_GLITCH.md §8.2 item 1, verified in §7.2 E4 / E5).
+_MATROSKA_TIMECODESCALE_NS = 100_000
+
+
+def _clock_to_monotonic_offset_ns(clock: Any, *, samples: int) -> int:
+    """`time.monotonic_ns()` minus `clock.get_time()`, from paired reads.
+
+    Keeps the read bracketed most tightly by the two monotonic samples
+    (about 1 us apart). Zero when the pipeline runs on GStreamer's
+    system clock, which is the same counter (REPLAY_SEAM_GLITCH.md §7.2 E1).
+    """
+    best_width: int | None = None
+    best_offset = 0
+    for _ in range(max(1, samples)):
+        before = time.monotonic_ns()
+        clock_ns = int(clock.get_time())
+        after = time.monotonic_ns()
+        width = after - before
+        if best_width is None or width < best_width:
+            best_width = width
+            best_offset = (before + after) // 2 - clock_ns
+    return best_offset
+
+
+def _clock_drift_tolerance_ns() -> int:
+    """How far the clock mapping may move before it is worth a warning.
+
+    On Python before 3.13, Windows' `time.monotonic` ticks every ~15.6 ms,
+    so the tolerance follows the clock's resolution.
+    """
+    try:
+        resolution_ns = int(time.get_clock_info("monotonic").resolution * 1e9)
+    except Exception:
+        resolution_ns = 0
+    return max(1_000_000, 2 * resolution_ns)
 
 
 @dataclass(slots=True)
@@ -232,13 +272,18 @@ class PipelineManager:
         self._segment_validator_worker = SegmentValidatorWorker(
             self._source.get_feed_id()
         )
-        # Validation of a finalized segment waits for splitmuxsink to
-        # report its file closed (`_validate_segment_once_closed`).
-        # Keyed by `_segment_path_key`; `_closed_segment_paths` holds
-        # close messages that arrived before their segment finalized.
-        self._segment_close_lock = threading.Lock()
-        self._segments_awaiting_close: dict[str, tuple[Segment, Path, Any, Any]] = {}
-        self._closed_segment_paths: set[str] = set()
+        # Segment bounds from splitmuxsink's own reports
+        # (docs/REPLAY_SEAM_GLITCH.md §7.4 step 1): the open segment, the
+        # ones waiting for `splitmuxsink-fragment-closed`, and the running
+        # times of recent encoded buffers. A segment reaches the DB, the
+        # index and the validator only once its file is closed.
+        self._segment_bookkeeper = SegmentBookkeeper()
+        # The record encoder's current GstSegment, for PTS -> running time.
+        self._record_encoder_segment: Any | None = None
+        # ((pipeline generation, base time), monotonic - pipeline clock):
+        # running time + base time + that offset = time.monotonic_ns().
+        self._clock_mapping: tuple[tuple[int, int], int] | None = None
+        self._clock_drift_warned: bool = False
 
         self._Gst: Any | None = None
         self._GstVideo: Any | None = None
@@ -299,15 +344,14 @@ class PipelineManager:
         self._recording_segment_duration_seconds: float = max(
             0.5, float(recording_segment_duration_seconds)
         )
-        # Phase 4.B: per-segment metadata tracking. The buffer probe on
-        # jpegenc.src updates `_pending_segment` for the currently-writing
-        # segment; format-location and disable_file_recording finalize it
-        # into the metadata DB + segment index.
-        self._pending_segment: dict[str, Any] | None = None
+        # Phase 4.B: finished segments are written to the metadata DB and
+        # the segment index (see `_segment_bookkeeper` for how they are
+        # bounded).
         self._metadata_db: MetadataDb | None = None
         self._segment_index: SegmentIndex | None = None
         # Slice 5.A: session-clock reference (per-app monotonic origin).
-        # Captured at first-buffer of each segment for `pts_to_session_offset_ns`.
+        # Segment session times are the pipeline's running time mapped
+        # onto this clock's origin (`_running_time_to_monotonic_ns`).
         self._session_clock: SessionClock | None = None
         # Bug-fix flag: set on `disable_file_recording`. The next
         # `enable_file_recording` checks it and rebuilds the
@@ -554,11 +598,13 @@ class PipelineManager:
 
         The mechanism is `split-now`: emitted while the valve is still
         open, splitmuxsink rotates on the next buffer, which sends EOS to
-        the OLD muxer (trailer write) and runs `format-location` for a
-        NEW segment (which calls `_finalize_pending_segment_locked` for
-        the OLD one — properly recording it). After a brief sleep to let
-        the rotation + async-finalize worker thread complete, we close
-        the valve and drop the new (post-split) pending segment.
+        the OLD muxer (trailer write) and runs `format-location-full` for
+        a NEW segment, whose first buffer is exactly where the OLD one
+        ends. The OLD one is indexed when its `fragment-closed` message
+        arrives, or below once splitmuxsink is at NULL. After a brief
+        sleep to let the rotation + async-finalize worker thread
+        complete, we close the valve and stop tracking the new
+        (post-split) segment.
         """
         # The operator is ending the game: a resume still pending from a
         # mid-game rebuild must not restart recording afterwards.
@@ -593,14 +639,13 @@ class PipelineManager:
         self._recording_running = False
         self._set_branch_enabled("record", False)
 
-        # 4. If split-now fired, the OLD segment is already in the DB
-        # (format-location's auto-finalize ran on rotation) and its
-        # trailer is on disk. The current `_pending_segment` is the
-        # post-split throwaway — drop it without recording so we don't
-        # leave a tiny, trailer-less DB row that confuses replay.
+        # 4. If split-now fired, the OLD segment ended where the
+        # post-split one began. The post-split segment is a throwaway:
+        # stop tracking it so it never becomes a tiny, trailer-less DB
+        # row that confuses replay.
         split_fired = self._recording_segment_counter > counter_before
         if split_fired:
-            self._pending_segment = None
+            self._segment_bookkeeper_or_new().drop_current()
             LOGGER.info(
                 "disable: split-now confirmed for feed_id=%s; "
                 "dropping partial post-split segment",
@@ -613,7 +658,6 @@ class PipelineManager:
                 "best-effort (may lack trailer)",
                 self._recording_feed_id,
             )
-        self._finalize_pending_segment_locked()
 
         # 5. Tear splitmuxsink down. enable_file_recording rebuilds it.
         if self._splitmuxsink is not None and self._Gst is not None:
@@ -629,9 +673,10 @@ class PipelineManager:
                     "splitmuxsink NULL transition failed on disable for feed_id=%s",
                     self._recording_feed_id,
                 )
-        # At NULL every fragment file is closed; validate any segment
-        # whose close message hasn't been read off the bus yet.
-        self._submit_segments_awaiting_close()
+        # At NULL every fragment file is closed: index the segments whose
+        # close message hasn't been read off the bus yet, and the
+        # in-flight one when the split didn't happen.
+        self._finalize_closed_fragments(include_current=not split_fired)
 
         # 6. Flush the audio mux-branch so no opus packet survives the
         # gap between games.
@@ -708,31 +753,26 @@ class PipelineManager:
 
         self._teardown_pipeline()
         self._source.disconnect_source()
+        keeper = self._segment_bookkeeper_or_new()
         if was_recording:
-            # Index the partial segment the old pipeline was writing so the
-            # footage recorded before the dropout stays replayable. It also
-            # has to go before the new pipeline starts: the encoder probe
-            # updates `_pending_segment` in place, and the new pipeline's
-            # PTS restart at 0, which would overwrite this segment's
-            # last_pts.
-            pending = self._pending_segment
-            if pending is not None and self._bytes_written(pending) <= 0:
+            # Index the segments the old pipeline was writing so the
+            # footage recorded before the dropout stays replayable. The
+            # pipeline is at NULL, so every file is closed and the bus
+            # thread that would have read their close messages has exited.
+            # This has to happen before the new pipeline starts: its
+            # running time restarts at 0.
+            current = keeper.current()
+            if current is not None and self._bytes_written(current.file_path) <= 0:
                 # A feed that froze right after Start has a segment file
-                # that never got any data (and one counted frame). Indexing
-                # it would only hand replay a file it can't open.
+                # that never got any data. Indexing it would only hand
+                # replay a file it can't open.
                 LOGGER.info(
                     "not indexing %s after teardown: nothing was written to it",
-                    pending.get("file_path"),
+                    current.file_path,
                 )
-                self._pending_segment = None
-            else:
-                self._finalize_pending_segment_locked()
-        else:
-            self._pending_segment = None
-        # The pipeline is at NULL, so every fragment file is closed and
-        # the bus thread that would have read their close messages has
-        # exited — validate whatever was still waiting.
-        self._submit_segments_awaiting_close()
+                keeper.drop_current()
+            self._finalize_closed_fragments(include_current=True)
+        keeper.reset()
         # Phase 10.E: drain the validator worker so any finalized
         # segments still in its queue get checked before the pipeline
         # is rebuilt or torn down for good. 5s budget is generous —
@@ -751,10 +791,10 @@ class PipelineManager:
         )
 
     @staticmethod
-    def _bytes_written(pending: dict[str, Any]) -> int:
+    def _bytes_written(file_path: str) -> int:
         try:
-            return Path(pending["file_path"]).stat().st_size
-        except (OSError, KeyError):
+            return Path(file_path).stat().st_size
+        except OSError:
             return 0
 
     def is_source_connected(self) -> bool:
@@ -985,10 +1025,11 @@ class PipelineManager:
     def set_session_clock(self, clock: SessionClock | None) -> None:
         """Attach the per-app monotonic session clock (slice 5.A).
 
-        Used to capture `pts_to_session_offset_ns` at the first buffer
-        of each segment so replay queries can resolve session-time to
-        a `(segment, offset_in_segment_ns)` pair without rerunning a
-        per-feed PTS-mapping query (§8.3 / §6.3).
+        Segment session times are the pipeline's running time mapped onto
+        this clock's origin, one constant per pipeline
+        (`_running_time_to_monotonic_ns`), so replay queries can resolve
+        session-time to a `(segment, offset_in_segment_ns)` pair without
+        rerunning a per-feed PTS-mapping query (§8.3 / §6.3).
         """
         self._session_clock = clock
 
@@ -1836,13 +1877,15 @@ class PipelineManager:
                 None,
             )
 
-        # Slice 4.B: probe the encoder's src so we capture per-segment
-        # first/last PTS and frame counts of the *encoded* stream
-        # (matches what splitmuxsink actually writes to disk).
+        # Slice 4.B: probe the encoder's src so each segment's frame count
+        # is the number of *encoded* buffers (what splitmuxsink writes to
+        # disk) whose running time falls inside it. The probe also sees
+        # downstream events, to keep the segment for the PTS -> running
+        # time conversion.
         encoder_src_pad = encoder.get_static_pad("src")
         if encoder_src_pad is not None:
             encoder_src_pad.add_probe(
-                Gst.PadProbeType.BUFFER,
+                Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM,
                 self._on_record_encoder_buffer_probe,
                 None,
             )
@@ -1992,8 +2035,30 @@ class PipelineManager:
         # its children's async state changes instead of passing them up.
         # Measured: preview 0 fps without it, ~58 fps with it.
         self._set_property_if_supported(sink, "async-handling", True)
-        sink.connect("format-location", self._on_splitmuxsink_format_location)
+        if self._recording_muxer_factory() == "matroskamux":
+            self._set_matroska_timecodescale(sink)
+        # `format-location-full` (not `format-location`) hands over the
+        # first buffer of each new file: its running time is where the
+        # new segment starts and the previous one ends.
+        sink.connect("format-location-full", self._on_splitmuxsink_format_location)
         return sink
+
+    def _set_matroska_timecodescale(self, sink: Any) -> None:
+        """Store mkv timestamps in 100 us steps instead of 1 ms."""
+        Gst = self._Gst
+        try:
+            sink.set_property(
+                "muxer-properties",
+                Gst.Structure.new_from_string(
+                    f"properties,timecodescale=(gint64){_MATROSKA_TIMECODESCALE_NS}"
+                ),
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "could not set matroskamux timecodescale (%s); segment files "
+                "keep 1 ms timestamps",
+                exc,
+            )
 
     def _rebuild_splitmuxsink_locked(self) -> None:
         """Replace the existing splitmuxsink with a fresh instance.
@@ -2178,8 +2243,13 @@ class PipelineManager:
                 feed_id=self._recording_feed_id,
             )
 
-    def _on_splitmuxsink_format_location(self, _splitmuxsink: Any, fragment_id: int) -> str:
-        """Pick a per-segment filename based on the active recording session.
+    def _on_splitmuxsink_format_location(
+        self, _splitmuxsink: Any, fragment_id: int, first_sample: Any = None
+    ) -> str:
+        """Pick a per-segment filename and start tracking the new segment.
+
+        Connected to `format-location-full`, which also passes the first
+        buffer of the new file (`first_sample`).
 
         Uses our own `_recording_segment_counter` rather than splitmuxsink's
         `fragment_id` argument — splitmuxsink's counter increments during
@@ -2190,21 +2260,16 @@ class PipelineManager:
         filenames predictable: every new recording session starts at
         `segment_00000.mkv`.
 
-        Slice 4.B: also drives segment-metadata lifecycle. By the time
-        this callback fires for fragment N, fragment N-1 has been closed
-        by splitmuxsink's rotation (modulo `async-finalize` flushing). So
-        finalize the previous pending segment (if any) into the metadata
-        DB + index, then reset state for the new segment.
+        The first buffer's running time is where this segment starts and
+        the previous one ends (docs/REPLAY_SEAM_GLITCH.md §7.4 step 1).
+        No database work happens here, on the streaming thread: the
+        previous segment is indexed once splitmuxsink reports its file
+        closed (`_on_segment_file_closed`).
 
         If the callback fires without an active session (defensive — the
         upstream valve should be closed in that case), fall back to a temp
         path so the caller doesn't crash.
         """
-        # Finalize the previous segment (if any) before opening the next.
-        # This is where we transition state="writing" → "complete" and
-        # capture first/last PTS, frame count, file size.
-        self._finalize_pending_segment_locked()
-
         if self._recording_session_paths is None or self._recording_feed_id is None:
             fallback_dir = unrouted_segments_dir()
             fallback_dir.mkdir(parents=True, exist_ok=True)
@@ -2246,122 +2311,245 @@ class PipelineManager:
             self._recording_feed_id,
             path,
         )
-        # Begin tracking the new pending segment. The buffer probe will
-        # populate first/last PTS and frame count as buffers flow.
-        self._pending_segment = {
-            "session_id": self._recording_session_paths.session_id,
-            "feed_id": self._recording_feed_id,
-            "fragment_index": index,
-            "file_path": str(path),
-            "first_pts_ns": None,
-            "last_pts_ns": None,
-            "frame_count": 0,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            # Slice 5.A — captured by `_on_record_encoder_buffer_probe` on
-            # first buffer; None means "no session_clock attached or
-            # first buffer never arrived". Stays None for sessions
-            # initialized in tests via `__new__` without a clock.
-            "first_session_time_ns": None,
-        }
+        self._open_fragment_record(index, path, first_sample)
         return str(path)
 
+    def _segment_bookkeeper_or_new(self) -> SegmentBookkeeper:
+        """The segment bookkeeper (created on first use by `__new__` test stubs)."""
+        keeper = getattr(self, "_segment_bookkeeper", None)
+        if keeper is None:
+            keeper = self._segment_bookkeeper = SegmentBookkeeper()
+        return keeper
+
+    def _open_fragment_record(self, index: int, path: Path, first_sample: Any) -> None:
+        """Register the segment splitmuxsink just opened."""
+        keeper = self._segment_bookkeeper_or_new()
+        bounds = self._sample_running_time(first_sample)
+        if bounds is None:
+            # Only `format-location-full` passes the first buffer. Without
+            # it neither this segment's start nor the previous one's end
+            # is known, and indexing guessed bounds is what caused the
+            # seam glitch, so neither is indexed.
+            LOGGER.warning(
+                "splitmuxsink opened %s without its first buffer; this segment "
+                "and the previous one are not indexed",
+                path,
+            )
+            keeper.drop_current()
+            return
+        start_running_time_ns, start_pts_ns = bounds
+        assert self._recording_session_paths is not None
+        assert self._recording_feed_id is not None
+        record = FragmentRecord(
+            session_id=self._recording_session_paths.session_id,
+            feed_id=self._recording_feed_id,
+            fragment_index=index,
+            file_path=str(path),
+            created_at=datetime.now(timezone.utc).isoformat(),
+            start_running_time_ns=start_running_time_ns,
+            start_pts_ns=start_pts_ns,
+            running_time_to_monotonic_ns=self._running_time_to_monotonic_ns(),
+        )
+        finished = keeper.open_fragment(record)
+        if finished is not None:
+            # The previous file's close message was read before this
+            # callback ran (rare); it is complete, so index it now.
+            self._finalize_fragment(finished)
+
+    def _sample_running_time(self, sample: Any) -> tuple[int, int] | None:
+        """`(running_time_ns, pts_ns)` of a GstSample's buffer, or None."""
+        Gst = getattr(self, "_Gst", None)
+        if sample is None or Gst is None:
+            return None
+        try:
+            buffer = sample.get_buffer()
+            pts = buffer.pts if buffer is not None else Gst.CLOCK_TIME_NONE
+            if pts == Gst.CLOCK_TIME_NONE:
+                return None
+            running_time = pts
+            segment = sample.get_segment()
+            if segment is not None:
+                converted = segment.to_running_time(Gst.Format.TIME, pts)
+                if converted != Gst.CLOCK_TIME_NONE:
+                    running_time = converted
+            return int(running_time), int(pts)
+        except Exception:
+            LOGGER.exception("could not read the first buffer's timestamp")
+            return None
+
+    def _running_time_to_monotonic_ns(self) -> int | None:
+        """Constant that maps this pipeline's running time to `time.monotonic_ns()`.
+
+        `running_time + base_time` is the pipeline clock's time when a
+        buffer is due; adding the clock's offset to the monotonic clock
+        gives a `time.monotonic_ns()` value, which `SessionClock` counts
+        from. One constant per pipeline (base time), measured once by
+        paired clock reads (accurate to ~1 us), so segment times carry no
+        per-segment sampling error (docs/REPLAY_SEAM_GLITCH.md §7.4 step 1).
+
+        Also step 0 of that section: logs which clock the pipeline runs on
+        and warns if the mapping drifts (it can't with GStreamer's system
+        clock, which is the same counter as `time.monotonic_ns()`).
+        Returns None without a running pipeline.
+        """
+        Gst = self._Gst
+        pipeline = getattr(self, "_pipeline", None)
+        if Gst is None or pipeline is None:
+            return None
+        try:
+            clock = pipeline.get_clock()
+            base_time = pipeline.get_base_time()
+        except Exception:
+            return None
+        if clock is None or base_time is None or base_time == Gst.CLOCK_TIME_NONE:
+            return None
+        key = (int(getattr(self, "_pipeline_generation", 0)), int(base_time))
+        mapping = getattr(self, "_clock_mapping", None)
+        if mapping is None or mapping[0] != key:
+            offset_ns = _clock_to_monotonic_offset_ns(clock, samples=64)
+            self._clock_mapping = (key, offset_ns)
+            self._clock_drift_warned = False
+            self._log_pipeline_clock(clock, offset_ns)
+            return int(base_time) + offset_ns
+        offset_ns = mapping[1]
+        drift_ns = _clock_to_monotonic_offset_ns(clock, samples=8) - offset_ns
+        if abs(drift_ns) > _clock_drift_tolerance_ns() and not getattr(
+            self, "_clock_drift_warned", False
+        ):
+            self._clock_drift_warned = True
+            LOGGER.warning(
+                "feed %s: the pipeline clock moved %.3f ms against "
+                "time.monotonic_ns since recording started; segment session "
+                "times will drift (docs/REPLAY_SEAM_GLITCH.md §7.4 step 3)",
+                self._recording_feed_id,
+                drift_ns / 1e6,
+            )
+        return int(base_time) + offset_ns
+
+    def _log_pipeline_clock(self, clock: Any, offset_ns: int) -> None:
+        try:
+            clock_type = clock.__gtype__.name
+        except Exception:
+            clock_type = type(clock).__name__
+        LOGGER.info(
+            "feed %s: pipeline clock %s, offset to time.monotonic_ns %+.4f ms",
+            self._recording_feed_id,
+            clock_type,
+            offset_ns / 1e6,
+        )
+        if clock_type != "GstSystemClock":
+            LOGGER.warning(
+                "feed %s: pipeline runs on %s, not GstSystemClock; segment "
+                "session times assume it keeps pace with time.monotonic_ns "
+                "(docs/REPLAY_SEAM_GLITCH.md §7.4 step 3)",
+                self._recording_feed_id,
+                clock_type,
+            )
+
     def _on_record_encoder_buffer_probe(self, _pad: Any, info: Any, _user: Any) -> Any:
-        """Track per-segment first/last PTS and frame count (slice 4.B + 5.A).
+        """Note each encoded buffer's running time for frame counting.
 
-        Runs on the streaming thread once per encoded JPEG buffer. Reads
-        only buffer.pts and increments a counter — no pixel work. The
-        captured stats are flushed into a `Segment` row by
-        `_finalize_pending_segment_locked` when the segment closes.
-
-        Slice 5.A: also captures `session_time_ns` at the moment of the
-        first buffer of the segment. `_finalize_pending_segment_locked`
-        uses that to compute `pts_to_session_offset_ns` and the segment's
-        `start/end_session_time_ns` (§6.3).
+        Runs on the streaming thread once per encoded buffer, upstream of
+        splitmuxsink, and also sees downstream events so it can keep the
+        pad's segment for the PTS -> running time conversion. Only the
+        buffer's timestamp is read. Frames are attributed to segments by
+        timestamp when a segment finishes (`SegmentBookkeeper`), so when a
+        buffer passes here relative to a file switch doesn't matter.
         """
         Gst = self._Gst
         if Gst is None:
             return 0
-        pending = self._pending_segment
-        if pending is None or not self._recording_running:
+        probe_type = info.type
+        if probe_type & Gst.PadProbeType.EVENT_DOWNSTREAM:
+            event = info.get_event()
+            if event is not None and event.type == Gst.EventType.SEGMENT:
+                self._record_encoder_segment = event.parse_segment()
             return Gst.PadProbeReturn.OK
         buf = info.get_buffer()
-        if buf is None:
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
             return Gst.PadProbeReturn.OK
-        if buf.pts != Gst.CLOCK_TIME_NONE:
-            pts_ns = int(buf.pts)
-            if pending["first_pts_ns"] is None:
-                pending["first_pts_ns"] = pts_ns
-                if self._session_clock is not None:
-                    pending["first_session_time_ns"] = (
-                        self._session_clock.now_session_time_ns()
-                    )
-            pending["last_pts_ns"] = pts_ns
-        pending["frame_count"] += 1
+        running_time = buf.pts
+        segment = getattr(self, "_record_encoder_segment", None)
+        if segment is not None:
+            converted = segment.to_running_time(Gst.Format.TIME, buf.pts)
+            if converted != Gst.CLOCK_TIME_NONE:
+                running_time = converted
+        self._segment_bookkeeper_or_new().note_buffer(int(running_time))
         return Gst.PadProbeReturn.OK
 
-    def _finalize_pending_segment_locked(self) -> None:
-        """Convert the pending-segment state into a `Segment` row + index entry.
+    def _nominal_frame_duration_ns(self) -> int:
+        return int(getattr(self, "_frame_duration_ns", 0) or 33_333_333)
 
-        Called from `_on_splitmuxsink_format_location` (when the next
-        segment is about to open) and from `disable_file_recording` (when
-        the operator clicks Stop). No-op if there's no pending segment or
-        the segment had no buffers (e.g. valve closed before any frame
-        flowed through).
+    def _finalize_closed_fragments(self, *, include_current: bool) -> None:
+        """Index the segments whose files are closed (splitmuxsink at NULL).
+
+        `include_current` also finishes the open segment, which nothing
+        rotated away from (Stop without a split, or a teardown).
         """
-        pending = self._pending_segment
-        self._pending_segment = None
-        if pending is None:
-            return
-        if pending["first_pts_ns"] is None:
-            # Empty segment — no buffers ever flowed through. Nothing to
-            # record. The on-disk file may exist as zero bytes; let 4.E's
-            # cleanup handle it.
-            LOGGER.debug(
-                "skipping finalize for empty segment %s",
-                pending.get("file_path"),
+        keeper = self._segment_bookkeeper_or_new()
+        finished = keeper.finish_closing()
+        if include_current:
+            last = keeper.finish_current(
+                nominal_frame_duration_ns=self._nominal_frame_duration_ns()
             )
-            return
-        file_path = Path(pending["file_path"])
+            if last is not None:
+                finished.append(last)
+        for fragment in finished:
+            self._finalize_fragment(fragment)
+
+    def _finalize_fragment(self, finished: FinishedFragment) -> None:
+        """Write a finished segment to the DB + index and queue its validation.
+
+        The file is closed by now (that is what makes it finished), so the
+        validator can open it straight away.
+        """
+        record = finished.record
+        file_path = Path(record.file_path)
         try:
             size_bytes = file_path.stat().st_size if file_path.exists() else 0
         except OSError:
             size_bytes = 0
-        first_pts = int(pending["first_pts_ns"])
-        last_pts = int(pending["last_pts_ns"]) if pending["last_pts_ns"] is not None else first_pts
-        # Slice 5.A: derive session-time fields from the first buffer's
-        # session-time reading (captured at the same moment first_pts
-        # was observed). `pts_to_session_offset_ns` is the additive
-        # offset that maps the segment's PTS-ns timeline onto session
-        # time (§6.3 / §8.3). All three fields stay None when no
-        # session_clock was attached — keeps test stubs that bypass
-        # __init__ working without surprises.
-        first_session_time_ns: int | None = pending.get("first_session_time_ns")
-        if first_session_time_ns is not None:
-            pts_to_session_offset_ns: int | None = first_session_time_ns - first_pts
-            start_session_time_ns: int | None = first_session_time_ns
-            end_session_time_ns: int | None = last_pts + pts_to_session_offset_ns
-        else:
-            pts_to_session_offset_ns = None
-            start_session_time_ns = None
-            end_session_time_ns = None
+        duration_ns = finished.duration_ns
+        frame_count = finished.frame_count
+        if frame_count <= 0:
+            # No encoded buffer was attributed to it (should not happen).
+            # Estimate from the duration so replay can still position in it.
+            frame_count = max(1, round(duration_ns / self._nominal_frame_duration_ns()))
+            LOGGER.warning(
+                "segment %s: no buffers attributed; frame count estimated as %d",
+                file_path.name,
+                frame_count,
+            )
+        start_session_time_ns: int | None = None
+        end_session_time_ns: int | None = None
+        pts_to_session_offset_ns: int | None = None
+        clock = self._session_clock
+        if clock is not None and record.running_time_to_monotonic_ns is not None:
+            to_session_ns = (
+                record.running_time_to_monotonic_ns - clock.session_start_monotonic_ns
+            )
+            start_session_time_ns = record.start_running_time_ns + to_session_ns
+            end_session_time_ns = finished.end_running_time_ns + to_session_ns
+            pts_to_session_offset_ns = start_session_time_ns - record.start_pts_ns
         segment = Segment(
-            session_id=pending["session_id"],
-            feed_id=pending["feed_id"],
-            fragment_index=int(pending["fragment_index"]),
+            session_id=record.session_id,
+            feed_id=record.feed_id,
+            fragment_index=record.fragment_index,
             file_path=str(file_path),
             codec=self._recording_codec,
             container=self._recording_container,
-            start_pts_ns=first_pts,
-            end_pts_ns=last_pts,
-            duration_ns=max(0, last_pts - first_pts),
-            frame_count_estimate=int(pending["frame_count"]),
+            start_pts_ns=record.start_pts_ns,
+            end_pts_ns=record.start_pts_ns + duration_ns,
+            duration_ns=duration_ns,
+            frame_count_estimate=frame_count,
             size_bytes=size_bytes,
             state=SEGMENT_STATE_COMPLETE,
-            created_at=str(pending["created_at"]),
+            created_at=record.created_at,
             finalized_at=datetime.now(timezone.utc).isoformat(),
             start_session_time_ns=start_session_time_ns,
             end_session_time_ns=end_session_time_ns,
             pts_to_session_offset_ns=pts_to_session_offset_ns,
+            end_exclusive=True,
         )
         if self._metadata_db is not None:
             try:
@@ -2376,91 +2564,41 @@ class PipelineManager:
         if self._segment_index is not None:
             self._segment_index.add(segment)
         LOGGER.info(
-            "finalized segment %s: frames=%d bytes=%d duration_ms=%d",
+            "finalized segment %s: frames=%d bytes=%d duration_ms=%.3f",
             file_path.name,
             segment.frame_count_estimate,
             segment.size_bytes,
-            segment.duration_ns // 1_000_000,
+            segment.duration_ns / 1e6,
         )
         # Phase 10.E: queue the segment for background validation. If
         # the validator finds it corrupt, the worker quarantines the
         # file, marks the DB row, evicts from the index, and emits a
         # `segment_quarantined_runtime` health event. Validation runs
-        # on a daemon thread so finalize itself stays cheap, and only
-        # once the file is closed (`_validate_segment_once_closed`).
-        # `getattr` tolerates the older PipelineManager.__new__-bypassing
-        # test stubs that don't initialize the worker attribute.
-        worker = getattr(self, "_segment_validator_worker", None)
-        if (
-            worker is not None
-            and self._recording_session_paths is not None
-            and segment.feed_id
-        ):
+        # on a daemon thread so finalize itself stays cheap.
+        session_paths = self._recording_session_paths
+        if session_paths is not None and segment.feed_id:
             try:
-                feed_paths = self._recording_session_paths.get_feed_paths(
-                    segment.feed_id
-                )
-                self._validate_segment_once_closed(
-                    segment, quarantine_dir=feed_paths.quarantine_dir
+                quarantine_dir = session_paths.get_feed_paths(segment.feed_id).quarantine_dir
+                self._submit_segment_validation(
+                    segment, quarantine_dir, self._metadata_db, self._segment_index
                 )
             except Exception:
                 LOGGER.exception(
                     "segment-validator submit failed for %s", file_path
                 )
 
-    def _validate_segment_once_closed(
-        self, segment: Segment, *, quarantine_dir: Path
-    ) -> None:
-        """Submit `segment` for validation once splitmuxsink has closed its file.
+    def _on_segment_file_closed(self, location: str, running_time_ns: int | None = None) -> None:
+        """Bus-thread handler for splitmuxsink's `splitmuxsink-fragment-closed`.
 
-        Finalize runs from `format-location` for the NEXT fragment, but
-        with `async-finalize` the old fragment's muxer is still writing
-        its trailer at that point. Validating then intermittently failed
-        good files and quarantined them, which left segment-sized holes
-        in replay. The task waits here until the bus thread sees
-        `splitmuxsink-fragment-closed` for the file
-        (`_on_segment_file_closed`), or goes out immediately if that
-        message already arrived.
+        Indexes the segment whose file just closed. Its end was already
+        fixed by the next segment's first buffer; `running_time_ns` (the
+        message's own value, equal to it) is only cross-checked.
         """
-        submission = (segment, quarantine_dir, self._metadata_db, self._segment_index)
-        key = _segment_path_key(segment.file_path)
-        with self._segment_close_lock:
-            already_closed = key in self._closed_segment_paths
-            if already_closed:
-                self._closed_segment_paths.discard(key)
-            else:
-                self._segments_awaiting_close[key] = submission
-        if already_closed:
-            self._submit_segment_validation(*submission)
-
-    def _on_segment_file_closed(self, location: str) -> None:
-        """Bus-thread handler for splitmuxsink's `splitmuxsink-fragment-closed`."""
-        key = _segment_path_key(location)
-        with self._segment_close_lock:
-            submission = self._segments_awaiting_close.pop(key, None)
-            if submission is None:
-                # Closed before its finalize ran, or a file that never
-                # gets a DB row (empty / post-split throwaway segment).
-                self._closed_segment_paths.add(key)
-                return
-        self._submit_segment_validation(*submission)
-
-    def _submit_segments_awaiting_close(self) -> None:
-        """Submit every segment still waiting on a close message.
-
-        Callers invoke this once splitmuxsink (or the whole pipeline) is
-        at NULL, which closes every fragment file, so any close message
-        not yet read off the bus no longer matters.
-        """
-        lock = getattr(self, "_segment_close_lock", None)
-        if lock is None:
-            return  # PipelineManager.__new__ test stub
-        with lock:
-            pending = list(self._segments_awaiting_close.values())
-            self._segments_awaiting_close.clear()
-            self._closed_segment_paths.clear()
-        for submission in pending:
-            self._submit_segment_validation(*submission)
+        finished = self._segment_bookkeeper_or_new().fragment_closed(
+            location, running_time_ns
+        )
+        if finished is not None:
+            self._finalize_fragment(finished)
 
     def _submit_segment_validation(
         self,
@@ -3321,7 +3459,8 @@ class PipelineManager:
             | Gst.MessageType.INFO
             | Gst.MessageType.EOS
             | Gst.MessageType.QOS
-            # `splitmuxsink-fragment-closed` gates segment validation.
+            # `splitmuxsink-fragment-closed` makes a segment final: it is
+            # indexed and validated then.
             | Gst.MessageType.ELEMENT
         )
         while not self._stop_event.is_set():
@@ -3506,7 +3645,14 @@ class PipelineManager:
             ):
                 location = structure.get_string("location")
                 if location:
-                    self._on_segment_file_closed(location)
+                    running_time_ns: int | None = None
+                    try:
+                        value = structure.get_value("running-time")
+                        if value is not None:
+                            running_time_ns = int(value)
+                    except Exception:
+                        running_time_ns = None
+                    self._on_segment_file_closed(location, running_time_ns)
             return False
 
         return False
@@ -3746,6 +3892,7 @@ class PipelineManager:
             self._stream_start_timestamp = None
             self._audio_stream_start_timestamp = None
             self._audio_format = None
+            self._record_encoder_segment = None
             # Per-pipeline recording state. These all reference elements of
             # the pipeline that was just torn down. Leaving them set made
             # the rebuilt pipeline's next Start try to link the DEAD

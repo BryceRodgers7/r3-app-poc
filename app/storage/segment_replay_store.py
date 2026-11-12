@@ -39,11 +39,55 @@ class SegmentReplayLocation:
     currently in freeze-frame mode (§15.5 degraded-replay indicator).
     The strict resolvers (`resolve`, `resolve_session_time`) only
     return on exact coverage, so they always emit `is_freeze=False`.
+
+    `frame_index` is the 0-based frame within the file, set when the
+    segment's bounds and frame count are exact (`Segment.end_exclusive`).
+    The decoder then reads that frame directly instead of deriving one
+    from the offset and the container's declared frame rate.
     """
 
     segment: Segment
     offset_in_segment_ns: int
     is_freeze: bool = False
+    frame_index: int | None = None
+
+
+def _frame_period_ns(segment: Segment) -> float | None:
+    """Average frame spacing of an exact-bounds segment, else None.
+
+    Only `end_exclusive` rows qualify: their duration runs from the first
+    frame to the start of the next segment and their frame count is the
+    number of frames in the file, so `duration / count` is the period.
+    """
+    if (
+        not segment.end_exclusive
+        or segment.frame_count_estimate <= 0
+        or segment.duration_ns <= 0
+    ):
+        return None
+    return segment.duration_ns / segment.frame_count_estimate
+
+
+def _last_frame_session_time(segment: Segment) -> int | None:
+    """Session time of a segment's last frame (its end, for older rows)."""
+    if segment.end_session_time_ns is None:
+        return None
+    period = _frame_period_ns(segment)
+    if period is None:
+        return segment.end_session_time_ns
+    return segment.end_session_time_ns - int(round(period))
+
+
+def _frame_location(
+    segment: Segment, frame_index: int, period_ns: float, *, is_freeze: bool
+) -> SegmentReplayLocation:
+    frame_index = min(max(0, frame_index), segment.frame_count_estimate - 1)
+    return SegmentReplayLocation(
+        segment=segment,
+        offset_in_segment_ns=int(round(frame_index * period_ns)),
+        is_freeze=is_freeze,
+        frame_index=frame_index,
+    )
 
 
 class RecordingSegmentReplayStore:
@@ -186,6 +230,10 @@ class RecordingSegmentReplayStore:
             )
             if s.state == SEGMENT_STATE_COMPLETE
             and self._segment_in_current_game(s)
+            # An exclusive end belongs to the next segment.
+            and not (
+                s.end_exclusive and s.end_session_time_ns == target_session_time_ns
+            )
         ]
         if not candidates:
             return None
@@ -209,16 +257,25 @@ class RecordingSegmentReplayStore:
 
         1. Replay not available → None.
         2. Feed has no completed segments with session-time → None.
-        3. `session_time_ns` falls inside a segment → exact match,
-           offset = `session_time - start_session_time`.
+        3. `session_time_ns` falls inside a segment → exact match.
+           - Exact-bounds segments (`end_exclusive`) cover the half-open
+             `[start, end)`, and the answer is the frame *nearest* to
+             `session_time_ns`: frame k is shown from half a frame before
+             its timestamp to half a frame after it. So the lookup uses
+             `session_time + half a frame`, and a time in the last half
+             frame of a segment shows the next segment's first frame.
+             Consecutive segments meet exactly, so stepping across a seam
+             neither repeats nor skips a frame
+             (docs/REPLAY_SEAM_GLITCH.md §7.4 step 2).
+           - Older segments: the inclusive `[start, end]`, offset =
+             `session_time - start_session_time`.
         4. `session_time_ns` is **before** the feed's earliest segment →
-           that earliest segment, offset 0 (freeze on first frame).
+           that earliest segment's first frame (freeze).
         5. `session_time_ns` is **after** all segments **or** in a gap
-           between segments → the latest segment whose
-           `end_session_time_ns <= session_time_ns`, offset clamped to
-           that segment's `duration_ns` (freeze on last frame). If no
-           such segment exists (defensive — would imply the in-coverage
-           check above missed) fall back to the earliest with offset 0.
+           between segments → the last frame of the latest segment that
+           ends at or before it (freeze). If no such segment exists
+           (defensive — would imply the in-coverage check above missed)
+           fall back to the earliest segment's first frame.
         """
         if not self.is_replay_available(recording_state=recording_state):
             return None
@@ -232,11 +289,20 @@ class RecordingSegmentReplayStore:
         ]
         if not completed:
             return None
+        # The index orders by PTS, which restarts at 0 when a feed's
+        # pipeline is rebuilt mid-game; session time does not.
+        completed.sort(key=lambda s: s.start_session_time_ns)
         # Case 3 — exact in-coverage match. is_freeze=False.
         for seg in completed:
             assert seg.start_session_time_ns is not None
             assert seg.end_session_time_ns is not None
-            if seg.start_session_time_ns <= session_time_ns <= seg.end_session_time_ns:
+            period = _frame_period_ns(seg)
+            if period is not None:
+                lookup = session_time_ns + period / 2
+                if seg.start_session_time_ns <= lookup < seg.end_session_time_ns:
+                    frame_index = int((lookup - seg.start_session_time_ns) // period)
+                    return _frame_location(seg, frame_index, period, is_freeze=False)
+            elif seg.start_session_time_ns <= session_time_ns <= seg.end_session_time_ns:
                 offset = session_time_ns - seg.start_session_time_ns
                 return SegmentReplayLocation(
                     segment=seg, offset_in_segment_ns=offset, is_freeze=False
@@ -245,16 +311,16 @@ class RecordingSegmentReplayStore:
         earliest = completed[0]
         assert earliest.start_session_time_ns is not None
         if session_time_ns < earliest.start_session_time_ns:
-            return SegmentReplayLocation(
-                segment=earliest, offset_in_segment_ns=0, is_freeze=True
-            )
+            return self._first_frame(earliest)
         # Case 5 — after all coverage or in a gap. Pick the segment
         # whose end_session_time is the highest at-or-before
         # `session_time_ns`. Freeze on its last frame.
         nearest_before: Segment | None = None
         for seg in completed:
             assert seg.end_session_time_ns is not None
-            if seg.end_session_time_ns <= session_time_ns:
+            period = _frame_period_ns(seg)
+            lookup = session_time_ns + period / 2 if period is not None else session_time_ns
+            if seg.end_session_time_ns <= lookup:
                 if (
                     nearest_before is None
                     or (
@@ -267,14 +333,45 @@ class RecordingSegmentReplayStore:
             # Defensive fallback — the case 4 guard above should have
             # caught it, but if for some reason we land here, freeze
             # on the earliest segment's first frame.
-            return SegmentReplayLocation(
-                segment=earliest, offset_in_segment_ns=0, is_freeze=True
+            return self._first_frame(earliest)
+        period = _frame_period_ns(nearest_before)
+        if period is not None:
+            return _frame_location(
+                nearest_before,
+                nearest_before.frame_count_estimate - 1,
+                period,
+                is_freeze=True,
             )
         return SegmentReplayLocation(
             segment=nearest_before,
             offset_in_segment_ns=max(0, nearest_before.duration_ns),
             is_freeze=True,
         )
+
+    @staticmethod
+    def frame_session_time(location: SegmentReplayLocation) -> int | None:
+        """Session time of the frame `location` points at, or None.
+
+        Known only for exact-bounds segments (`frame_index` set).
+        `PlaybackController.step_frames` snaps each step onto it so a run of
+        steps can't drift off the recorded frames.
+        """
+        segment = location.segment
+        period = _frame_period_ns(segment)
+        if (
+            period is None
+            or location.frame_index is None
+            or segment.start_session_time_ns is None
+        ):
+            return None
+        return segment.start_session_time_ns + int(round(location.frame_index * period))
+
+    @staticmethod
+    def _first_frame(segment: Segment) -> SegmentReplayLocation:
+        period = _frame_period_ns(segment)
+        if period is not None:
+            return _frame_location(segment, 0, period, is_freeze=True)
+        return SegmentReplayLocation(segment=segment, offset_in_segment_ns=0, is_freeze=True)
 
     def earliest_session_time(self, feed_id: str) -> int | None:
         """Return the earliest `start_session_time_ns` for `feed_id`, or None.
@@ -292,36 +389,39 @@ class RecordingSegmentReplayStore:
         return None
 
     def latest_replayable_session_time(self, feed_id: str) -> int | None:
-        """Return the latest `end_session_time_ns` of any complete segment, or None.
+        """Return the session time of the latest replayable frame, or None.
+
+        That is a complete segment's `end_session_time_ns` for older rows
+        (an inclusive end, the start of the last frame) and one frame
+        before it for exact-bounds rows (whose end is exclusive), so the
+        live edge is a real frame either way.
 
         Phase 7.B-ext: when a per-game filter is active, only segments
         from the current game are considered.
         """
-        if self._current_game_start_session_time_ns is None:
-            return self._index.latest_replayable_session_time(feed_id)
         latest: int | None = None
         for seg in self._index.all_for_feed(feed_id):
             if seg.state != SEGMENT_STATE_COMPLETE:
                 continue
-            if seg.end_session_time_ns is None:
-                continue
             if not self._segment_in_current_game(seg):
                 continue
-            if latest is None or seg.end_session_time_ns > latest:
-                latest = seg.end_session_time_ns
+            last_frame = _last_frame_session_time(seg)
+            if last_frame is None:
+                continue
+            if latest is None or last_frame > latest:
+                latest = last_frame
         return latest
 
     def available_session_time_range(self) -> tuple[int | None, int | None]:
-        """Return `(earliest_start, latest_replayable_end)` across all feeds.
+        """Return `(earliest_start, latest_replayable_frame)` across all feeds.
 
         Operator-UI bounds for the replay timeline. Crosses feeds by
-        design — the timeline is shared per §8.1. Phase 7.B-ext: when
-        a per-game filter is active, only segments from the current
-        game are considered, so the operator can't rewind into a
-        prior game's recording within the same session.
+        design — the timeline is shared per §8.1. The upper bound is the
+        latest replayable frame (see `latest_replayable_session_time`).
+        Phase 7.B-ext: when a per-game filter is active, only segments
+        from the current game are considered, so the operator can't
+        rewind into a prior game's recording within the same session.
         """
-        if self._current_game_start_session_time_ns is None:
-            return self._index.cross_feed_session_time_range()
         earliest: int | None = None
         latest: int | None = None
         for feed_id in self._index.feed_ids():
@@ -333,8 +433,9 @@ class RecordingSegmentReplayStore:
                 if earliest is None or seg.start_session_time_ns < earliest:
                     earliest = seg.start_session_time_ns
                 if seg.state == SEGMENT_STATE_COMPLETE:
-                    if latest is None or seg.end_session_time_ns > latest:
-                        latest = seg.end_session_time_ns
+                    last_frame = _last_frame_session_time(seg)
+                    if last_frame is not None and (latest is None or last_frame > latest):
+                        latest = last_frame
         return earliest, latest
 
     def feeds_with_coverage_at(self, session_time_ns: int) -> list[str]:

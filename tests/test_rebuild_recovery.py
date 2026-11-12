@@ -41,7 +41,6 @@ def _bare_pm() -> PipelineManager:
     pm._recording_disable_count = 0
     pm._pipeline_generation = 1
     pm._ingest_frame_count = 0
-    pm._pending_segment = None
     pm._segment_validator_worker = None
     pm._appsrc = None
     pm._frame_feed_thread = None
@@ -57,6 +56,20 @@ def _bare_pm() -> PipelineManager:
     return pm
 
 
+def _record(file_path: str):
+    from app.media.segment_bookkeeping import FragmentRecord
+
+    return FragmentRecord(
+        session_id="session_001",
+        feed_id="ndi_1",
+        fragment_index=3,
+        file_path=file_path,
+        created_at="2026-11-11T00:00:00+00:00",
+        start_running_time_ns=0,
+        start_pts_ns=0,
+    )
+
+
 class StopAllRemembersRecordingTests(unittest.TestCase):
     def _stoppable(self, *, recording: bool) -> tuple[PipelineManager, list[str]]:
         pm = _bare_pm()
@@ -64,18 +77,30 @@ class StopAllRemembersRecordingTests(unittest.TestCase):
         calls: list[str] = []
         pm._set_branch_enabled = lambda *_a, **_k: None
         pm._teardown_pipeline = lambda: calls.append("teardown")
-        pm._finalize_pending_segment_locked = lambda: calls.append("finalize")
-        pm._submit_segments_awaiting_close = lambda: calls.append("submit")
+        pm._finalize_fragment = lambda finished: calls.append(
+            f"index {Path(finished.record.file_path).name}"
+        )
         return pm, calls
+
+    def _writing(self, pm: PipelineManager, file_path: Path, *, frames: int) -> None:
+        keeper = pm._segment_bookkeeper_or_new()
+        keeper.open_fragment(_record(str(file_path)))
+        for k in range(frames):
+            keeper.note_buffer(k * 33_333_333)
 
     def test_stop_all_mid_game_flags_a_resume_and_indexes_the_partial_segment(self) -> None:
         pm, calls = self._stoppable(recording=True)
-        pm.stop_all()
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = Path(tmp) / "segment_00003.mkv"
+            partial.write_bytes(b"segment-data" * 100)
+            self._writing(pm, partial, frames=90)
+            pm.stop_all()
         self.assertTrue(pm._recording_resume_after_rebuild)
         self.assertFalse(pm._recording_running)
-        # Indexed after teardown (file closed) and before validation is
-        # submitted; it must not survive into the new pipeline.
-        self.assertEqual(calls, ["teardown", "finalize", "submit"])
+        # Indexed after teardown (file closed); nothing survives into the
+        # new pipeline, whose running time restarts at 0.
+        self.assertEqual(calls, ["teardown", "index segment_00003.mkv"])
+        self.assertIsNone(pm._segment_bookkeeper_or_new().current())
 
     def test_stop_all_does_not_index_a_segment_file_that_never_got_data(self) -> None:
         # A feed that froze right after Start: one counted frame, 0 bytes.
@@ -83,28 +108,22 @@ class StopAllRemembersRecordingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             empty = Path(tmp) / "segment_00000.mkv"
             empty.write_bytes(b"")
-            pm._pending_segment = {"file_path": str(empty), "frame_count": 1}
+            self._writing(pm, empty, frames=1)
             pm.stop_all()
-        self.assertNotIn("finalize", calls)
-        self.assertIsNone(pm._pending_segment)
+        self.assertEqual(calls, ["teardown"])
+        self.assertIsNone(pm._segment_bookkeeper_or_new().current())
         self.assertTrue(pm._recording_resume_after_rebuild)
-
-    def test_stop_all_indexes_a_segment_file_that_has_data(self) -> None:
-        pm, calls = self._stoppable(recording=True)
-        with tempfile.TemporaryDirectory() as tmp:
-            partial = Path(tmp) / "segment_00003.mkv"
-            partial.write_bytes(b"segment-data" * 100)
-            pm._pending_segment = {"file_path": str(partial), "frame_count": 90}
-            pm.stop_all()
-        self.assertIn("finalize", calls)
 
     def test_stop_all_when_not_recording_does_not_flag_a_resume(self) -> None:
         pm, calls = self._stoppable(recording=False)
-        pm._pending_segment = {"stale": True}
-        pm.stop_all()
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = Path(tmp) / "segment_00001.mkv"
+            stale.write_bytes(b"data")
+            self._writing(pm, stale, frames=10)
+            pm.stop_all()
         self.assertFalse(pm._recording_resume_after_rebuild)
-        self.assertNotIn("finalize", calls)
-        self.assertIsNone(pm._pending_segment)
+        self.assertEqual(calls, ["teardown"])
+        self.assertIsNone(pm._segment_bookkeeper_or_new().current())
 
 
 class ConnectSourceTests(unittest.TestCase):

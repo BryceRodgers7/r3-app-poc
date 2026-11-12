@@ -651,6 +651,9 @@ class PlaybackController:
             if earliest is not None and target_session_time_ns < earliest:
                 target_session_time_ns = earliest
                 clamped_at_start = True
+            target_session_time_ns = self._snap_to_recorded_frame_locked(
+                target_session_time_ns
+            )
             # Phase 14.D: fence-clamp after the range clamp. Step
             # already lands in PAUSED, so the only change is the
             # status string differentiating a fence hit from a
@@ -683,6 +686,37 @@ class PlaybackController:
         else:
             sign = "+" if frame_delta > 0 else "-"
             self._emit_state(f"Step {sign}{abs(frame_delta)} frames")
+
+    def _snap_to_recorded_frame_locked(self, session_time_ns: int) -> int:
+        """Move a step target onto the nearest recorded frame of the first feed.
+
+        `frame_period_ns` is a whole number of nanoseconds and the recorded
+        frame period usually is not (29.97 fps is 33,366,700.03 ns), so a long
+        run of steps would slowly drift across a frame boundary and show one
+        frame twice. Snapping each step to a real frame of the first feed
+        that has one there makes every step land exactly one frame further
+        on that feed; the other feeds keep a fixed offset from it, so they
+        advance one frame per step too. Feeds recorded before exact segment
+        bounds (`Segment.end_exclusive`) have no frame times, and the target
+        is left as it is (docs/REPLAY_SEAM_GLITCH.md §7.4 step 2).
+        """
+        frame_session_time = getattr(self._replay_store, "frame_session_time", None)
+        if frame_session_time is None:
+            return session_time_ns
+        recording_state = self._recording_manager.recording_state.state
+        for runtime in self._feed_runtimes:
+            location = self._replay_store.nearest_frame_location(
+                feed_id=runtime.feed.feed_id,
+                session_time_ns=session_time_ns,
+                recording_state=recording_state,
+            )
+            if location is None or location.is_freeze:
+                continue
+            if getattr(location, "frame_index", None) is None:
+                return session_time_ns
+            snapped = frame_session_time(location)
+            return session_time_ns if snapped is None else snapped
+        return session_time_ns
 
     # ------------------------------------------------------------------
     # Jog-wheel gesture lifecycle + auto-resume policy

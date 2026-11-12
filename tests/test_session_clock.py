@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 
 from app.core.models import (
@@ -89,180 +90,62 @@ class SessionClockRebaseTests(unittest.TestCase):
         self.assertGreater(sc.now_session_time_ns(), pre_crash_latest_end_ns)
 
 
-class PipelineManagerSessionTimeCaptureTests(unittest.TestCase):
-    """Drive `_on_record_encoder_buffer_probe` + `_finalize_pending_segment_locked`
-    through a stub `PipelineManager` to confirm that session-time fields
-    end up on the `Segment` row."""
+class PipelineClockMappingTests(unittest.TestCase):
+    """`PipelineManager._running_time_to_monotonic_ns`: running time to
+    `time.monotonic_ns()`, one constant per pipeline (REPLAY_SEAM_GLITCH.md
+    §7.4 steps 0-1). Segment rows built from it are covered in
+    `test_segment_close_gating`."""
 
-    def _build_pm_stub(self, *, clock: SessionClock | None) -> object:
+    class _Clock:
+        def __init__(self, lag_ns: int) -> None:
+            self.lag_ns = lag_ns
+
+        def get_time(self) -> int:
+            return time.monotonic_ns() - self.lag_ns
+
+    def _pm(self, clock: object, base_time: int) -> object:
+        from types import SimpleNamespace
+
         from app.media.pipeline_manager import PipelineManager
 
         pm = PipelineManager.__new__(PipelineManager)
-        pm._recording_session_paths = None
-        pm._recording_feed_id = None
-        pm._recording_codec = "mjpeg"
-        pm._recording_container = "mkv"
-        pm._recording_segment_counter = 0
-        pm._recording_game_subdir = None
-        pm._pending_segment = None
-        pm._metadata_db = None
-        pm._segment_index = None
-        pm._recording_running = True
-        pm._feed_metrics = None
-        pm._session_clock = clock
+        pm._Gst = SimpleNamespace(CLOCK_TIME_NONE=2**64 - 1)
+        pm._pipeline = SimpleNamespace(get_clock=lambda: clock, get_base_time=lambda: base_time)
+        pm._pipeline_generation = 1
+        pm._recording_feed_id = "ndi_main"
         return pm
 
-    def _session_paths(self, root: Path) -> SessionPaths:
-        recording_dir = root / "recording"
-        for d in (root, recording_dir):
-            d.mkdir(parents=True, exist_ok=True)
-        return SessionPaths(
-            session_id="session_001",
-            root_dir=root,
-            recording_dir=recording_dir,
-        )
+    def test_maps_base_time_plus_clock_offset(self) -> None:
+        pm = self._pm(self._Clock(lag_ns=3_000_000), base_time=9_000_000_000)
+        with self.assertLogs("app.media.pipeline_manager", level="INFO") as logs:
+            value = pm._running_time_to_monotonic_ns()
+        self.assertAlmostEqual(value, 9_000_000_000 + 3_000_000, delta=200_000)
+        self.assertTrue(any("pipeline clock" in line for line in logs.output))
 
-    def test_pts_to_session_offset_captured_on_first_buffer(self) -> None:
-        """A segment whose first buffer arrives at session_time=10s with
-        PTS=2s should record `pts_to_session_offset_ns = 8s`."""
+    def test_constant_for_the_pipeline_and_warns_on_drift(self) -> None:
+        clock = self._Clock(lag_ns=0)
+        pm = self._pm(clock, base_time=5_000_000_000)
+        first = pm._running_time_to_monotonic_ns()
+        clock.lag_ns = 50_000_000  # the clock falls 50 ms behind
+        with self.assertLogs("app.media.pipeline_manager", level="WARNING"):
+            second = pm._running_time_to_monotonic_ns()
+        self.assertEqual(first, second)
+
+    def test_new_pipeline_generation_remeasures(self) -> None:
+        clock = self._Clock(lag_ns=0)
+        pm = self._pm(clock, base_time=5_000_000_000)
+        first = pm._running_time_to_monotonic_ns()
+        clock.lag_ns = 20_000_000
+        pm._pipeline_generation = 2
+        second = pm._running_time_to_monotonic_ns()
+        self.assertAlmostEqual(second - first, 20_000_000, delta=200_000)
+
+    def test_none_without_a_pipeline(self) -> None:
         from app.media.pipeline_manager import PipelineManager
 
-        clock_fn = _FakeNanosecondClock(start_ns=0)
-        clock_fn.advance_ns(10_000_000_000)  # session starts at t=0; clock at t=10s
-        # Construct AFTER advancing so session_start = 10s; first reading = 10s.
-        sc = SessionClock(clock_ns=clock_fn)
-
-        with TemporaryDirectory() as tmp:
-            session = self._session_paths(Path(tmp))
-            pm = self._build_pm_stub(clock=sc)
-            pm._recording_session_paths = session
-            pm._recording_feed_id = "ndi_main"
-
-            # Open segment 0.
-            path1 = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
-            file_path1 = Path(path1)
-            file_path1.parent.mkdir(parents=True, exist_ok=True)
-            file_path1.write_bytes(b"\0")
-
-            # Advance clock by 0.5s before first buffer.
-            clock_fn.advance_ns(500_000_000)
-
-            # Stub buffer probe: simulate first buffer at PTS=2_000_000_000.
-            pending = pm._pending_segment
-            assert pending is not None
-            pending["first_pts_ns"] = 2_000_000_000
-            pending["first_session_time_ns"] = sc.now_session_time_ns()
-            pending["last_pts_ns"] = 2_000_000_000
-            pending["frame_count"] = 1
-
-            # Now simulate two seconds of buffers (last PTS = 4s).
-            pending["last_pts_ns"] = 4_000_000_000
-            pending["frame_count"] = 60
-
-            # Close it via finalize.
-            PipelineManager._finalize_pending_segment_locked(pm)
-
-        # The pending dict was cleared by finalize. Re-derive what the
-        # Segment row would have had: first_session_time_ns was 500ms
-        # after the SessionClock construction (which we set to t=10s),
-        # so first_session_time_ns = 500_000_000 (relative to session
-        # origin). Offset = 500_000_000 - 2_000_000_000 = -1_500_000_000.
-        # We can't read the inserted Segment back without a metadata_db,
-        # but we can re-run the math the same way and assert via the
-        # next test (which uses metadata_db).
-
-    def test_finalize_persists_session_time_fields_to_db(self) -> None:
-        """Round-trip: finalize → insert_segment → read back."""
-        from app.media.pipeline_manager import PipelineManager
-
-        clock_fn = _FakeNanosecondClock(start_ns=0)
-        sc = SessionClock(clock_ns=clock_fn)
-
-        with TemporaryDirectory() as tmp:
-            session = self._session_paths(Path(tmp))
-            db = MetadataDb(Path(tmp) / "metadata.db")
-            db.create_session(
-                session_id="session_001",
-                source_name="Test",
-                started_at="2026-04-28T00:00:00+00:00",
-            )
-            pm = self._build_pm_stub(clock=sc)
-            pm._recording_session_paths = session
-            pm._recording_feed_id = "ndi_main"
-            pm._metadata_db = db
-
-            # Open segment.
-            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
-            file_path = Path(path)
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_bytes(b"\0")
-
-            # Advance clock 3s; first buffer arrives with PTS=1_000_000_000.
-            clock_fn.advance_ns(3_000_000_000)
-            pending = pm._pending_segment
-            assert pending is not None
-            pending["first_pts_ns"] = 1_000_000_000
-            pending["first_session_time_ns"] = sc.now_session_time_ns()
-            pending["last_pts_ns"] = 5_000_000_000  # 4s span in PTS
-            pending["frame_count"] = 120
-
-            # Finalize.
-            PipelineManager._finalize_pending_segment_locked(pm)
-
-            # Read back from DB.
-            segments = db.segments_for_session("session_001")
-            self.assertEqual(len(segments), 1)
-            seg = segments[0]
-            self.assertEqual(seg.start_pts_ns, 1_000_000_000)
-            self.assertEqual(seg.end_pts_ns, 5_000_000_000)
-            # session_time fields populated.
-            self.assertEqual(seg.start_session_time_ns, 3_000_000_000)
-            # offset = first_session_time - first_pts = 3s - 1s = 2s
-            self.assertEqual(seg.pts_to_session_offset_ns, 2_000_000_000)
-            # end_session_time = last_pts + offset = 5s + 2s = 7s
-            self.assertEqual(seg.end_session_time_ns, 7_000_000_000)
-            db.close()
-
-    def test_finalize_leaves_session_time_fields_none_when_no_clock(self) -> None:
-        """A pipeline running without a `SessionClock` (test stubs, etc.)
-        produces segments with NULL session-time fields rather than
-        crashing."""
-        from app.media.pipeline_manager import PipelineManager
-
-        with TemporaryDirectory() as tmp:
-            session = self._session_paths(Path(tmp))
-            db = MetadataDb(Path(tmp) / "metadata.db")
-            db.create_session(
-                session_id="session_001",
-                source_name="Test",
-                started_at="2026-04-28T00:00:00+00:00",
-            )
-            pm = self._build_pm_stub(clock=None)
-            pm._recording_session_paths = session
-            pm._recording_feed_id = "ndi_main"
-            pm._metadata_db = db
-
-            path = PipelineManager._on_splitmuxsink_format_location(pm, None, 0)
-            file_path = Path(path)
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_bytes(b"\0")
-
-            pending = pm._pending_segment
-            assert pending is not None
-            pending["first_pts_ns"] = 1_000_000_000
-            # `first_session_time_ns` left as None (no clock attached).
-            pending["last_pts_ns"] = 5_000_000_000
-            pending["frame_count"] = 120
-
-            PipelineManager._finalize_pending_segment_locked(pm)
-
-            segments = db.segments_for_session("session_001")
-            self.assertEqual(len(segments), 1)
-            seg = segments[0]
-            self.assertIsNone(seg.start_session_time_ns)
-            self.assertIsNone(seg.end_session_time_ns)
-            self.assertIsNone(seg.pts_to_session_offset_ns)
-            db.close()
+        pm = PipelineManager.__new__(PipelineManager)
+        pm._Gst = None
+        self.assertIsNone(pm._running_time_to_monotonic_ns())
 
 
 class LoadSegmentIndexRoundTripTests(unittest.TestCase):

@@ -842,7 +842,6 @@ class FormatLocationGameSubdirTests(unittest.TestCase):
         pm._recording_container = "mkv"
         pm._recording_segment_counter = 0
         pm._recording_game_subdir = None
-        pm._pending_segment = None
         pm._metadata_db = None
         pm._segment_index = None
         pm._splitmuxsink = None

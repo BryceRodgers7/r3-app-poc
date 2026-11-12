@@ -165,10 +165,10 @@ on the first push.
 pipeline's running clock at *push time*, not the source's actual
 capture time. That introduces a wall-clock-dependent jitter and breaks
 the session-time math (Phase 5.A), which assumes monotonically
-increasing PTS that maps cleanly to session time via a per-segment
-offset. Manual PTS, anchored on the first frame's timestamp so the
-first segment's PTS starts at 0, gives the segment finalizer a clean
-domain to capture `pts_to_session_offset_ns`.
+increasing PTS that maps cleanly to session time through one offset per
+pipeline (`IMPLEMENTATION.md` §5.9). Manual PTS, anchored on the first
+frame's timestamp so the first segment's PTS starts at 0, gives the
+segment bookkeeping a clean running-time domain.
 
 **Code:** `pipeline_manager.py:706-717` (video appsrc),
 `1592-1602` (audio appsrc), `2031-2036` (video PTS computation),

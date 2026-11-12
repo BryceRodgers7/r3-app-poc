@@ -1,13 +1,15 @@
 # Replay glitch at segment seams — findings, scaling to 6-8 feeds / 60 fps, segment length, and the recommended fix
 
-Date: 2026-11-10 (sections 6-8 added 2026-11-11). Status: **investigated, not fixed.**
-Nothing under `app/` was changed. Read this before touching segment bookkeeping in
-`PipelineManager`, `RecordingSegmentReplayStore.nearest_frame_location`,
-`SegmentDecoder`, or `PlaybackController.step_frames`, or before changing
-`[recording] segment_duration_seconds` (section 6) or the `[app]` target size and frame
-rate (section 8). **Section 7 is the recommended fix for the timing jitter**; start there
-if you are about to implement one. Section 7.8 says how often a repeated or skipped frame
-is still expected once it is in.
+Date: 2026-11-10 (sections 6-8 added 2026-11-11, section 9 on 2026-11-11). Status:
+**fixed on branch `feature/fix-jitter`** (section 9: what was implemented, how it differs
+from section 7, and the live test results). Sections 1-8 describe the code before that
+fix. Read this before touching segment bookkeeping in `PipelineManager`,
+`RecordingSegmentReplayStore.nearest_frame_location`, `SegmentDecoder`, or
+`PlaybackController.step_frames`, or before changing `[recording]
+segment_duration_seconds` (section 6) or the `[app]` target size and frame rate
+(section 8). **Section 7 is the recommended fix for the timing jitter** and section 9
+the implementation; section 7.8 says how often a repeated or skipped frame is still
+expected with it.
 
 Hardware for every measurement here: Intel i7-1165G7 (4 cores / 8 threads), Windows 11,
 GStreamer 1.28 on MSYS2 UCRT64. On this machine every recording uses **software**
@@ -983,3 +985,94 @@ Other costs of a 1920x1080 at 60 target:
 - **Not measured:** NDI's own decode of a 1080p60 stream (it adds to the ingest stage),
   real camera content (JPEG size and encode time depend on it), several real feeds at
   once, `qsvjpegenc` once it links, and the production hardware.
+
+---
+
+## 9. Implementation (branch `feature/fix-jitter`, 2026-11-11)
+
+Sections 7.4 steps 0-2 and the schema marker, plus 8.2 item 1 (`timecodescale`). The
+reference for the new behaviour is `IMPLEMENTATION.md` §5.9 (bounds and indexing), §6.2
+(resolver), §6.6 (decoder) and §11.6 (stepping).
+
+### 9.1 What changed
+
+| Where | Change |
+|---|---|
+| `app/media/segment_bookkeeping.py` (new) | `SegmentBookkeeper`: a segment starts at the running time of its first buffer, ends where the next one starts, counts the encoded buffers whose running time falls in `[start, end)`, and is finished only once its file is closed |
+| `app/media/pipeline_manager.py` | `format-location-full` instead of `format-location`; the encoder probe only notes running times (it also sees SEGMENT events for the conversion); session time = running time + one constant per pipeline (`_running_time_to_monotonic_ns`, with the step 0 clock log and a drift warning); rows written on `splitmuxsink-fragment-closed` or when splitmuxsink / the pipeline is at NULL (`_finalize_closed_fragments`), not from the streaming thread; `matroskamux timecodescale = 100 us`. `_pending_segment`, `_finalize_pending_segment_locked` and the close-gating maps are gone |
+| `app/core/models.py`, `app/storage/metadata_db.py` | `Segment.end_exclusive` / `segments.end_exclusive` (added to existing DBs; old rows read 0 and keep resolving the old way) |
+| `app/storage/segment_replay_store.py` | `nearest_frame_location`: half-open bounds, nearest frame, `frame_index` on the location, segments ordered by session time; live edge = the last frame's time; strict resolver half-open; `frame_session_time` |
+| `app/media/segment_decoder.py`, `app/media/mkv_timestamps.py` (new) | reads `frame_index`; reads every frame's timestamp from the mkv block headers and checks where each seek landed; a request past the end returns the last frame; a file whose seeks don't work is read from its start |
+| `app/core/playback_controller.py` | `step_frames` snaps each step onto the nearest recorded frame of the first feed that has one |
+| `tests/` | new `test_segment_bookkeeping`, `test_replay_exact_bounds`, `test_mkv_timestamps`; rewritten `test_segment_close_gating` (with a real-splitmuxsink contract test: segments meet exactly, counts match the files, the decoder lands on the right pictures), clock-mapping tests in `test_session_clock`, `stop_all` tests in `test_rebuild_recovery`. 1,496 tests; the only failures are the 4 that predate this branch |
+
+### 9.2 Where it differs from section 7.4
+
+- **Stepping (step 2).** Not pure frame-index stepping on one feed: on a shared timeline
+  that would drag the other feeds over that feed's gaps (a feed that dropped out, say).
+  `step_frames` still steps in session time but snaps every step onto a recorded frame.
+  The snap is needed: `frame_period_ns` is a whole number of nanoseconds and the recorded
+  period is not (33,366,700 vs 33,366,700.03 ns at 29.97), so starting within a few ns of a
+  frame boundary, about 30 steps of drift show one frame twice. A unit test reproduces
+  that without the snap and passes with it.
+- **Decoder (step 2).** The frame index alone was not enough. OpenCV seeks to frame k as
+  `k / declared fps`, which is a neighbouring frame when frames are not evenly spaced:
+  in the real app on the synthetic source (about 26 fps, frames 35-74 ms apart),
+  **247 of 300 backward steps showed the wrong picture** while the location was right. The
+  same seek arithmetic was in the old decoder, and the section 2.3 feed is the same case.
+  Two OpenCV traps found on the way: `CAP_PROP_POS_MSEC` is wrong after a capture's first
+  `read()` (even after a seek), and in a file cut short by a crash a seek does nothing.
+- **Live edge.** With exclusive ends the latest segment end is one frame past the last
+  recorded frame, which would have resolved as a freeze. The store's latest replayable time
+  is now that last frame's time.
+- **Segment closed without a split** (Stop when `split-now` didn't happen, teardown): ends
+  one frame after its last buffer, using the median recent spacing.
+- **Not done:** step 3 (not needed, 7.2 E4 / E5), step 4 (optional), the ingest reorder
+  (8.2 item 3, a CPU saving, not part of the jitter fix).
+
+### 9.3 Results
+
+The real app (`main.build_application`, driven like `docs/ndi_test_harness/cycle.py`) ran
+from a scratch folder with its own `app_settings.toml`, one feed, two games (about 60 s and
+30 s). During game 1 the referee controller stepped 300 frames back from live and 300
+forward, crossing two seams each way. Then an offline audit read the recording with the
+app's own store: every seam, 34 click phases, 12 clicks each.
+
+| Check | NDI: VLC on this PC, 1080p 29.97 | Synthetic source: 720p, about 26 fps, uneven |
+|---|---|---|
+| Pipeline clock (log) | `GstSystemClock`, offset -0.0001 ms | same |
+| Segments | 38, 119 frames / 3,970.637 ms each | 40 |
+| DB rows vs files: frame count, first and last timestamp | all match (within the 0.1 ms file step) | counts and starts match |
+| Gap or overlap between consecutive segments | none | none |
+| Different pts-to-session offsets per game | 1 | 1 |
+| Frames with sub-millisecond file timestamps | 3,967 / 4,407 | 3,642 / 4,052 |
+| In-app referee steps that moved exactly one frame | 600 / 600, no freezes | 600 / 600, no freezes, no wrong pictures |
+| Offline, all seams x 34 phases | 1,224 / 1,224 clean | 1,292 / 1,292 clean |
+| Same, without the snap | 1,188 / 1,224 | 0 / 1,292 (frames 37.7 ms apart, steps 33.4 ms) |
+
+**Caveat on the NDI column:** during both NDI runs VLC's NDI output sent one unchanging
+solid-green frame (confirmed with a bare receiver outside the app: 241 frames, 1 distinct
+image), so its picture checks prove nothing. Timing, bounds and frame positions do not
+depend on the picture; the synthetic source has a different picture in every frame (4,052
+distinct), which is why it was added.
+
+**Decoder on existing recordings** (read-only), forward, backward and random order from a
+fresh decoder, each picture compared with a straight read of the file:
+
+| Files | Decodes | Wrong picture |
+|---|---|---|
+| Synthetic test recording (uneven) | 2,508 | 0 |
+| `session_018` (30 fps NDI, including a quarantined file cut short) | 987 | 0 |
+| `session_022` (the ~28 fps feed of section 2.3) | 1,008 | 0 |
+
+**Cost.** A backward step (a seek) on 1080p NDI files: 58 ms against 57 ms before; on the
+uneven 720p files 37 ms against 35 ms. A forward step about 6 ms. Reading one file's
+timestamps 2-5 ms (16 ms for older files with interleaved audio and 1 ms timestamps).
+
+### 9.4 Not verified yet
+
+- Moving NDI pictures in the real app (VLC sent a still frame), several feeds under load
+  (7.6 item 4), a real camera over the network, 60 fps, and stepping by hand in the GUI (the
+  runs drove `step_frames` programmatically).
+- Recordings made before this branch keep the old behaviour in replay; existing databases
+  get the new column on first open.

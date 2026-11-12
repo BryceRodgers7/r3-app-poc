@@ -357,12 +357,13 @@ Per app, at runtime:
 - **GStreamer streaming thread (per pipeline)** — buffer probes
   (`_on_record_encoder_buffer_probe`, `_on_native_preview_buffer_probe`,
   `_on_record_branch_buffer_probe`, audio-presence probe), appsink
-  `new-sample` signal handlers, splitmuxsink's `format-location`
+  `new-sample` signal handlers, splitmuxsink's `format-location-full`
   callback, `prepare-window-handle` sync bus messages.
 - **Bus monitor thread (per pipeline)** — `_monitor_bus_loop` polls
   asynchronous bus messages (`ERROR`, `WARNING`, `INFO`, `EOS`, `QOS`,
-  and `ELEMENT` for `splitmuxsink-fragment-closed`, which releases a
-  finalized segment to the mid-session validator — see §7.2).
+  and `ELEMENT` for `splitmuxsink-fragment-closed`, which makes a
+  segment final: its row is written to SQLite and the `SegmentIndex`,
+  and it goes to the mid-session validator — see §5.9 and §7.2).
 - **Frame feed thread (python_push only)** — `_feed_appsrc_loop`,
   pushes synthetic frames into `appsrc`. Native sources don't have
   one — they ingest natively.
@@ -403,19 +404,21 @@ render path re-enters the controller to update
 
 **SQLite cross-thread access (`MetadataDb`).** The connection is
 opened with `check_same_thread=False` and every write is gated on
-`_write_lock`. Inserts come from both the streaming thread (segment
-rotation via splitmuxsink's `format-location`) and the Qt main thread
-(recording stop, post-session processor). Reads are also serialized
+`_write_lock`. Segment inserts come from the bus monitor thread
+(`splitmuxsink-fragment-closed`), the Qt main thread (recording stop,
+post-session processor) and, rarely, the streaming thread (a close
+message read before the next file's `format-location-full`). Reads are also serialized
 through the lock for simplicity — replay queries are not
 high-frequency.
 
-**Streaming-thread-safe segment-row insert path.** The
-`_finalize_pending_segment_locked` call inside the
-`format-location` callback (and inside `disable_file_recording`) reads
-the in-memory `_pending_segment` dict and writes a `Segment` row
-synchronously. The dict is updated only by the same callback chain
-plus `_on_record_encoder_buffer_probe` (also streaming-thread), so no lock
-is needed on the dict itself; the SQLite write goes through
+**Segment bookkeeping across threads.** `SegmentBookkeeper`
+(`app/media/segment_bookkeeping.py`) holds the open segment, the
+segments waiting for their close message and the running times of
+recent encoded buffers. The streaming thread feeds it
+(`format-location-full`, `_on_record_encoder_buffer_probe`), the bus
+thread and the Qt thread finish segments from it, so every method takes
+its own lock. No database work happens on the streaming thread in the
+normal path (§5.9); the SQLite write goes through
 `MetadataDb._write_lock`.
 
 **Qt-main-thread health events.** `record_health_event` is safe to
@@ -567,12 +570,16 @@ in this exact order:
 3. Close the valve. Any post-split frames already captured into the
    throwaway "dud" segment are discarded.
 4. If the segment counter advanced during the sleep (= split fired),
-   drop the post-split pending segment without recording (it has
-   no buffers / no trailer).
-5. Finalize the in-flight pending segment via
-   `_finalize_pending_segment_locked` — writes the row to SQLite +
-   `SegmentIndex`.
-6. `splitmuxsink.set_state(NULL)` to fully tear down.
+   stop tracking the post-split segment without recording it (it has
+   a few frames at most and no trailer). The game's last real segment
+   ended exactly where it began, and is indexed when its
+   `fragment-closed` message arrives or in step 6.
+5. `splitmuxsink.set_state(NULL)` to fully tear down. Every file is
+   closed now.
+6. `_finalize_closed_fragments` indexes the segments whose close
+   message hasn't been read off the bus yet and, only when the split
+   did not happen, the in-flight segment (ending one frame after its
+   last buffer). See §5.9.
 7. **`_flush_audio_mux_branch_locked()`** — sends `FLUSH_START` then
    `FLUSH_STOP(reset_time=False)` on the audio mux-branch's head
    queue's sink pad. Without this, opusenc's final partially-encoded
@@ -733,9 +740,10 @@ carried across the gap like this:
 
 1. `stop_all` notes that recording was armed
    (`_recording_resume_after_rebuild`), tears the pipeline down, and
-   indexes the partial segment the old pipeline was writing (it has to be
-   cleared before the new pipeline starts: the encoder probe updates
-   `_pending_segment` in place and the new pipeline's PTS restart at 0).
+   indexes the segments the old pipeline was writing (the open one ends
+   one frame after its last buffer). This has to happen before the new
+   pipeline starts, whose running time restarts at 0; the segment
+   bookkeeper is then reset.
 2. `_teardown_pipeline` drops every reference into the dead pipeline
    (`_audio_record_encoder`, `_splitmuxsink`, the audio-present flag…).
    Leaving the encoder set made the *next* game's rebuild try to link the
@@ -750,9 +758,49 @@ carried across the gap like this:
 4. An operator Start or Stop supersedes a pending resume; a Stop that lands
    while the worker is inside `enable_file_recording` is undone.
 
-Each resumed segment stamps its own `pts_to_session_offset_ns`, so replay
-(which works in session time) is unaffected by the PTS restart. The
-PTS-time queries (`resolve`) can mis-rank segments across the rebuild.
+The new pipeline has its own base time, so its segments get their own
+`pts_to_session_offset_ns` (one constant for that pipeline, §5.9) and
+replay (which works in session time) is unaffected by the PTS restart.
+`nearest_frame_location` orders a feed's segments by session time for
+this reason. The PTS-time queries (`resolve`) can mis-rank segments
+across the rebuild.
+
+### 5.9 Segment bounds and when a segment is indexed
+
+Implemented on `feature/fix-jitter` for the seam glitch
+(`REPLAY_SEAM_GLITCH.md` §7.4 and §9). `SegmentBookkeeper`
+(`app/media/segment_bookkeeping.py`) works in the pipeline's running time:
+
+- **Start** of a segment = running time of the first buffer splitmuxsink
+  passes to `format-location-full` (`_on_splitmuxsink_format_location`
+  now receives it as `first_sample`).
+- **End** (exclusive) = the next segment's start, which equals the
+  `running-time` splitmuxsink reports in `splitmuxsink-fragment-closed`
+  (cross-checked; a difference over 1 ms is logged). Consecutive
+  segments meet exactly. A segment nothing rotated away from (Stop
+  without a split, teardown) ends one frame after its last buffer.
+- **Frame count** = encoded buffers whose running time is in
+  `[start, end)`, noted by `_on_record_encoder_buffer_probe`. It equals
+  the frames in the file.
+- **Session time** = running time + `_running_time_to_monotonic_ns()` −
+  `SessionClock.session_start_monotonic_ns`. The middle term is the
+  pipeline's base time plus the pipeline clock's offset to
+  `time.monotonic_ns()`, measured once per pipeline by paired clock reads
+  (zero on `GstSystemClock`). It is logged at the first segment of a
+  pipeline (`pipeline clock GstSystemClock, offset to time.monotonic_ns
+  ...`), and a drift over 1 ms (or two monotonic ticks) is warned about.
+  So `pts_to_session_offset_ns` is the same for every segment of one
+  pipeline.
+- **Indexed** (SQLite row, `SegmentIndex`, validator) when its file is
+  closed: on `fragment-closed` (bus thread), or when splitmuxsink or the
+  whole pipeline is set to NULL (`_finalize_closed_fragments`). Nothing
+  is written from the streaming thread in the normal path, and a row is
+  never written before its file's trailer.
+- Rows carry `end_exclusive = 1` (`segments.end_exclusive`, added by
+  `MetadataDb._add_missing_segment_columns_locked`; older rows read 0 and
+  keep their inclusive-end meaning).
+- `matroskamux` gets `timecodescale = 100 us` through `muxer-properties`,
+  so file timestamps are within 0.05 ms of the GStreamer ones.
 
 ---
 
@@ -769,12 +817,13 @@ Replay queries operate in two timestamp domains:
 - **Session-time (cross-feed, monotonic-anchored).** A single
   `SessionClock` instance per app run. `now_session_time_ns()` returns
   monotonic-anchored nanoseconds since the clock's origin. The
-  `PipelineManager` captures `session_time_ns` at the **first buffer
-  of every segment**, derives `pts_to_session_offset_ns =
-  first_session_time_ns - first_pts`, and stamps the segment's
+  `PipelineManager` maps each segment's running-time bounds onto it
+  with one constant per pipeline (§5.9) and stamps the segment's
   `start_session_time_ns` / `end_session_time_ns` /
-  `pts_to_session_offset_ns` fields at finalize. The replay layer
-  uses session-time for all multi-feed queries (§8.6).
+  `pts_to_session_offset_ns` fields when the segment is indexed. The
+  replay layer uses session-time for all multi-feed queries (§8.6).
+  Rows written before §5.9 took `start_session_time_ns` from a clock
+  sample at the segment's first buffer instead.
 
 The `PlaybackController` runs in **session-time** (slice 5.C) — the
 replay clock advances `_playback_session_time_ns` and per-tick decode
@@ -792,14 +841,25 @@ replayable segment. Decision tree:
    filter excludes everything) → `None`.
 2. Feed has no completed segments with session-time → `None`.
 3. `session_time_ns` falls inside a segment → exact match,
-   `is_freeze=False`.
+   `is_freeze=False`. For `end_exclusive` rows (§5.9) a segment covers
+   `[start, end)` and the answer is the frame **nearest** the time: the
+   lookup uses `session_time + half a frame`, the frame period being
+   `duration / frame_count`, and the location carries `frame_index`.
+   The last half frame of a segment therefore shows the next segment's
+   first frame, and consecutive segments leave no hole to freeze in.
+   Older rows keep the inclusive `[start, end]` match by offset.
 4. `session_time_ns` is **before** the feed's earliest segment → that
-   earliest segment, offset 0, `is_freeze=True` (freeze on first
-   frame).
+   earliest segment's first frame, `is_freeze=True`.
 5. `session_time_ns` is **after** all segments **or** in a gap → the
-   latest segment ending at-or-before `session_time_ns`, offset
-   clamped to its `duration_ns`, `is_freeze=True` (freeze on last
-   frame).
+   last frame of the latest segment ending at-or-before it
+   (`is_freeze=True`). For older rows that is offset `duration_ns`.
+
+Segments are ordered by session time (PTS restarts after a mid-game
+rebuild). For `end_exclusive` rows, `latest_replayable_session_time` and
+the upper bound of `available_session_time_range` are the session time
+of the latest *frame* (end minus one frame), so the live edge resolves to
+a real frame rather than a freeze. `frame_session_time(location)` gives
+a resolved frame's exact session time (used by `step_frames`, §11.6).
 
 The `is_freeze` flag selects the clamped freeze frame to render for a
 feed without exact coverage at the target timestamp. It is still
@@ -865,7 +925,13 @@ feed. The clamp keeps replay tracking the live edge naturally.
 2. Decode via the per-feed `SegmentDecoder` (one
    `cv2.VideoCapture` per feed). With more than one feed the decodes run
    in parallel on a small thread pool (`_decode_jobs`; cv2 releases the
-   GIL) and the results come back in feed order.
+   GIL) and the results come back in feed order. The decoder reads
+   `location.frame_index` when present. On open it reads every frame's
+   timestamp from the mkv block headers (`app/media/mkv_timestamps.py`,
+   a few ms, no decoding), so a seek lands on the k-th frame even when
+   frames aren't evenly spaced: it aims just before frame k's timestamp,
+   checks `CAP_PROP_POS_MSEC` and reads forward. A request past the
+   file's real end returns its last frame instead of `None`.
 3. Push the frames into `OutputRenderer.show_frame` (which routes by
    `frame.feed_id`), in feed order, on the Qt thread.
 4. Track `is_freeze=True` results into `feeds_in_freeze_frame`.
@@ -979,14 +1045,13 @@ finalized segment is also checked by the feed's `SegmentValidatorWorker`
 (`app/core/segment_validator_worker.py`) with the same validator; a
 failure quarantines the file, marks the row `quarantined`, evicts it
 from the `SegmentIndex` (replay then holds the previous frame across the
-hole) and emits `segment_quarantined_runtime`. Timing matters:
-`_finalize_pending_segment_locked` runs from `format-location` for the
-*next* fragment, while `async-finalize` is still writing the old
-fragment's matroskamux trailer, and a check at that instant fails on
-good files. So `PipelineManager._validate_segment_once_closed` holds
-the task until the bus thread sees `splitmuxsink-fragment-closed` for
-that file. `disable_file_recording` and `stop_all` submit anything still
-waiting once splitmuxsink / the pipeline is at NULL. The worker also
+hole) and emits `segment_quarantined_runtime`. Timing matters: with
+`async-finalize`, a fragment's matroskamux trailer is still being written
+after the next fragment opens, and a check at that instant fails on good
+files. A segment is therefore only indexed and submitted once
+splitmuxsink has reported its file closed (`splitmuxsink-fragment-closed`
+on the bus thread), or once splitmuxsink / the pipeline is at NULL in
+`disable_file_recording` and `stop_all` (§5.9). The worker also
 re-checks a failed file once, after `retry_delay_seconds` (1s), before
 quarantining it.
 
@@ -1036,10 +1101,9 @@ considering a "stricter default" should account for that — the
 existing default is deliberate.
 
 **Recovered "dirty" segments have synthetic PTS.** The original
-splitmuxsink-assigned PTS is gone after a crash (only captured in
-`_pending_segment` in memory, written by
-`_finalize_pending_segment_locked` which fires when the *next*
-segment opens — that didn't happen). `_build_dirty_segment` synthesizes
+splitmuxsink-assigned PTS is gone after a crash (only held in memory by
+the segment bookkeeper until splitmuxsink reports the file closed —
+that didn't happen). `_build_dirty_segment` synthesizes
 `start_pts_ns=0`, `duration_ns=cv2_duration`. Replay queries comparing
 pre-crash and post-resume segments on the same feed mis-rank by PTS;
 session-time queries are unaffected because session-time fields are
@@ -1469,7 +1533,13 @@ only while a challenge lockout is active (Phase 14.F gate) and greys
 out otherwise. Each degree emits `seek_by_frames_requested(int)` wired
 to `PlaybackController.step_frames`, which is a pure seek-and-pause
 primitive: it always lands in PAUSED and clamps to the replayable
-range and the challenge fence (§14.D clip bounds).
+range and the challenge fence (§14.D clip bounds). After the range clamp
+it snaps the target onto the nearest recorded frame of the first feed
+that has one there (`_snap_to_recorded_frame_locked`), so a run of steps
+can't drift off the frames: `frame_period_ns` is a whole number of ns
+and the recorded period usually isn't (29.97 fps = 33,366,700.03 ns).
+Every step then moves exactly one frame on every feed, across segment
+seams too (`REPLAY_SEAM_GLITCH.md` §9). Older rows aren't snapped.
 
 **Auto-pause / resume policy.** `step_frames` itself never resumes,
 but two gesture wrappers apply a configurable policy (defaults shown,

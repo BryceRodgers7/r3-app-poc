@@ -73,8 +73,20 @@ _SEGMENTS_TABLE_BODY = """
     pts_to_session_offset_ns INTEGER,
     start_wall_clock_utc TEXT,
     end_wall_clock_utc TEXT,
+    end_exclusive INTEGER NOT NULL DEFAULT 0,
     UNIQUE(file_path)
 """
+
+# Columns added after Phase 7.F, as `(name, declaration)`. The 7.F
+# migration copies only `_SEGMENT_COLUMNS` (the columns a legacy table
+# can have); these get their DEFAULT there, and `_initialize_schema`
+# adds any that an existing table lacks.
+_SEGMENT_ADDED_COLUMNS = (
+    # 1 = bounds from splitmuxsink's fragment reports, half-open
+    # [start, end) (docs/REPLAY_SEAM_GLITCH.md §7.4). 0 = older rows,
+    # inclusive end at the start of the last frame.
+    ("end_exclusive", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 class MetadataDb:
@@ -123,6 +135,7 @@ class MetadataDb:
         connection.execute(
             f"CREATE TABLE IF NOT EXISTS segments ({_SEGMENTS_TABLE_BODY})"
         )
+        self._add_missing_segment_columns_locked(connection)
         connection.execute(
             "CREATE INDEX IF NOT EXISTS segments_by_feed_pts "
             "ON segments(session_id, feed_id, start_pts_ns)"
@@ -252,6 +265,26 @@ class MetadataDb:
             raise
         LOGGER.info("segments table migration complete")
 
+    def _add_missing_segment_columns_locked(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Add the `_SEGMENT_ADDED_COLUMNS` an existing segments table lacks.
+
+        Existing rows take the column default, which marks them as the
+        older (inclusive-end) kind.
+        """
+        existing = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(segments)").fetchall()
+        }
+        for name, declaration in _SEGMENT_ADDED_COLUMNS:
+            if name in existing:
+                continue
+            LOGGER.info("adding segments.%s column", name)
+            connection.execute(
+                f"ALTER TABLE segments ADD COLUMN {name} {declaration}"
+            )
+
     def _migrate_drop_legacy_plays_table_locked(
         self, connection: sqlite3.Connection
     ) -> None:
@@ -301,8 +334,9 @@ class MetadataDb:
                     created_at, finalized_at,
                     start_session_time_ns, end_session_time_ns,
                     pts_to_session_offset_ns,
-                    start_wall_clock_utc, end_wall_clock_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    start_wall_clock_utc, end_wall_clock_utc,
+                    end_exclusive
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     segment.session_id,
@@ -324,6 +358,7 @@ class MetadataDb:
                     segment.pts_to_session_offset_ns,
                     segment.start_wall_clock_utc,
                     segment.end_wall_clock_utc,
+                    1 if segment.end_exclusive else 0,
                 ),
             )
             connection.commit()
@@ -617,6 +652,7 @@ def _row_to_segment(row: sqlite3.Row) -> Segment:
         pts_to_session_offset_ns=row["pts_to_session_offset_ns"],
         start_wall_clock_utc=row["start_wall_clock_utc"],
         end_wall_clock_utc=row["end_wall_clock_utc"],
+        end_exclusive=bool(row["end_exclusive"]) if "end_exclusive" in row.keys() else False,
     )
 
 

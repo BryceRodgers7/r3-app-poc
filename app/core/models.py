@@ -354,3 +354,10 @@ class Segment:
     pts_to_session_offset_ns: int | None = None
     start_wall_clock_utc: str | None = None
     end_wall_clock_utc: str | None = None
+    # True for rows written from splitmuxsink's own fragment reports
+    # (docs/REPLAY_SEAM_GLITCH.md §7.4): the segment covers the half-open
+    # interval [start, end), `end_*` is the start of the next segment, and
+    # `frame_count_estimate` is the exact number of frames in the file.
+    # False for older rows, whose `end_*` is the start of their last frame
+    # (inclusive) and whose bounds came from a per-segment clock sample.
+    end_exclusive: bool = False
