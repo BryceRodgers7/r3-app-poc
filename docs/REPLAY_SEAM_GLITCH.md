@@ -1,10 +1,13 @@
-# Replay glitch at segment seams — findings, scaling to 6-8 feeds / 60 fps, and segment length
+# Replay glitch at segment seams — findings, scaling to 6-8 feeds / 60 fps, segment length, and the recommended fix
 
-Date: 2026-11-10 (section 6 added 2026-11-11). Status: **investigated, not fixed.**
+Date: 2026-11-10 (sections 6-8 added 2026-11-11). Status: **investigated, not fixed.**
 Nothing under `app/` was changed. Read this before touching segment bookkeeping in
 `PipelineManager`, `RecordingSegmentReplayStore.nearest_frame_location`,
 `SegmentDecoder`, or `PlaybackController.step_frames`, or before changing
-`[recording] segment_duration_seconds` (section 6).
+`[recording] segment_duration_seconds` (section 6) or the `[app]` target size and frame
+rate (section 8). **Section 7 is the recommended fix for the timing jitter**; start there
+if you are about to implement one. Section 7.8 says how often a repeated or skipped frame
+is still expected once it is in.
 
 Hardware for every measurement here: Intel i7-1165G7 (4 cores / 8 threads), Windows 11,
 GStreamer 1.28 on MSYS2 UCRT64. On this machine every recording uses **software**
@@ -522,3 +525,461 @@ and the scratch tests, not from app recordings.
 - **Not measured:** the real NDI chain, more than one feed, disk load, power loss (only a
   process kill), post-session export with 30 s files (`long_form_export`,
   `clips_json_export`; no 4 s constants were found in them), or the UI strings.
+
+---
+
+## 7. Recommended fix for the timing jitter
+
+Date: 2026-11-11. Recommendation only; nothing is implemented. It builds on sections 2-6
+and on three new experiments (7.2) run with scratch GStreamer pipelines outside the repo.
+
+### 7.1 The root cause, stated precisely
+
+Every segment's position in session time is **one reading of `time.monotonic_ns()`,
+taken when the segment's first buffer happens to reach a Python pad probe**
+(`_on_record_encoder_buffer_probe`, `pipeline_manager.py:2268-2300`; `SessionClock` is
+`time.monotonic_ns()`, `session_clock.py:44`). That reading includes however late the
+probe ran, which depends on CPU load. Separately, which frames belong to which segment
+is decided by **when** the `format-location` callback swaps `_pending_segment`
+(`:2181-2266`), not by the frames' timestamps. Those two choices produce the per-segment
+offset jitter, the 2-frame lead and the blind-window frame loss of section 2.2.
+
+The data needed to avoid both already exists inside GStreamer: every buffer carries an
+exact timestamp on the pipeline's timeline, and `splitmuxsink` reports exactly which
+buffer starts and ends each file.
+
+### 7.2 New measurements
+
+**E1 — GStreamer's clock and Python's clock are the same counter.** On this machine:
+
+| | |
+|---|---|
+| `time.monotonic()` (Python 3.14.3) | `QueryPerformanceCounter()`, 100 ns resolution |
+| `GstSystemClock` | `clock-type=monotonic`, 100 ns resolution |
+| Offset between them | 0.0001 ms, unchanged after 10 s (zero drift); paired-read bracket 0.8 us |
+
+So a buffer's `base_time + running_time` *is* a `time.monotonic_ns()` value, whenever
+the pipeline runs on the system clock. Converting a frame timestamp to session time needs
+no sampling at all. (On Python 3.12 and earlier, `time.monotonic()` on Windows was
+`GetTickCount64()` with ~15.6 ms resolution; `perf_counter_ns()` is QPC on all versions.)
+
+**E2 — the error inside today's sample.** A live 720p30 pipeline shaped like the record
+branch (`queue ! videoconvert ! I420 ! jpegenc`), measuring how late a Python probe on the
+encoder's src pad sees each buffer relative to that buffer's own timestamp. That lateness
+is exactly what today's per-segment offset absorbs:
+
+| Load | Median | Sigma | p95 | Max |
+|---|---|---|---|---|
+| Idle | 7.8 ms | 1.4 ms | 9.8 ms | 12.0 ms |
+| 8 parallel 720p JPEG encoders (CPU) | 22.3 ms | 9.2 ms | 35.9 ms | 44.3 ms |
+| 6 Python threads at ~20% duty (GIL) | 5.7 ms | 1.5 ms | 9.3 ms | 12.1 ms |
+| Both | 23.4 ms | 8.6 ms | 40.8 ms | 52.9 ms |
+
+The jitter at a seam is the *difference* of two such samples, so its sigma is about
+sqrt(2) x sigma: about 1.9 ms idle and 13 ms under the CPU load. That is consistent with
+the 1.4 ms (one feed) and 13.1 ms (two feeds) measured in the recordings (section 3.2).
+**CPU contention, not the GIL, drives it**, which is why it grows with feed count and fps.
+
+**E3 — splitmuxsink already reports exact bounds.** Live 720p30, 4 s fragments, with the
+app's probe-and-swap bookkeeping reproduced (including a SQLite insert + commit inside
+the callback, as `_finalize_pending_segment_locked` does), compared with the frames in
+each file (`ffprobe`):
+
+| Source of the fragment bounds | Error vs the file (idle) | Error vs the file (8-encoder load) |
+|---|---|---|
+| Today's design: probe + swap in `format-location` | head +2 frames (+1 on the first fragment), tail +2 frames | same, plus one fragment at head +3 / count -1 (a lost frame) |
+| `format-location-full`'s first sample (PTS) | +0.085 ms on every fragment | -0.118 ms on every fragment |
+| `splitmuxsink-fragment-opened` message, `running-time` | +0.085 ms | -0.118 ms |
+| `splitmuxsink-fragment-closed` message, `running-time` vs *end* of the last frame | -0.25 ms | -0.45 ms |
+
+The residuals are the mkv's 1 ms timestamp rounding, not errors. So the experiment
+reproduces the recorded symptoms (the constant 2-frame lead and the occasional lost frame
+under load) **outside the app**, and shows GStreamer's own reports are exact under the
+same load. `fragment-closed` gives the exclusive end (end of the last frame), so
+consecutive fragments meet exactly. One exception: a fragment closed by EOS (Stop)
+reported the *start* of its last frame, so the final segment needs last PTS + one frame
+duration.
+
+**E4 — which clock the NDI pipelines run on (verified 2026-11-11).** `gst-inspect-1.0
+ndisrc` says the element *can* provide a clock, so this needed a real sender. Test: the
+app's own `NDIReceiver` chain (`timestamp-mode=receive-time-vs-timestamp`, target
+1920x1080 at 30 from `app_settings.toml`) plus a record branch shaped like the app's,
+receiving NDI 6 Tools Test Patterns (`DAVIDI7 (Test Pattern)`, UYVY 1920x1080, declared
+30/1) on this PC, 60 s, letting GStreamer pick the clock as the app does:
+
+| | Result |
+|---|---|
+| Pipeline clock | **`GstSystemClock`** (the singleton), `clock-type=monotonic`, 100 ns, no master |
+| `ndisrc.provide_clock()` in this mode | none |
+| Pipeline clock minus `time.monotonic_ns()` | 0.0001 ms at start and after 59.6 s; drift 0.001 ppm; paired-read bracket 1.6 us |
+
+So with the app's timestamp mode the NDI pipelines run on the system clock, which is the
+same counter as `SessionClock` (E1). Step 3 of 7.4 is not needed. If a feed's
+`ndi_timestamp_mode` is ever set to another value (for example `clocked`), repeat the
+check, since `ndisrc` may then provide its own clock.
+
+The same run exposed a second hazard. The Test Patterns "Crosshatch" stream declares
+30/1 but delivered **one frame per second** (57 frames in 60 s; `videorate` in=57,
+out=1798, duplicate=1740). `videorate` can only emit the duplicates once the next real
+frame arrives, so they reached the encoder in bursts, **0.4-4.3 s late** (median 758 ms).
+Any static or slow NDI source (a still image, a paused player) would therefore throw
+today's per-segment offset sample off by up to seconds. The step 1 fix is not affected,
+because it uses the frames' timestamps, not their arrival. This run is not usable for
+live-rate timing; repeat with a moving source (a moving Test Patterns pattern, VLC
+playing a video, or a camera). Done in E5.
+
+**E5 — a moving 29.97 fps source (2026-11-11).** Same chain and record branch as E4,
+with `splitmuxsink-fragment-opened` / `-closed` messages captured as well. The source
+was VLC on this PC playing a 29.97 fps video over NDI (`DAVIDI7 (VLC)`, UYVY 1920x1080
+bt709, declared 30000/1001). The target was 1920x1080 at `target_fps = 29.97` (caps
+2997/100) and the run lasted 120 s (31 fragments). Because sender and receiver share one
+machine, there is no network in this path.
+
+| | Result |
+|---|---|
+| Pipeline clock | `GstSystemClock` again; minus `time.monotonic_ns()` 0.0001 ms, drift 0.000 ppm over 119.7 s |
+| Source rate, fitted to the NDI timestamps of 3,463 frames | 29.970037 fps: 0.2 ppm from 30000/1001, 1.2 ppm from the 2997/100 target; no missing frames (no timestamp gap over 1.5 frames) |
+| NDI frame arrival interval (at `videorate`'s sink) | median 33.29 ms, sigma 2.6 ms, p1-p99 27.6-39.5 ms, max 57.1 ms |
+| NDI timestamp step (`receive-time-vs-timestamp`) | median 33.34 ms, sigma 0.93 ms, p1-p99 31.4-35.5 ms, range 24.0-43.4 ms |
+| `videorate` after start-up | 0 drops, 0 duplicates (all 121 duplicates were at start-up, below) |
+| Today's sample: encoder-src lateness at each segment's first frame, steady state (29 segments) | median 31.1 ms, sigma 3.3 ms (1.4 ms without one 47.6 ms outlier); seam-to-seam change sigma 4.6 ms; **1 of 28 seams moved by more than half a frame** (17.1 ms) |
+| Proposed: `fragment-opened` running-time vs `format-location-full`'s first sample | 0.0000 ms on all 31 fragments |
+| Proposed: next fragment's first sample minus `fragment-closed` running-time | **0.0000 ms on all 29 seams**: no hole, no overlap |
+| Proposed: `fragment-closed` minus (last frame + 1/29.97 s) | 0 ± 0.05 ms (the files' 100 us timestamp step) |
+| File first timestamp vs first sample, `timecodescale` 100 us | at most 0.049 ms; 3,240 of 3,600 frames carry sub-millisecond timestamps; `cv2` seeks work |
+| Segment length | 119 frames = 3,970.6 ms (a 120th frame would end at 4,004 ms, past `max-size-time`) |
+| Cost | process 0.77 cores; 26.8 MB per segment = 6.75 MB/s, about 24 GB per hour for one 1080p feed |
+
+What it shows:
+
+- **Clock:** confirmed with a moving source. Step 3 of 7.4 is not needed.
+- **Today's design** (one feed, 1080p, idle machine): 1 seam in 28 got an offset error
+  larger than half a frame, the same 3.6% as the one-feed recordings (section 3.2). The
+  lateness is about 31 ms at 1080p against 7.8 ms at 720p (E2), because the 1080p
+  conversion and encode take longer. So today's session times run about one frame
+  behind capture.
+- **The proposed bounds are exact on a live source at a non-integer rate:** consecutive
+  fragments meet to the nanosecond, and `fragment-closed` is the exclusive end. The E3
+  exception repeated: the last fragment, closed by EOS, reported the *start* of its last
+  frame (120,086.75 ms; the file's last frame is at 120,086.8 ms).
+- **Source jitter does not reach the files.** `videorate` puts every output frame on its
+  own exact 2997/100 grid. Consecutive NDI timestamps differ from the frame period by at
+  most about 10 ms (steps of 24.0-43.4 ms). That was never enough to push a frame past
+  the half-frame point (16.7 ms) where `videorate` drops or duplicates. Arrival
+  jitter (sigma 2.6 ms) is about 3 times larger than timestamp jitter (sigma 0.93 ms), so
+  `receive-time-vs-timestamp` smooths most of it.
+- **`target_fps` matched to the source works.** At 29.97, the 1.2 ppm left over (the
+  2997/100 rounding, 8.2 item 2) is one dropped or duplicated frame in about 7.7 hours.
+  With `target_fps = 30` the same source would get a duplicate about every 33 s. A camera
+  with its own oscillator will be some ppm off this PC's clock whatever the setting, so
+  expect an occasional single-frame slip there; the `videorate` telemetry shows it.
+- **Start-up burst (scratch pipeline only).** `ndisrc` took about 4 s from PLAYING to its
+  first frame. `videorate` (default `skip-to-first=false`) then emitted 121 copies of that
+  frame at once to fill back to running time 0. The record queue peaked at 120 buffers
+  (about 712 MiB of 1080p BGR) and the first two fragments reached the encoder 4.1 s and
+  1.7 s late. This does not reach the app's recordings: a new pipeline starts with the
+  record valve closed, and recording is only enabled once video is flowing
+  (`IMPLEMENTATION.md` §5.8). The preview path still gets the burst, and its leaky
+  queues drop it.
+
+### 7.3 How this is done outside this app
+
+- **GStreamer's synchronisation model:** a buffer's clock time is `base_time +
+  running_time`, and running time comes from the PTS through the pad's segment.
+  Pipelines that must line up share one clock and one base time
+  (`gst_pipeline_use_clock`, `gst_element_set_base_time`, with `start-time` set to
+  NONE). That is the standard way to keep several capture pipelines on one timeline.
+- **splitmuxsink is built to be indexed this way:** `format-location-full` hands over the
+  first buffer of each new file, and the `splitmuxsink-fragment-opened` /
+  `-closed` element messages carry each file's running-time bounds. GStreamer's own
+  `hlssink2` builds its playlist segment durations from those messages (from GStreamer's
+  source; not re-checked here).
+- **Segmented streaming formats never sample a wall clock per segment.** HLS `EXTINF`
+  durations and MPEG-DASH `SegmentTimeline` entries (`t`, `d`, with `t[n+1] = t[n] +
+  d[n]`) come from media timestamps, so segments are contiguous by construction.
+- **Broadcast replay servers index by frame count or timecode against a common
+  reference** (genlock, PTP), not by when software noticed a frame. NDI carries a
+  sender timecode and timestamp per frame, and `ndisrc` can use them (`timestamp-mode`
+  `timecode` / `timestamp`); cross-camera alignment then depends on the senders' clock
+  sync. The app moved to `receive-time-vs-timestamp` for the low-fps problem
+  (`NDI_LOW_FPS_INVESTIGATION.md`), which is compatible with everything below.
+
+### 7.4 Recommendation, in order
+
+**Step 0 — check the clock. Done for the NDI Test Patterns sender (7.2 E4) and a moving
+29.97 fps VLC sender (7.2 E5): the system clock, identical to `time.monotonic_ns()`;
+step 3 is not needed.** Still worth keeping
+as a one-line log at PLAYING (`pipeline.get_clock()`'s type, and the paired-read offset
+to `time.monotonic_ns()` at start and after a minute), and confirming once on a POV
+camera. Also pin Python 3.13 or later (or move `SessionClock` to `perf_counter_ns`) so
+session time never falls back to 15.6 ms ticks.
+
+**Step 1 — derive segment times from GStreamer's timeline, not from a probe sample.**
+This is the fix.
+
+1. **Start** of each segment = running time of the first sample passed to
+   `format-location-full` (connect it instead of `format-location`; the filename logic
+   stays the same). `splitmuxsink-fragment-opened` gives the same value.
+2. **End** (exclusive) = `running-time` of `splitmuxsink-fragment-closed`. For the
+   segment closed at Stop, use last PTS + one frame duration (E3 exception).
+3. **Session time** = running time + `(base_time - session_start_monotonic_ns)`: **one
+   constant per pipeline generation**, computed once at PLAYING and again after a
+   rebuild (new base time), not once per segment. With the system clock (E1) this is
+   exact. `SessionClock.rebase` keeps working, because it only moves
+   `session_start_monotonic_ns`.
+4. **Frame membership by timestamp, not timing.** If the probe is kept for frame counts,
+   attribute each buffer by comparing its PTS with the known start of the next
+   fragment. Better, take the count from the closed file in the validator, which
+   already opens every closed segment.
+5. **Insert the row and index entry when `fragment-closed` arrives** (the bus thread
+   already receives it for validation, `IMPLEMENTATION.md` §7.2) instead of inside
+   `format-location`. The file is complete at that point, closing the "indexed before
+   the trailer is written" window (`pipeline_manager.py:546`). The SQLite commit also
+   leaves the streaming thread, and with it the blind window.
+
+Result: consecutive segments of a feed meet exactly (`start[N+1] == end[N]`), and the
+bookkeeping error is zero by construction, whatever the CPU load, feed count or frame
+rate. That removes the 2-frame lead, the blind-window loss and the per-segment offset
+jitter (section 2.2), and the scaling of section 3 with them. The ~8-23 ms
+encode-and-probe latency in E2 disappears too, so a segment's session time means the
+frame's capture time rather than when the encoder finished it.
+
+**Step 2 — make replay use the exact bounds** (section 5 rows 2-4).
+`nearest_frame_location` treats segments as half-open `[start, end)`, so no hole exists
+to freeze on. `SegmentDecoder` positions by container timestamp rather than
+`offset x declared fps`, which also fixes the 28 fps feed of 2.3. `step_frames` steps
+by frame index across segments. These are small once step 1 makes the bounds right.
+
+**Step 3 — only if step 0 shows ndisrc's clock (it did not, 7.2 E4).** Either have every pipeline
+`use_clock(Gst.SystemClock.obtain())`, which then also allows a shared base time
+(step 4), or keep ndisrc's clock and map it to `time.monotonic_ns()` with paired clock
+reads at PLAYING, re-checked every few seconds and fitted for drift. Paired clock reads
+are accurate to about 1 us (E1), unlike buffer-arrival samples. The first option must be
+re-tested against the low-fps problem in `NDI_LOW_FPS_INVESTIGATION.md`, because
+`ndisrc` computes `receive-time-vs-timestamp` PTS against the pipeline clock.
+
+**Step 4 — optional: one timeline for all feeds.** With a shared clock and base time,
+every feed's running time is directly comparable, and `split-at-running-time` can cut
+all feeds at the same session times (section 6.5 tested it). Seams then line up across
+feeds instead of forming a zone (section 3.3 item 3). This is worth doing only after
+steps 1-2, when seams no longer glitch and only the next-file-open hitch is left.
+
+**Schema.** `start/end_session_time_ns` and `pts_to_session_offset_ns` already exist, but
+an *exclusive* end changes the meaning of `end_*`. Mark new rows (a column added in
+`MetadataDb._initialize_schema`, per `CLAUDE.md`), so old inclusive-end rows keep
+resolving the old way.
+
+### 7.5 What this does and does not fix
+
+| Problem | After steps 1-2 |
+|---|---|
+| Per-segment offset jitter (1.4 ms one feed, 13 ms two feeds, worse with load) | Gone: no per-segment sample |
+| 2-frame probe lead; replay ~2 frames behind true session time | Gone: bounds come from splitmuxsink |
+| Blind-window frame loss (3.6% / 40% of seams) | Gone: no swap timing, no DB work in the streaming path |
+| One-frame hole between segments; repeated / skipped frames at seams | Gone with half-open intervals |
+| Past-end reads (first segment, 28 fps feed) | Gone with exact durations and timestamp positioning |
+| Growth with 6-8 feeds and 60 fps (section 3) | The bookkeeping part is gone; CPU capacity limits (section 3.2) remain |
+| Real timing irregularity of the source (network, NDI receive) | Not affected: it is in the PTS, and those are the true frame times |
+| Constant latency differences between cameras | Not affected; calibrate per camera if cross-camera sync matters |
+
+### 7.6 How to verify it
+
+1. Unit tests (`unittest`) that feed recorded PTS sequences and fragment messages into
+   the bookkeeping and check `start[N+1] == end[N]`.
+2. On a new recording, the section 2.2 file audit should read head 0 / tail 0 / count 0
+   on every segment, and every DB gap should be exactly one frame.
+3. The section 1 step simulation over every seam and 34 click phases should show 0
+   repeated and 0 skipped frames.
+4. Two-, four- and eight-feed runs under load (section 4) should show zero offset change
+   between consecutive segments of a feed.
+5. A real-camera run for step 0 and, if needed, step 3.
+
+### 7.7 Alternatives considered and rejected
+
+| Alternative | Why not |
+|---|---|
+| Smooth the per-segment offset (median of recent segments) | Hides some jitter, lags real changes, and leaves the 2-frame lead and lost frames |
+| Raise thread priority or pin CPU affinity for probe threads | Shrinks the lateness but never removes it; the cause is sampling at arrival |
+| Read first/last timestamps back from each closed mkv | Exact, but extra I/O and a delay before replay; useful as the validator's check, not as the source |
+| Move the probe after splitmuxsink's internal queue | With `async-finalize` the muxer is created per fragment; fragile, and still timing-based |
+| Switch `ndisrc` to sender `timecode` / `timestamp` mode | Depends on sender clocks; coarse timecodes were the low-fps cause; does not fix the bookkeeping |
+
+### 7.8 How often a repeat or skip is still expected after the fix
+
+Date: 2026-11-11. Question asked: with the section 7 changes, how likely is a glitch,
+and how often? **Nothing here is built yet**, so the "after" figures are predictions
+from the 7.2 measurements, not results from the app. Section 7.6 is how to confirm them.
+
+**Short answer:** stepping across a seam should become clean every time. What can still
+show a repeated or skipped frame is a real duplicate or gap *inside the recording*, made
+by `videorate` before anything reaches the files. Each one is a single frame, it can sit
+anywhere in a segment, and it looks like one repeated click (or one two-frame jump), not
+the "repeat 2-3, then skip" pattern of section 1. With your current one-feed setup that
+is about once every 7.7 hours. With real cameras it is an estimated once every 10-55
+minutes per camera, still to be measured.
+
+**Stepping, today against after steps 1-2:**
+
+| | Today | After the fix |
+|---|---|---|
+| Stepping inside a segment | Clean (168 of 168 runs, section 1) | Clean |
+| Crossing a seam (one about every 120 clicks at 30 fps) | **About 65% of crossings glitch**: same frame for 1-3 clicks, then 0-2 frames skipped (section 1) | **Expected 0%**: segments meet exactly, and stepping goes by frame index, not time |
+| Segment timing error | One feed: offset sigma 1.4-3.3 ms, 1 seam in 28 off by more than half a frame (7.2 E5), 3.6% of seams lose a frame (3.2). Two feeds: sigma 13 ms, 40% of seams lose a frame (3.2) | 0.0000 ms at all 29 seams with a moving 29.97 fps source (7.2 E5); under 0.5 ms (the file's 1 ms rounding) with 8 extra encoders loading the CPU (7.2 E3) |
+| Replay lags true session time | About 2 frames (probe lead), plus about 31 ms of encode latency at 1080p | None: times are the frames' capture timestamps |
+
+**What can still repeat or skip a frame after the fix:**
+
+| Cause | How often, per feed | Basis |
+|---|---|---|
+| Source and target rates differ slightly: VLC on this PC, `target_fps = 29.97` | 1 frame in about 7.7 hours | Measured, 7.2 E5: 1.2 ppm apart (mostly the 2997/100 rounding, 8.2 item 2) |
+| A camera's clock against this PC's clock | About 1 frame every 11-55 minutes if they are 10-50 ppm apart, so a 0.3-1.5% chance inside a 10-second review | **Estimate.** 10-50 ppm is a typical spread for quartz clocks, not measured here; the camera rate as seen by this PC is what counts |
+| `target_fps` not matching the camera (30 against 29.97, or 60 against 59.94) | 1 duplicate every 33 s (30 fps) or 16.7 s (60 fps); the reverse mismatch drops instead | Arithmetic; avoided by matching `target_fps` (8.2 item 2) |
+| Frames lost by the network or the NDI receiver | Unknown. None in E5, but sender and receiver were on the same PC | Not measured over a real network |
+| More feeds, size or rate than the PC can encode | Constant, once the record queue backs up | Limits in 8.3: about 4 feeds at 1080p30, 8 at 720p30 on this PC |
+| Timestamp spread at a 60 fps target | Possible, rare | Not measured; the half-frame margin drops from 16.7 ms to 8.3 ms (8.2 item 4) |
+| A still or paused source | Repeats for as long as the source is still | Correct behaviour: the picture really is not changing (7.2 E4) |
+
+The rate-mismatch rows exist today too; the seam glitch hides them. The ingest
+`videorate` counters already in telemetry (`rate_dropped_per_sec`,
+`rate_duplicated_per_sec`) show the real rate for each camera.
+
+**Not covered by the fix:**
+
+- **Recordings made before the fix** keep today's behaviour. Only new rows carry the
+  exclusive-end marker (7.4, "Schema"), so older rows resolve the old way.
+- **A feed that drops out and reconnects mid-game** (`IMPLEMENTATION.md` §5.8) leaves a
+  real gap in the footage, which shows as a jump.
+- **Constant latency differences between cameras** are an offset between tiles, not
+  jitter (7.5).
+
+To replace the estimates with measured numbers, run the E5 check against a real camera
+over the network, and for the time of a match, and read the `videorate` counters.
+
+---
+
+## 8. 1080p60 NDI cameras: effect on the fix, and what to set in `app_settings.toml`
+
+Date: 2026-11-11. Question asked: how does a 1920x1080 at 60 fps NDI feed change the
+section 7 recommendation, and should `app_settings.toml` be changed to match? Advice
+only; nothing in `app/` or `app_settings.toml` was changed.
+
+Two things need to be kept apart:
+
+- **What the camera sends**: here, 1080p60 over NDI.
+- **What the app records**: `target_frame_width`, `target_frame_height` and `target_fps`
+  in `[app]` (today 1280, 720, 30). `ndi_receiver.py:209-263` scales and rate-converts the
+  camera to that target ahead of the `tee`, so the preview, the recording, the step size
+  (`frame_period_ns`, `application_coordinator.py:159-166`) and the seam structure all
+  follow the target, not the camera.
+
+### 8.1 Short answer
+
+- **The section 7 fix does not change**, and it matters more at 60 fps. Today's timing
+  errors are milliseconds (section 7.2), and a 16.7 ms frame holds twice as many frames
+  of them as a 33.3 ms one (section 3.4, case B). The fix makes them zero at any
+  resolution or rate.
+- **Four additions for 60 fps** (8.2).
+- **Do not set the target to 1920x1080 at 60 yet.** On this PC the record stage cannot
+  keep even one 1080p60 feed going with headroom (8.3), and the clock check of section
+  7.4 step 0 does not need the change. Keep 1280x720 at 30 for now.
+
+### 8.2 Additions to the recommendation for 60 fps
+
+1. **Finer file timestamps.** `matroskamux` stores timestamps in steps of its
+   `timecodescale` property, default 1,000,000 ns (1 ms). A 60 fps frame lasts 16.667 ms,
+   so file timestamps alternate 16 / 17 ms. Setting `timecodescale` to 100,000 (100 us)
+   through `splitmuxsink`'s `muxer-properties` keeps them exact to 0.1 ms. It matters only
+   for section 7.4 step 2, where the decoder positions by container timestamp; the
+   bookkeeping itself uses GStreamer's nanosecond values. **Verified 2026-11-11** in the
+   E4 run (`muxer-properties = "properties,timecodescale=(gint64)100000"`): every file's
+   first timestamp matched `format-location-full`'s first sample to 0.0000 ms, 80 of 120
+   frames per file carried sub-millisecond timestamps (the other 40 fall on whole
+   milliseconds at 30 fps), and `cv2` seeks worked. E5 repeated it at 29.97 fps: first
+   timestamps within 0.049 ms (the 100 us step), 3,240 of 3,600 frames sub-millisecond.
+   Not yet applied in the app: it is a
+   one-property change in `_build_splitmuxsink_element` (`pipeline_manager.py:1971-1996`).
+2. **Match `target_fps` to the camera's exact rate.** Many "60 fps" sources are 59.94
+   (60000/1001). With a 59.94 camera and `target_fps = 60`, `videorate` inserts a
+   duplicate frame about every 16.7 s (a 0.06 fps mismatch), which looks like a stuck
+   frame when stepping but has nothing to do with seams. The reverse mismatch drops a
+   frame at the same interval. `target_fps = 59.94` becomes `2997/50` through
+   `Fraction(...).limit_denominator(1000)` (`ndi_receiver.py:255`), off from 60000/1001 by
+   one frame in about 4.6 hours. The ingest `videorate` drop / duplicate rates are
+   already in telemetry (`rate_dropped_per_sec`, `rate_duplicated_per_sec`) to confirm
+   what the cameras send. The same holds at 30 fps: in E5 (7.2) a 29.97 source with
+   `target_fps = 29.97` gave 0 drops and 0 duplicates over 115 s, where `target_fps = 30`
+   would have duplicated a frame about every 33 s.
+3. **Drop and scale before converting.** The NDI chain is `videoconvert ! videoscale !
+   videorate ! capsfilter` (`ndi_receiver.py:320-322`), so every full-size frame is
+   converted to BGR at the camera's rate before anything is dropped or shrunk. Measured,
+   1080p60 UYVY input to a 1280x720 at 30 BGR target, one thread:
+
+   | Element order | Input fps one thread can take | One 60 fps camera uses |
+   |---|---|---|
+   | Today: convert, scale, rate | 71 | 84% of a thread |
+   | Rate, scale, convert | 103 | 58% of a thread |
+
+   Both figures include the synthetic source's own cost, so the real saving in
+   conversion work is larger. This applies at today's 720p30 target, as soon as the
+   cameras send 1080p60, and it adds up across 6-8 cameras.
+4. **Run the step 0 clock check with a 1080p60 sender** where possible (Test Patterns set
+   to 1080p60, or a 1080p60 clip in VLC). Which clock the pipeline uses will not depend on
+   it, but the timestamp cadence at 60 fps might. The first run (7.2 E4) used a Test
+   Patterns stream that delivered 1 frame per second. The second (7.2 E5) used a moving
+   1080p 29.97 source: NDI timestamp step sigma 0.93 ms, steps 24.0-43.4 ms, and no drops
+   or duplicates. At 60 fps the half-frame margin halves to 8.3 ms, which a spread like
+   that might occasionally exceed, so a 60 fps cadence run is still needed.
+
+### 8.3 What this PC can record
+
+Maximum sustained fps for one feed, idle machine, software `jpegenc` (`qsvjpegenc` fails
+to link here; see the note at the top of this doc), 1200 synthetic frames per run:
+
+| | Ingest stage (UYVY to BGR) | Record stage (BGR to I420 bt601 + `jpegenc quality=85`) |
+|---|---|---|
+| 1280x720 | 177 fps | 135 fps |
+| 1920x1080 | 82 fps | **61 fps** |
+
+The two stages run on different threads (the `ndisrc` streaming thread and the record
+queue's thread, see the threading notes in `IMPLEMENTATION.md` §4.1), so a feed is limited
+by the slower one. Combined with the many-feed encode totals in section 3.2 (about 440 fps
+at 720p and 180 fps at 1080p across all feeds):
+
+| Target in `[app]` | Feasible on this PC (encode only) |
+|---|---|
+| 1280x720 at 30 (current) | Up to 8 feeds |
+| 1280x720 at 60 | About 4 feeds; 6 is tight (81% of the total); 8 is over |
+| 1920x1080 at 30 | About 4 feeds; 6 is at the limit |
+| 1920x1080 at 60 | **Not even 1 feed with headroom** (60 needed of 61 possible); 2 or more cannot keep up |
+
+Other costs of a 1920x1080 at 60 target:
+
+| | 1080p30 | 1080p60 |
+|---|---|---|
+| Disk per feed | 7.0 MB/s (measured, session_010: 28.1 MB per 4 s; 6.75 MB/s in 7.2 E5, about 24 GB per hour) | about 14 MB/s; 8 feeds about 112 MB/s (budget default 200 MB/s) |
+| Record-queue memory if the encoder stalls (section 6.3) | up to 712 MiB per feed (120 buffers) | up to 1.48 GiB per feed (256 buffers) |
+| Replay, 8 feeds (section 3.2) | Stepping fine; about 16.5 ms decode per click | Stepping fine; 60 fps *playback* exceeds what the UI thread can decode and draw |
+
+### 8.4 Recommendation on the settings
+
+- **Now:** leave `[app]` at 1280x720 at 30. The section 7 step 0 clock check is unaffected
+  by the target and does not need a change.
+- **If 60 fps frame-by-frame review matters more than resolution:** 1280x720 at 60 is the
+  realistic middle on this class of PC, for up to about 4 feeds. Set `target_fps` to the
+  cameras' exact rate (8.2 item 2).
+- **1920x1080 at 60 for 6-8 cameras needs all of:** working hardware JPEG encoding (fix
+  the `qsvjpegenc` caps negotiation) or a much bigger CPU; the ingest reorder (8.2 item 3);
+  the section 7 fix; replay decode and drawing off the Qt thread (section 5, last row);
+  and capacity measured on the production machine, not this laptop.
+
+### 8.5 Method, and what was not measured
+
+- Stage capacities: `gst-launch-1.0` with `videotestsrc pattern=ball`, 1200 frames,
+  non-live, timed end to end, one process per measurement. The ingest-order comparison used
+  the same source with UYVY 1920x1080 at 60 into a BGR 1280x720 at 30 capsfilter. Scratch
+  scripts, not in the repo.
+- Disk figures come from `size_bytes` in `metadata.db` (read-only); the 60 fps figure is
+  scaled, not measured.
+- **Not measured:** NDI's own decode of a 1080p60 stream (it adds to the ingest stage),
+  real camera content (JPEG size and encode time depend on it), several real feeds at
+  once, `qsvjpegenc` once it links, and the production hardware.
