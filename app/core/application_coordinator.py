@@ -266,6 +266,20 @@ class ApplicationCoordinator:
                 role, rect
             )
 
+    def set_native_preview_crop(
+        self, role: str, feed_id: str, crop: tuple[int, int, int, int]
+    ) -> None:
+        """Cut `crop` source pixels off `feed_id`'s native preview before its sink.
+
+        How a tile zooms live video past what one sink surface can draw.
+        No-op for feeds that aren't on the native path, like
+        `set_native_preview_render_rectangle`.
+        """
+        if self.is_native_preview_active(feed_id):
+            self._feed_runtimes[feed_id].pipeline_manager.set_native_preview_crop(
+                role, crop
+            )
+
     def is_native_preview_active(self, feed_id: str) -> bool:
         """Return True when `feed_id` is using the d3d11 native-preview path."""
         runtime = self._feed_runtimes.get(feed_id)

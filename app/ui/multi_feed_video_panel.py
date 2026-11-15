@@ -133,8 +133,13 @@ class MultiFeedVideoPanel(QWidget):
         for tile in self._tiles.values():
             tile.set_video_surface_visible(show_video, live=live)
 
-    def enable_zoom_pan(self, aspect_ratio: float) -> None:
+    def enable_zoom_pan(
+        self, aspect_ratio: float, source_size: tuple[int, int] | None = None
+    ) -> None:
         """Let each tile hold its own zoom and pan.
+
+        `source_size` is the live frame size in pixels; with it a big tile
+        can zoom past what one sink surface draws (see `VideoWidget`).
 
         The zoom level shows in the tile's title. A review call shouldn't
         rest on a magnified picture nobody can tell is magnified, and
@@ -142,7 +147,7 @@ class MultiFeedVideoPanel(QWidget):
         """
         for feed in self._feeds:
             tile = self._tiles[feed.feed_id]
-            tile.enable_zoom_pan(aspect_ratio)
+            tile.enable_zoom_pan(aspect_ratio, source_size)
             tile.view_changed.connect(
                 lambda view, feed=feed: self._show_zoom_in_title(feed, view)
             )

@@ -285,14 +285,21 @@ Tested with real mouse input on the real pipeline (59 of 59). `IMPLEMENTATION.md
 - The real camera, zoomed, during a feed freeze.
 - The replay display change (3.1) was checked against the zoom/pan unit tests and
   pixel assertions, not with the real mouse.
-- Touch pinch and pan (`feature/touch-zoom-pan`). Real Win32 touch was injected
-  (`InjectTouchInput`) into the real referee window with synthetic feeds, and
-  into a bare tile over a native child surface. Not done: a live NDI feed on the
-  native d3d11 sink, so whether the sink's own child window passes touch through
-  as it does mouse is unconfirmed. No physical touchscreen was used.
-- 8x zoom (same branch). The surface a tile asks for is capped at the
-  9288x5224 above, so 8x on a small tile is that same surface, not a bigger
-  one. Its VRAM use is still unmeasured.
+- Touch pinch and pan, and 8x zoom (`feature/touch-zoom-pan`). Real Win32
+  touch was injected (`InjectTouchInput`) into the real referee window, with
+  synthetic feeds and with a live NDI test pattern on the real native d3d11
+  sink: 8.00x by pinch on a maximized single tile, the sink cropped to half
+  the frame, panning, and back to 1x (15 of 15 checks). A bare tile over a
+  native child surface was also touch-tested. A forced-crop A/B against the
+  uncropped picture matched on 100% of sampled pixels. Not done: a physical
+  touchscreen, the real camera (the test pattern delivers about 1 fps), and
+  a screen big enough to need the quarter-frame crop for real (that level
+  was only exercised with a lowered surface budget).
+- The crop path never asks for a surface bigger than the 9288x5224 above, so
+  8x does not add VRAM use. That surface's VRAM use is still unmeasured in the
+  full app. Crop changes (a level switch, or a pan past the crop) can show one
+  transitional frame, because the crop and rectangle are two separate
+  property sets; not seen in testing.
 
 ---
 

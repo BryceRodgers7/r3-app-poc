@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.core.models import FeedDefinition, MediaFrame
 from app.ui.feed_view import (
+    MAX_SURFACE_PIXELS,
     ZOOM_PER_WHEEL_NOTCH,
     FeedView,
     Tile,
@@ -378,7 +379,10 @@ class ZoomLabelTests(_QtTestCase):
         tile.setMinimumHeight(0)
         tile.resize(2322, 1306)
         QApplication.processEvents()
-        self.assertAlmostEqual(shown[-1], max_zoom(Tile(2322, 1306, _WIDE)))
+        # This tile has no frame size, so it can't crop: the surface is its limit.
+        self.assertAlmostEqual(
+            shown[-1], max_zoom(Tile(2322, 1306, _WIDE, crop_levels=(1,)))
+        )
         self.assertEqual(tile.view().zoom, 8.0)  # what the referee set is kept
         tile.resize(800, 450)
         QApplication.processEvents()
@@ -391,6 +395,128 @@ class ZoomLabelTests(_QtTestCase):
         tile.resize(640, 360)
         QApplication.processEvents()
         self.assertEqual(shown, [])
+
+
+class NativeCropTests(_QtTestCase):
+    """Zoom past what one sink surface can draw is done by cropping the frame."""
+
+    _SOURCE = (1920, 1080)
+
+    def _big_tile(self, *, source=True) -> tuple[VideoWidget, list, list]:
+        """A native tile as big as a maximized single tile, with what it sends."""
+        tile = VideoWidget()
+        tile.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        tile.setMinimumHeight(90)
+        tile.resize(2322, 1306)
+        tile.enable_zoom_pan(_WIDE, self._SOURCE if source else None)
+        tile.set_render_mode("native")
+        tile.show()
+        QApplication.processEvents()
+        sent: list = []
+        tile.native_crop_changed.connect(lambda crop: sent.append(("crop", crop)))
+        tile.native_render_rect_changed.connect(lambda rect: sent.append(("rect", rect)))
+        return tile, sent, [sent]
+
+    def _zoom_to(self, tile: VideoWidget, zoom: float) -> None:
+        position = (tile.width() // 2, tile.height() // 2)
+        while tile.view().zoom < zoom - 1e-9:
+            _wheel(tile, position=position)
+
+    def test_a_big_tile_zooms_to_8x_by_cropping(self) -> None:
+        tile, sent, _ = self._big_tile()
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        self.assertEqual(tile.view().zoom, 8.0)
+        crops = [value for kind, value in sent if kind == "crop"]
+        self.assertTrue(crops)
+        self.assertNotEqual(crops[-1], (0, 0, 0, 0))
+
+    def test_the_surface_it_asks_for_stays_in_budget(self) -> None:
+        tile, sent, _ = self._big_tile()
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+            rects = [value for kind, value in sent if kind == "rect"]
+            self.assertLessEqual(rects[-1][2] * rects[-1][3], MAX_SURFACE_PIXELS * 1.01)
+
+    def test_low_zoom_sends_no_crop(self) -> None:
+        tile, sent, _ = self._big_tile()
+        for _ in range(4):
+            _wheel(tile, position=(1161, 653))
+        self.assertEqual([k for k, _ in sent if k == "crop"], [])
+
+    def test_the_crop_is_sent_before_the_rectangle_that_goes_with_it(self) -> None:
+        tile, sent, _ = self._big_tile()
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        first_crop = next(i for i, (kind, _) in enumerate(sent) if kind == "crop")
+        self.assertEqual(sent[first_crop + 1][0], "rect")
+
+    def test_zooming_back_out_removes_the_crop(self) -> None:
+        # Otherwise the sink would be left showing a part of the frame.
+        tile, sent, _ = self._big_tile()
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        for _ in range(14):
+            _wheel(tile, delta=-120, position=(1161, 653))
+        self.assertEqual(tile.view(), FeedView())
+        crops = [value for kind, value in sent if kind == "crop"]
+        self.assertEqual(crops[-1], (0, 0, 0, 0))
+
+    def test_the_crop_is_only_sent_when_it_changes(self) -> None:
+        tile, sent, _ = self._big_tile()
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        sent.clear()
+        # Small pans stay inside the crop already in use.
+        for step in range(4):
+            _drag(tile, (1000, 650), (1000 - 6, 650))
+        self.assertEqual([k for k, _ in sent if k == "crop"], [])
+        self.assertTrue([k for k, _ in sent if k == "rect"])
+
+    def test_panning_far_moves_the_crop_with_it(self) -> None:
+        tile, sent, _ = self._big_tile()
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        first = [v for k, v in sent if k == "crop"][-1]
+        for _ in range(30):
+            _drag(tile, (1500, 650), (700, 650))
+        last = [v for k, v in sent if k == "crop"][-1]
+        self.assertNotEqual(first, last)
+        self.assertGreater(last[0], first[0])  # now showing more of the right
+
+    def test_a_tile_without_a_frame_size_never_crops(self) -> None:
+        tile, sent, _ = self._big_tile(source=False)
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        self.assertEqual([k for k, _ in sent if k == "crop"], [])
+        self.assertAlmostEqual(tile.view().zoom, 4.0, places=1)
+
+    def test_a_small_tile_never_needs_one(self) -> None:
+        tile = _tile(native=True)
+        tile.enable_zoom_pan(_WIDE, self._SOURCE)
+        crops: list = []
+        tile.native_crop_changed.connect(crops.append)
+        for _ in range(12):
+            _wheel(tile)
+        self.assertEqual(tile.view().zoom, 8.0)
+        self.assertEqual(crops, [])
+
+    def test_qimage_tiles_send_no_crop(self) -> None:
+        tile = _tile()
+        tile.enable_zoom_pan(_WIDE, self._SOURCE)
+        crops: list = []
+        tile.native_crop_changed.connect(crops.append)
+        for _ in range(12):
+            _wheel(tile)
+        self.assertEqual(crops, [])
+
+    def test_the_title_shows_the_full_zoom_on_a_big_tile(self) -> None:
+        tile, _, _ = self._big_tile()
+        shown: list[float] = []
+        tile.view_changed.connect(lambda view: shown.append(view.zoom))
+        for _ in range(12):
+            _wheel(tile, position=(1161, 653))
+        self.assertEqual(shown[-1], 8.0)
 
 
 class NativeRenderRectTests(_QtTestCase):

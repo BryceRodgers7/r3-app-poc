@@ -25,9 +25,12 @@ from PySide6.QtWidgets import (
 
 from app.core.models import MediaFrame
 from app.ui.feed_view import (
+    CROP_LEVELS,
     FeedView,
+    NativeView,
     Tile,
     clamped,
+    native_view,
     panned,
     picture_rect,
     pinched,
@@ -65,6 +68,9 @@ class VideoWidget(QWidget):
     view_changed = Signal(object)  # FeedView
     # (x, y, width, height) the native sink should draw the picture into.
     native_render_rect_changed = Signal(object)
+    # (left, top, right, bottom) source pixels to cut off before the sink.
+    # Sent ahead of the rectangle it goes with, and only when it changes.
+    native_crop_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -117,6 +123,11 @@ class VideoWidget(QWidget):
         # The zoom last reported through `view_changed`: the title shows it,
         # so it has to follow what the tile can actually draw.
         self._announced_zoom = self._view.zoom
+        # Frame size in pixels, when known: what lets live zoom crop the
+        # frame upstream of the sink instead of growing its surface.
+        self._source_size: tuple[int, int] | None = None
+        self._native_view: NativeView | None = None
+        self._sent_crop = (0, 0, 0, 0)
         # True once the native sink has been given a render rectangle.
         # An explicit rectangle stops the sink tracking its window, and
         # the sink can't be handed back: its (-1, -1, -1, -1) reset
@@ -153,9 +164,19 @@ class VideoWidget(QWidget):
             """
         )
 
-    def enable_zoom_pan(self, aspect_ratio: float) -> None:
-        """Let this tile be zoomed and panned, for a picture of `aspect_ratio`."""
+    def enable_zoom_pan(
+        self, aspect_ratio: float, source_size: tuple[int, int] | None = None
+    ) -> None:
+        """Let this tile be zoomed and panned, for a picture of `aspect_ratio`.
+
+        `source_size` is the live frame's size in pixels. With it, zoom past
+        what one sink surface can draw is done by cropping the frame before
+        the sink; without it, the surface limit is the zoom limit.
+        """
         self._zoom_pan_aspect_ratio = float(aspect_ratio)
+        self._source_size = (
+            (int(source_size[0]), int(source_size[1])) if source_size else None
+        )
         # Without this Qt sends no touch events here, and turns a touch
         # into a mouse click, which cannot pinch. Only a tile that zooms
         # asks, so the operator window's tiles behave as before.
@@ -167,7 +188,12 @@ class VideoWidget(QWidget):
 
     def _tile(self) -> Tile:
         assert self._zoom_pan_aspect_ratio is not None
-        return Tile(self.width(), self.height(), self._zoom_pan_aspect_ratio)
+        return Tile(
+            self.width(),
+            self.height(),
+            self._zoom_pan_aspect_ratio,
+            CROP_LEVELS if self._source_size is not None else (1,),
+        )
 
     def _has_area(self) -> bool:
         return self.width() > 0 and self.height() > 0
@@ -202,10 +228,11 @@ class VideoWidget(QWidget):
             self.view_changed.emit(shown)
 
     def _push_native_render_rect(self) -> None:
-        """Tell the native sink where to draw, once it has been zoomed.
+        """Tell the native sink how to show the view, once it has been zoomed.
 
-        A tile that has never been zoomed sends nothing, so the sink
-        keeps tracking its window by itself.
+        That is a render rectangle, and past what one surface can draw, a
+        crop of the frame ahead of it. A tile that has never been zoomed
+        sends nothing, so the sink keeps tracking its window by itself.
         """
         if self._render_mode != "native" or self._zoom_pan_aspect_ratio is None:
             return
@@ -214,9 +241,19 @@ class VideoWidget(QWidget):
         if not self._has_area():
             return
         self._native_rect_engaged = True
-        self.native_render_rect_changed.emit(
-            picture_rect(self._shown_view(), self._tile())
-        )
+        tile = self._tile()
+        view = self._shown_view()
+        if self._source_size is None:
+            crop, rect = (0, 0, 0, 0), picture_rect(view, tile)
+        else:
+            self._native_view = native_view(
+                view, tile, self._source_size, self._native_view
+            )
+            crop, rect = self._native_view.crop, self._native_view.rect
+        if crop != self._sent_crop:
+            self._sent_crop = crop
+            self.native_crop_changed.emit(crop)
+        self.native_render_rect_changed.emit(rect)
 
     def _update_cursor(self) -> None:
         if self._drag_position is not None:

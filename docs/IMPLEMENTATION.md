@@ -1500,15 +1500,57 @@ Inputs, all landing on the same `FeedView` through `feed_view.py`:
   `MouseEventSynthesizedBySystem`). The mouse handlers ignore those, or a
   touch pan would apply twice.
 
-**Zoom limit.** `MAX_ZOOM` is 8x, but a tile may stop sooner:
-`max_zoom(tile)` also keeps the native swapchain (the zoomed picture) to
-`MAX_SURFACE_PIXELS` (9288x5224, the surface measured below) and to
-Direct3D 11's 16384-pixel texture limit. A tile of about 1160x650 or
-smaller reaches 8x; a maximized single tile on a large screen stays at
-4x, as before. Replay obeys the same limit, since one view serves live
-and replay. A view set on a small tile is kept as the referee set it, and
-shown capped on a bigger one; `VideoWidget._announce_zoom` reports the
-zoom actually drawn so the title never overstates it.
+**Zoom limit.** `MAX_ZOOM` is 8x on every tile. The native sink draws a
+zoomed picture into a swapchain as large as the *whole* zoomed picture
+(see the render rectangle notes below), and one surface has a ceiling:
+`MAX_SURFACE_PIXELS` (9288x5224, the surface measured below) and Direct3D
+11's 16384-pixel texture limit. `surface_zoom(tile)` is the zoom a tile
+reaches that way: about 4x for a 2300x1300 tile, 7x for a tile of
+1300x720, 8x and more for anything smaller.
+
+Past that, `native_view` crops the frame **before** the sink, so the
+rectangle only has to cover what is left. `PipelineManager` puts a
+`videocrop` ahead of the referee window's sink (only that window zooms),
+and the crop keeps a half or a quarter of the frame (`CROP_LEVELS`
+1/2/4), which the render rectangle then draws at the remaining zoom. The
+result is pixel-for-pixel what one big surface would show (checked on the
+real sink: 100% of sampled pixels equal), with a surface that stays
+bounded however far the zoom goes.
+
+- The crop's *size* is one of three levels and changes only when the zoom
+  leaves the current level's range, because changing it makes the sink
+  renegotiate caps (a swapchain rebuild). Its *position* may slide freely:
+  measured, 200 slides cause no renegotiation. The plan also keeps the
+  current crop while the visible part stays inside it, so a pan moves the
+  crop only now and then (an 8x pan across the whole frame changes it a
+  handful of times, not on every step).
+- The crop is `(left, top, right, bottom)` source pixels, rounded to even
+  numbers (subsampled colour needs them). It is computed from the frame
+  size, which `enable_zoom_pan(aspect, source_size)` is given as
+  `target_frame_width x target_frame_height`: the native NDI chain pins
+  the preview frame to exactly that.
+- `VideoWidget` sends `native_crop_changed` ahead of
+  `native_render_rect_changed` and only when the crop differs, so the
+  rectangle always goes with the crop it was planned for. Nothing is
+  atomic between the two, so a crop change can show one transitional
+  frame. At crop `(0, 0, 0, 0)` `videocrop` is passthrough, so a tile that
+  never needs it pays nothing, and a never-zoomed tile still sends
+  nothing and keeps the sink's auto-sizing.
+- `PipelineManager.set_native_preview_crop` stores the crop, and the
+  branch builder re-applies it, so a branch rebuilt by a reconnect keeps
+  it. `videocrop` refuses left + right (or top + bottom) at or over the
+  frame, so each pair is set shrinking-side first.
+- A tile with no frame size (no `source_size`) can't crop, and its limit
+  is `surface_zoom`. A tile too big for the crop levels to hand over to
+  each other (`surface_zoom` under 2, about 4600 px wide) is held to
+  `surface_zoom` too.
+- If a crop can't both hold everything the tile shows and fit the surface
+  (a very tall letterboxed tile), the plan shows everything and lets the
+  surface exceed the budget rather than cut visible picture off.
+- Replay obeys the same limit, since one view serves live and replay. A
+  view set on a small tile is kept as the referee set it, and shown capped
+  on a tile that can't draw it; `VideoWidget._announce_zoom` reports the
+  zoom actually drawn so the title never overstates it.
 
 The view belongs to `VideoWidget`, which outlives a camera being hidden
 on the ribbon and every live/replay switch. Normalizing it to the source
@@ -1544,9 +1586,13 @@ Native render rectangle behavior, measured on `d3d11videosink`
   effect. `PipelineManager` stores it and re-applies it on bind, so a
   sink rebuilt by a reconnect keeps the view.
 - Oversizing the native child *widget* instead renders wrongly.
-- The swapchain is as large as the rectangle, which is what
-  `max_zoom` bounds: 4x of a maximized single tile is a 9288x5224
-  surface, and that is the most any tile asks for.
+- The swapchain is as large as the rectangle. 4x of a maximized single
+  tile is a 9288x5224 surface, which is the most any tile asks for
+  (`MAX_SURFACE_PIXELS`); `native_view` crops the frame to stay under it.
+- A bare `d3d11videosink` on the dev laptop (Iris Xe) survived rectangles up
+  to 16000x8992, using about 1.2 GB of shared GPU memory (about 8 bytes a
+  pixel). At 17000 wide it fails with "Internal data stream error": the
+  16384 limit. That is why a large tile can't reach 8x by rectangle alone.
 
 ### 11.6 Referee jog wheel + step transport (Phase 14.F + later)
 

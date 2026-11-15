@@ -314,6 +314,11 @@ class PipelineManager:
         self._operator_window_handle: int | None = None
         self._referee_render_rect: tuple[int, int, int, int] | None = None
         self._operator_render_rect: tuple[int, int, int, int] | None = None
+        # The referee window's crop of the frame (left, top, right, bottom
+        # source pixels), applied by `videocrop` ahead of its sink. Kept so a
+        # rebuilt branch gets it back, like the render rectangle.
+        self._referee_crop: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._referee_crop_element: Any | None = None
         self._preview_probe_pad: Any | None = None
         self._preview_probe_id: int | None = None
         self._video_window_handle: int | None = None
@@ -1088,6 +1093,50 @@ class PipelineManager:
             if sink is not None:
                 self._apply_render_rectangle_locked(sink)
 
+    def set_native_preview_crop(
+        self, role: str, crop: tuple[int, int, int, int]
+    ) -> None:
+        """Cut `crop` = `(left, top, right, bottom)` source pixels off the frame before a window's sink.
+
+        This is how a tile zooms live video past what one sink surface can
+        draw: the sink then only has to draw what is left. Only the referee
+        window zooms, so only its branch has a crop element. `(0, 0, 0, 0)`
+        passes the frame through untouched. Stored so a rebuilt branch
+        keeps it.
+        """
+        if role != "referee":
+            raise ValueError(f"Only the referee preview crops, not {role!r}")
+        if len(crop) != 4 or any(int(value) < 0 for value in crop):
+            raise ValueError(f"Crop must be four non-negative pixel counts: {crop!r}")
+        with self._pipeline_lock:
+            self._referee_crop = tuple(int(value) for value in crop)  # type: ignore[assignment]
+            self._apply_referee_crop_locked()
+
+    def _apply_referee_crop_locked(self) -> None:
+        """Give the referee's `videocrop` its stored crop, if it exists yet.
+
+        Each side pair is set shrinking-side first, so left + right (and
+        top + bottom) never exceed the frame on the way to a valid pair,
+        which `videocrop` would refuse.
+        """
+        element = self._referee_crop_element
+        if element is None:
+            return
+        left, top, right, bottom = self._referee_crop
+        try:
+            for first, second, new_first, new_second in (
+                ("left", "right", left, right),
+                ("top", "bottom", top, bottom),
+            ):
+                if new_first <= element.get_property(first):
+                    order = ((first, new_first), (second, new_second))
+                else:
+                    order = ((second, new_second), (first, new_first))
+                for name, value in order:
+                    element.set_property(name, value)
+        except Exception:
+            LOGGER.exception("Failed to set the referee preview crop %s", self._referee_crop)
+
     def _apply_render_rectangle_locked(self, sink: Any) -> None:
         """Give `sink` its stored render rectangle, if it has one."""
         rect = (
@@ -1616,7 +1665,22 @@ class PipelineManager:
                     "Failed to configure %s native-preview queue policy", label
                 )
             self._pipeline.add(sink_queue)
-            if not sink_queue.link(sink):
+            if label == "referee":
+                # Zoomed live video is cropped here when one sink surface
+                # can't draw it. At (0, 0, 0, 0) the element passes frames
+                # straight through.
+                crop = self._make_element(
+                    "videocrop", f"{branch_name}_referee_crop"
+                )
+                self._pipeline.add(crop)
+                if not (sink_queue.link(crop) and crop.link(sink)):
+                    raise RuntimeError(
+                        "Failed to link the referee preview queue to its video sink."
+                    )
+                self._referee_crop_element = crop
+                self._apply_referee_crop_locked()
+                crop.sync_state_with_parent()
+            elif not sink_queue.link(sink):
                 raise RuntimeError(
                     f"Failed to link the {label} preview queue to its video sink."
                 )

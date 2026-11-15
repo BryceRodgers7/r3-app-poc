@@ -394,7 +394,9 @@ def run():
     check("max zoom picture on screen", shows_picture(frame) > 0.3 and fills_tile(frame))
     check("max zoom feed live", alive(ref, a) >= 3)
     x, y, w, h = rect_of(a._surface_stack_host)
-    print(f"max surface {round(w * limit)}x{round(h * limit)}", flush=True)
+    plan = a._native_view  # past one surface's reach the frame is cropped first
+    rect = plan.rect if plan is not None else (0, 0, round(w * limit), round(h * limit))
+    print(f"max surface {rect[2]}x{rect[3]} crop {plan.crop if plan else None}", flush=True)
     shot(ref, "12_max_zoom")
     for s in coordinator.telemetry_hub.snapshot():
         print(f"{s.feed_id} src={s.source_fps:.1f} prv={s.preview_fps:.1f} rec={s.recording_fps:.1f} drop={s.dropped_per_sec:.1f}", flush=True)

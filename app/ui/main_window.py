@@ -127,7 +127,8 @@ class MainWindow(QMainWindow):
         role = "operator" if live_only_window else "referee"
         if controls_role == "referee":
             self.video_panel.enable_zoom_pan(
-                settings.target_frame_width / settings.target_frame_height
+                settings.target_frame_width / settings.target_frame_height,
+                (settings.target_frame_width, settings.target_frame_height),
             )
         for feed_id, widget in self.video_panel.widgets_by_feed_id.items():
             self._output_renderer.bind_feed_widget(feed_id, widget)
@@ -153,6 +154,16 @@ class MainWindow(QMainWindow):
                         )
                     )
                 )
+                if controls_role == "referee":
+                    # Only the referee window zooms, so only its branch has a
+                    # crop element to send this to.
+                    widget.native_crop_changed.connect(
+                        lambda crop, feed_id=feed_id: (
+                            application_coordinator.set_native_preview_crop(
+                                role, feed_id, crop
+                            )
+                        )
+                    )
 
         # Phase 13.A/13.B: at most one of these is non-None per window.
         # The `controls_role` selector picks which widget is built.
