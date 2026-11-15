@@ -285,6 +285,14 @@ Tested with real mouse input on the real pipeline (59 of 59). `IMPLEMENTATION.md
 - The real camera, zoomed, during a feed freeze.
 - The replay display change (3.1) was checked against the zoom/pan unit tests and
   pixel assertions, not with the real mouse.
+- Touch pinch and pan (`feature/touch-zoom-pan`). Real Win32 touch was injected
+  (`InjectTouchInput`) into the real referee window with synthetic feeds, and
+  into a bare tile over a native child surface. Not done: a live NDI feed on the
+  native d3d11 sink, so whether the sink's own child window passes touch through
+  as it does mouse is unconfirmed. No physical touchscreen was used.
+- 8x zoom (same branch). The surface a tile asks for is capped at the
+  9288x5224 above, so 8x on a small tile is that same surface, not a bigger
+  one. Its VRAM use is still unmeasured.
 
 ---
 

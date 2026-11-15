@@ -5,8 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 import cv2
-from PySide6.QtCore import QPointF, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QResizeEvent, QWheelEvent
+from PySide6.QtCore import QEvent, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QEventPoint,
+    QImage,
+    QMouseEvent,
+    QPixmap,
+    QResizeEvent,
+    QTouchEvent,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QLabel,
     QSizePolicy,
@@ -22,12 +30,21 @@ from app.ui.feed_view import (
     clamped,
     panned,
     picture_rect,
+    pinched,
     visible_source_rect,
     zoomed,
 )
 
 
 _ANGLE_DELTA_PER_NOTCH = 120
+_TOUCH_EVENT_TYPES = frozenset(
+    {
+        QEvent.Type.TouchBegin,
+        QEvent.Type.TouchUpdate,
+        QEvent.Type.TouchEnd,
+        QEvent.Type.TouchCancel,
+    }
+)
 
 
 class VideoWidget(QWidget):
@@ -39,8 +56,9 @@ class VideoWidget(QWidget):
     the video panel.
 
     With `enable_zoom_pan`, Ctrl+wheel zooms and a left-button drag pans.
-    The view belongs to the widget, so it outlasts hiding the tile and
-    switching between live and replay.
+    On a touchscreen, two fingers pinch to zoom and pan together, and one
+    finger pans a zoomed tile. The view belongs to the widget, so it
+    outlasts hiding the tile and switching between live and replay.
     """
 
     video_surface_resized = Signal()
@@ -96,6 +114,9 @@ class VideoWidget(QWidget):
         self._zoom_pan_aspect_ratio: float | None = None
         self._view = FeedView()
         self._drag_position: QPointF | None = None
+        # The zoom last reported through `view_changed`: the title shows it,
+        # so it has to follow what the tile can actually draw.
+        self._announced_zoom = self._view.zoom
         # True once the native sink has been given a render rectangle.
         # An explicit rectangle stops the sink tracking its window, and
         # the sink can't be handed back: its (-1, -1, -1, -1) reset
@@ -135,6 +156,10 @@ class VideoWidget(QWidget):
     def enable_zoom_pan(self, aspect_ratio: float) -> None:
         """Let this tile be zoomed and panned, for a picture of `aspect_ratio`."""
         self._zoom_pan_aspect_ratio = float(aspect_ratio)
+        # Without this Qt sends no touch events here, and turns a touch
+        # into a mouse click, which cannot pinch. Only a tile that zooms
+        # asks, so the operator window's tiles behave as before.
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
 
     def view(self) -> FeedView:
         """Return the tile's current zoom and pan."""
@@ -163,7 +188,18 @@ class VideoWidget(QWidget):
         self._refresh_pixmap()
         self._push_native_render_rect()
         self._update_cursor()
-        self.view_changed.emit(view)
+        self._announce_zoom()
+
+    def _announce_zoom(self) -> None:
+        """Report the zoom the tile is drawing, if it has changed.
+
+        A tile can draw less than the referee asked for (see `max_zoom`):
+        the view is kept as set, but the title must show what is on screen.
+        """
+        shown = self._shown_view()
+        if shown.zoom != self._announced_zoom:
+            self._announced_zoom = shown.zoom
+            self.view_changed.emit(shown)
 
     def _push_native_render_rect(self) -> None:
         """Tell the native sink where to draw, once it has been zoomed.
@@ -208,8 +244,22 @@ class VideoWidget(QWidget):
         )
         event.accept()
 
+    @staticmethod
+    def _is_touch_echo(event: QMouseEvent) -> bool:
+        """True for a mouse event the system made up from a touch.
+
+        Windows sends a press and drag alongside every touch. The touch
+        handler already panned for it, so acting on the echo would pan
+        twice.
+        """
+        return event.source() != Qt.MouseEventSource.MouseEventNotSynthesized
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() != Qt.MouseButton.LeftButton or not self._view.is_zoomed:
+        if (
+            event.button() != Qt.MouseButton.LeftButton
+            or not self._view.is_zoomed
+            or self._is_touch_echo(event)
+        ):
             super().mousePressEvent(event)
             return
         self._drag_position = event.position()
@@ -232,6 +282,58 @@ class VideoWidget(QWidget):
         self._drag_position = None
         self._update_cursor()
         event.accept()
+
+    def event(self, event: QEvent) -> bool:
+        """Route touch events here; QWidget has no handler of its own for them."""
+        # Type first: Qt sends events while `__init__` is still running,
+        # before this widget's own attributes exist.
+        if event.type() in _TOUCH_EVENT_TYPES and self._zoom_pan_aspect_ratio is not None:
+            self._handle_touch(event)
+            return True
+        return super().event(event)
+
+    def _handle_touch(self, event: QTouchEvent) -> None:
+        """Two fingers pinch-zoom and pan together; one finger pans a zoomed tile.
+
+        Each event is handled from where its fingers just were
+        (`lastPosition`), so no gesture state is kept between events.
+        """
+        # Accepting the first event is what keeps the rest coming, and
+        # what stops Qt faking a mouse press from the touch.
+        event.accept()
+        if not self._has_area():
+            return
+        down = sorted(
+            (
+                point
+                for point in event.points()
+                if point.state() != QEventPoint.State.Released
+            ),
+            key=lambda point: point.id(),
+        )
+        if len(down) >= 2:
+            first, second = down[0], down[1]
+            if QEventPoint.State.Pressed in (first.state(), second.state()):
+                return  # a finger just landed: it has no earlier position
+            self._set_view(
+                pinched(
+                    self._shown_view(),
+                    (
+                        (first.lastPosition().x(), first.lastPosition().y()),
+                        (second.lastPosition().x(), second.lastPosition().y()),
+                    ),
+                    (
+                        (first.position().x(), first.position().y()),
+                        (second.position().x(), second.position().y()),
+                    ),
+                    self._tile(),
+                )
+            )
+        elif len(down) == 1 and down[0].state() == QEventPoint.State.Updated:
+            delta = down[0].position() - down[0].lastPosition()
+            self._set_view(
+                panned(self._shown_view(), delta.x(), delta.y(), self._tile())
+            )
 
     def set_placeholder_text(self, text: str) -> None:
         """Update the placeholder message shown when no embedded video is active."""
@@ -304,6 +406,8 @@ class VideoWidget(QWidget):
         super().resizeEvent(event)
         self._refresh_pixmap()
         self._push_native_render_rect()
+        if self._zoom_pan_aspect_ratio is not None and self._has_area():
+            self._announce_zoom()
         if self._showing_video_surface:
             self.video_surface_resized.emit()
 

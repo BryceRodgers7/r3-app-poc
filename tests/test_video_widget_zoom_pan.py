@@ -1,17 +1,23 @@
-"""Ctrl+wheel zoom and drag pan on a tile, and how long the view lasts."""
+"""Ctrl+wheel zoom, drag pan and touch pinch/pan on a tile, and how long the view lasts."""
 
 from __future__ import annotations
 
 import unittest
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.core.models import FeedDefinition, MediaFrame
-from app.ui.feed_view import ZOOM_PER_WHEEL_NOTCH, FeedView
+from app.ui.feed_view import (
+    ZOOM_PER_WHEEL_NOTCH,
+    FeedView,
+    Tile,
+    max_zoom,
+    picture_rect,
+)
 from app.ui.multi_feed_video_panel import MultiFeedVideoPanel
 from app.ui.video_widget import VideoWidget
 
@@ -50,6 +56,27 @@ def _wheel(
     )
     QApplication.sendEvent(widget, event)
     return event
+
+
+def _mouse_event(
+    widget: VideoWidget, event_type: QEvent.Type, x: int, *, synthesized: bool
+) -> QMouseEvent:
+    position = QPointF(x, 225)
+    released = event_type == QEvent.Type.MouseButtonRelease
+    return QMouseEvent(
+        event_type,
+        position,
+        position,
+        QPointF(widget.mapToGlobal(position.toPoint())),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton if released else Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        (
+            Qt.MouseEventSource.MouseEventSynthesizedBySystem
+            if synthesized
+            else Qt.MouseEventSource.MouseEventNotSynthesized
+        ),
+    )
 
 
 def _tile(*, native: bool = False) -> VideoWidget:
@@ -147,6 +174,223 @@ class PanInputTests(_QtTestCase):
         self.assertEqual(tile.cursor().shape(), Qt.CursorShape.OpenHandCursor)
         _wheel(tile, delta=-120)
         self.assertEqual(tile.cursor().shape(), Qt.CursorShape.ArrowCursor)
+
+
+class _Fingers:
+    """Drives a tile with `QTouchEvent`s, the way a touchscreen does.
+
+    One `QTouchEventSequence` serves the whole gesture: it is what
+    remembers where each finger is between events.
+    """
+
+    def __init__(self, tile: VideoWidget) -> None:
+        self._tile = tile
+        self._sequence = QTest.touchEvent(tile, QTest.createTouchDevice())
+
+    def _commit(self) -> None:
+        self._sequence.commit()
+        QApplication.processEvents()
+
+    def press(self, finger: int, x: int, y: int) -> None:
+        self._sequence.press(finger, QPoint(x, y), self._tile)
+        self._commit()
+
+    def move(self, **fingers: tuple[int, int]) -> None:
+        """Move fingers at once: `move(f0=(x, y), f1=(x, y))`."""
+        for name, position in fingers.items():
+            self._sequence.move(int(name[1:]), QPoint(*position), self._tile)
+        self._commit()
+
+    def release(self, finger: int, x: int = 0, y: int = 0) -> None:
+        self._sequence.release(finger, QPoint(x, y), self._tile)
+        self._commit()
+
+
+class TouchInputTests(_QtTestCase):
+    def test_a_zooming_tile_asks_for_touch_events(self) -> None:
+        self.assertTrue(
+            _tile().testAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents)
+        )
+
+    def test_the_operator_windows_tiles_do_not(self) -> None:
+        # They never call enable_zoom_pan, so touch stays a plain click there.
+        self.assertFalse(
+            VideoWidget().testAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents)
+        )
+
+    def test_spreading_two_fingers_zooms_in(self) -> None:
+        tile = _tile()
+        fingers = _Fingers(tile)
+        fingers.press(0, 350, 225)
+        fingers.press(1, 450, 225)
+        fingers.move(f0=(250, 225), f1=(550, 225))  # 100 -> 300 apart
+        self.assertAlmostEqual(tile.view().zoom, 3.0, places=2)
+
+    def test_pinching_closed_zooms_back_out(self) -> None:
+        tile = _tile()
+        fingers = _Fingers(tile)
+        fingers.press(0, 350, 225)
+        fingers.press(1, 450, 225)
+        fingers.move(f0=(250, 225), f1=(550, 225))
+        fingers.move(f0=(350, 225), f1=(450, 225))
+        self.assertEqual(tile.view(), FeedView())
+
+    def test_zoom_goes_to_eight_times_on_a_small_tile(self) -> None:
+        tile = _tile()  # 800x450
+        fingers = _Fingers(tile)
+        fingers.press(0, 395, 225)
+        fingers.press(1, 405, 225)
+        for spread in (20, 40, 80, 160, 320, 640, 780):
+            fingers.move(f0=(400 - spread // 2, 225), f1=(400 + spread // 2, 225))
+        self.assertEqual(tile.view().zoom, 8.0)
+
+    def test_two_fingers_moving_together_pan(self) -> None:
+        tile = _tile()
+        for _ in range(4):
+            _wheel(tile)
+        before = tile.view()
+        fingers = _Fingers(tile)
+        fingers.press(0, 350, 225)
+        fingers.press(1, 450, 225)
+        fingers.move(f0=(300, 225), f1=(400, 225))
+        self.assertGreater(tile.view().center_x, before.center_x)
+        self.assertAlmostEqual(tile.view().zoom, before.zoom)
+
+    def test_the_picture_stays_under_the_fingers(self) -> None:
+        tile = _tile()
+        fingers = _Fingers(tile)
+        fingers.press(0, 600, 225)
+        fingers.press(1, 700, 225)
+        fingers.move(f0=(500, 225), f1=(700, 225))  # spread 2x about (650, 225)
+        left, _, width, _ = picture_rect(tile.view(), Tile(800, 450, _WIDE))
+        # The source point that was under the new midpoint is the one that
+        # was under the old.
+        self.assertAlmostEqual((600 - left) / width * 2, 600 / 800 * 2 - 0.0, delta=0.5)
+        self.assertAlmostEqual(tile.view().zoom, 2.0)
+
+    def test_one_finger_pans_a_zoomed_tile(self) -> None:
+        tile = _tile()
+        for _ in range(4):
+            _wheel(tile)
+        before = tile.view()
+        fingers = _Fingers(tile)
+        fingers.press(0, 400, 225)
+        fingers.move(f0=(300, 225))
+        self.assertGreater(tile.view().center_x, before.center_x)
+
+    def test_one_finger_does_nothing_at_1x(self) -> None:
+        tile = _tile()
+        fingers = _Fingers(tile)
+        fingers.press(0, 400, 225)
+        fingers.move(f0=(300, 225))
+        self.assertEqual(tile.view(), FeedView())
+
+    def test_a_second_finger_landing_does_not_jump_the_view(self) -> None:
+        tile = _tile()
+        for _ in range(4):
+            _wheel(tile)
+        fingers = _Fingers(tile)
+        fingers.press(0, 300, 225)
+        before = tile.view()
+        fingers.press(1, 500, 225)
+        self.assertEqual(tile.view(), before)
+
+    # Lifting one of two fingers is checked against real Win32 touch input,
+    # not here: QTest drops the remaining finger's moves after a release.
+
+    def test_a_mouse_event_made_from_a_touch_is_ignored(self) -> None:
+        # Windows sends a press and drag with every touch. The touch
+        # handler has already panned for it, so acting on it pans twice.
+        tile = _tile()
+        for _ in range(4):
+            _wheel(tile)
+        before = tile.view()
+        for event_type, x in (
+            (QEvent.Type.MouseButtonPress, 400),
+            (QEvent.Type.MouseMove, 300),
+            (QEvent.Type.MouseButtonRelease, 300),
+        ):
+            QApplication.sendEvent(
+                tile, _mouse_event(tile, event_type, x, synthesized=True)
+            )
+        self.assertEqual(tile.view(), before)
+
+    def test_a_real_mouse_event_still_pans(self) -> None:
+        tile = _tile()
+        for _ in range(4):
+            _wheel(tile)
+        before = tile.view()
+        for event_type, x in (
+            (QEvent.Type.MouseButtonPress, 400),
+            (QEvent.Type.MouseMove, 300),
+            (QEvent.Type.MouseButtonRelease, 300),
+        ):
+            QApplication.sendEvent(
+                tile, _mouse_event(tile, event_type, x, synthesized=False)
+            )
+        self.assertGreater(tile.view().center_x, before.center_x)
+
+    def test_zoom_by_touch_reaches_the_native_sink(self) -> None:
+        tile = _tile(native=True)
+        rects: list[tuple[int, int, int, int]] = []
+        tile.native_render_rect_changed.connect(rects.append)
+        fingers = _Fingers(tile)
+        fingers.press(0, 350, 225)
+        fingers.press(1, 450, 225)
+        fingers.move(f0=(300, 225), f1=(500, 225))
+        self.assertEqual(rects[-1][2:], (1600, 900))
+
+    def test_touch_zoom_shows_in_the_title(self) -> None:
+        panel = PersistenceTests()._panel()
+        tile = panel.widgets_by_feed_id["feed_a"]
+        fingers = _Fingers(tile)
+        fingers.press(0, 100, 100)
+        fingers.press(1, 150, 100)
+        fingers.move(f0=(80, 100), f1=(170, 100))
+        self.assertIn("×", panel._titles["feed_a"].text())
+
+    def test_the_mouse_still_works_after_touch(self) -> None:
+        tile = _tile()
+        fingers = _Fingers(tile)
+        fingers.press(0, 350, 225)
+        fingers.press(1, 450, 225)
+        fingers.move(f0=(250, 225), f1=(550, 225))
+        fingers.release(1)
+        fingers.release(0)
+        before = tile.view()
+        _drag(tile, (400, 225), (300, 225))
+        self.assertGreater(tile.view().center_x, before.center_x)
+
+
+class ZoomLabelTests(_QtTestCase):
+    """The title shows the zoom the tile draws, which a bigger tile may cap."""
+
+    def test_zoom_set_on_a_small_tile_is_capped_when_the_tile_grows(self) -> None:
+        tile = _tile()
+        shown: list[float] = []
+        tile.view_changed.connect(lambda view: shown.append(view.zoom))
+        fingers = _Fingers(tile)
+        fingers.press(0, 395, 225)
+        fingers.press(1, 405, 225)
+        for spread in (20, 40, 80, 160, 320, 640, 780):
+            fingers.move(f0=(400 - spread // 2, 225), f1=(400 + spread // 2, 225))
+        self.assertEqual(shown[-1], 8.0)
+        tile.setMinimumHeight(0)
+        tile.resize(2322, 1306)
+        QApplication.processEvents()
+        self.assertAlmostEqual(shown[-1], max_zoom(Tile(2322, 1306, _WIDE)))
+        self.assertEqual(tile.view().zoom, 8.0)  # what the referee set is kept
+        tile.resize(800, 450)
+        QApplication.processEvents()
+        self.assertEqual(shown[-1], 8.0)
+
+    def test_resizing_without_a_zoom_change_says_nothing(self) -> None:
+        tile = _tile()
+        shown: list[float] = []
+        tile.view_changed.connect(lambda view: shown.append(view.zoom))
+        tile.resize(640, 360)
+        QApplication.processEvents()
+        self.assertEqual(shown, [])
 
 
 class NativeRenderRectTests(_QtTestCase):

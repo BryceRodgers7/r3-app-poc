@@ -1480,10 +1480,35 @@ docstring. `_render_state` runs at up to 25 Hz, so `set_tone` and
 
 Each referee tile holds its own `FeedView`: a zoom factor plus the
 source point at the middle of the tile, normalized to the picture.
-Ctrl+wheel zooms about the cursor, 1.25x a notch up to 4x, and a left
-drag pans once zoomed. `MultiFeedVideoPanel.enable_zoom_pan` turns it
-on; the operator window never calls it. The zoom level shows in the
-tile's title because nothing may be drawn over the video.
+`MultiFeedVideoPanel.enable_zoom_pan` turns it on; the operator window
+never calls it. The zoom level shows in the tile's title because nothing
+may be drawn over the video.
+
+Inputs, all landing on the same `FeedView` through `feed_view.py`:
+
+- **Mouse:** Ctrl+wheel zooms about the cursor, 1.25x a notch; a left
+  drag pans once zoomed.
+- **Touch:** two fingers pinch to zoom and pan in one gesture (the
+  picture under the fingers follows them: `pinched`); one finger pans a
+  zoomed tile. `VideoWidget.enable_zoom_pan` sets `WA_AcceptTouchEvents`,
+  and touch is handled in `event()` because `QWidget` has no touch
+  handler. Each event is read from the fingers' `lastPosition`, so no
+  gesture state is kept. A finger landing is skipped as a baseline, and
+  lifting one finger carries on as a one-finger pan with no jump.
+  Rotation is ignored.
+- **Windows sends a mouse press and drag with every touch** (source
+  `MouseEventSynthesizedBySystem`). The mouse handlers ignore those, or a
+  touch pan would apply twice.
+
+**Zoom limit.** `MAX_ZOOM` is 8x, but a tile may stop sooner:
+`max_zoom(tile)` also keeps the native swapchain (the zoomed picture) to
+`MAX_SURFACE_PIXELS` (9288x5224, the surface measured below) and to
+Direct3D 11's 16384-pixel texture limit. A tile of about 1160x650 or
+smaller reaches 8x; a maximized single tile on a large screen stays at
+4x, as before. Replay obeys the same limit, since one view serves live
+and replay. A view set on a small tile is kept as the referee set it, and
+shown capped on a bigger one; `VideoWidget._announce_zoom` reports the
+zoom actually drawn so the title never overstates it.
 
 The view belongs to `VideoWidget`, which outlives a camera being hidden
 on the ribbon and every live/replay switch. Normalizing it to the source
@@ -1519,8 +1544,9 @@ Native render rectangle behavior, measured on `d3d11videosink`
   effect. `PipelineManager` stores it and re-applies it on bind, so a
   sink rebuilt by a reconnect keeps the view.
 - Oversizing the native child *widget* instead renders wrongly.
-- The swapchain is as large as the rectangle, which is what `MAX_ZOOM`
-  bounds: 4x of a maximized single tile is a 9288x5224 surface.
+- The swapchain is as large as the rectangle, which is what
+  `max_zoom` bounds: 4x of a maximized single tile is a 9288x5224
+  surface, and that is the most any tile asks for.
 
 ### 11.6 Referee jog wheel + step transport (Phase 14.F + later)
 

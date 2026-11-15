@@ -25,7 +25,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import main as app_main
-from app.ui.feed_view import FeedView, MAX_ZOOM
+from app.ui.feed_view import FeedView, max_zoom
 
 LEFT = Qt.MouseButton.LeftButton
 os.makedirs("shots", exist_ok=True)
@@ -388,12 +388,13 @@ def run():
     mx, my = to_screen(a, a.width() // 2, a.height() // 2)
     real_ctrl_wheel(mx, my, 10)
     wait(600)
-    check("max zoom reached", a.view().zoom == MAX_ZOOM, view_of(a))
+    limit = max_zoom(a._tile())  # a big tile stops short of MAX_ZOOM
+    check("max zoom reached", a.view().zoom == limit, f"{view_of(a)} limit {limit:.2f}")
     frame = tile_pixels(ref, a)
     check("max zoom picture on screen", shows_picture(frame) > 0.3 and fills_tile(frame))
     check("max zoom feed live", alive(ref, a) >= 3)
     x, y, w, h = rect_of(a._surface_stack_host)
-    print(f"max surface {round(w * MAX_ZOOM)}x{round(h * MAX_ZOOM)}", flush=True)
+    print(f"max surface {round(w * limit)}x{round(h * limit)}", flush=True)
     shot(ref, "12_max_zoom")
     for s in coordinator.telemetry_hub.snapshot():
         print(f"{s.feed_id} src={s.source_fps:.1f} prv={s.preview_fps:.1f} rec={s.recording_fps:.1f} drop={s.dropped_per_sec:.1f}", flush=True)

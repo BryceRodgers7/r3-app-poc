@@ -5,14 +5,19 @@ from __future__ import annotations
 import unittest
 
 from app.ui.feed_view import (
+    MAX_SURFACE_DIMENSION,
+    MAX_SURFACE_PIXELS,
     MAX_ZOOM,
     MIN_ZOOM,
     ZOOM_PER_WHEEL_NOTCH,
     FeedView,
     Tile,
     clamped,
+    max_zoom,
     panned,
     picture_rect,
+    pinched,
+    scaled,
     visible_source_rect,
     zoomed,
 )
@@ -21,6 +26,8 @@ from app.ui.feed_view import (
 _WIDE = 16 / 9
 _TILE = Tile(1600, 900, _WIDE)  # exact 16:9, so the picture fills it
 _TALL_TILE = Tile(800, 900, _WIDE)  # letterboxed top and bottom at 1x
+_SMALL_TILE = Tile(800, 450, _WIDE)  # small enough to reach MAX_ZOOM
+_MAXIMIZED_TILE = Tile(2322, 1306, _WIDE)  # the surface measured at 4x
 
 
 class PictureRectTests(unittest.TestCase):
@@ -61,7 +68,18 @@ class ZoomTests(unittest.TestCase):
 
     def test_zoom_stops_at_the_limits(self) -> None:
         self.assertEqual(zoomed(FeedView(), -5, 800, 450, _TILE).zoom, MIN_ZOOM)
-        self.assertEqual(zoomed(FeedView(), 50, 800, 450, _TILE).zoom, MAX_ZOOM)
+        self.assertEqual(
+            zoomed(FeedView(), 50, 400, 225, _SMALL_TILE).zoom, MAX_ZOOM
+        )
+        self.assertEqual(
+            zoomed(FeedView(), 50, 800, 450, _TILE).zoom, max_zoom(_TILE)
+        )
+
+    def test_scaled_multiplies_by_a_factor(self) -> None:
+        self.assertAlmostEqual(scaled(FeedView(), 2.5, 400, 225, _SMALL_TILE).zoom, 2.5)
+        self.assertAlmostEqual(
+            scaled(FeedView(zoom=4.0), 0.5, 400, 225, _SMALL_TILE).zoom, 2.0
+        )
 
     def test_point_under_the_cursor_stays_put(self) -> None:
         start = FeedView(zoom=2.0, center_x=0.4, center_y=0.6)
@@ -78,6 +96,98 @@ class ZoomTests(unittest.TestCase):
     def test_zooming_out_fully_recenters(self) -> None:
         view = zoomed(FeedView(zoom=1.25, center_x=0.45, center_y=0.55), -1, 0, 0, _TILE)
         self.assertEqual(view, FeedView())
+
+
+class MaxZoomTests(unittest.TestCase):
+    def test_a_small_tile_reaches_the_full_limit(self) -> None:
+        self.assertEqual(max_zoom(_SMALL_TILE), MAX_ZOOM)
+        self.assertEqual(MAX_ZOOM, 8.0)
+
+    def test_the_measured_surface_is_the_most_a_tile_asks_for(self) -> None:
+        # 4x of a maximized tile is what was seen to work on the sink.
+        self.assertAlmostEqual(max_zoom(_MAXIMIZED_TILE), 4.0, places=2)
+        for tile in (_SMALL_TILE, _TILE, _MAXIMIZED_TILE, Tile(3840, 2160, _WIDE)):
+            _, _, width, height = picture_rect(FeedView(zoom=max_zoom(tile)), tile)
+            self.assertLessEqual(width * height, MAX_SURFACE_PIXELS * 1.001)
+            self.assertLessEqual(max(width, height), MAX_SURFACE_DIMENSION)
+
+    def test_a_bigger_tile_zooms_less(self) -> None:
+        self.assertLess(max_zoom(_TILE), max_zoom(_SMALL_TILE))
+        self.assertLess(max_zoom(_MAXIMIZED_TILE), max_zoom(_TILE))
+
+    def test_a_huge_tile_still_zooms_in_a_little(self) -> None:
+        self.assertGreaterEqual(max_zoom(Tile(20000, 11250, _WIDE)), MIN_ZOOM)
+
+    def test_a_tile_with_no_area_does_not_divide_by_zero(self) -> None:
+        self.assertEqual(max_zoom(Tile(0, 0, _WIDE)), MAX_ZOOM)
+
+    def test_clamped_pulls_an_oversized_zoom_down_to_the_tile(self) -> None:
+        # Set on a small tile, shown on a large one.
+        view = clamped(FeedView(zoom=MAX_ZOOM), _MAXIMIZED_TILE)
+        self.assertAlmostEqual(view.zoom, max_zoom(_MAXIMIZED_TILE))
+
+
+class PinchTests(unittest.TestCase):
+    """Two fingers: spread to zoom, move together to pan."""
+
+    @staticmethod
+    def _source_under(view: FeedView, tile: Tile, x: float, y: float) -> tuple[float, float]:
+        left, top, width, height = picture_rect(view, tile)
+        return (x - left) / width, (y - top) / height
+
+    def test_spreading_zooms_in(self) -> None:
+        before = ((300.0, 225.0), (500.0, 225.0))
+        after = ((200.0, 225.0), (600.0, 225.0))
+        view = pinched(FeedView(), before, after, _SMALL_TILE)
+        self.assertAlmostEqual(view.zoom, 2.0)
+
+    def test_pinching_closed_zooms_out(self) -> None:
+        before = ((200.0, 225.0), (600.0, 225.0))
+        after = ((300.0, 225.0), (500.0, 225.0))
+        view = pinched(FeedView(zoom=4.0), before, after, _SMALL_TILE)
+        self.assertAlmostEqual(view.zoom, 2.0)
+
+    def test_the_picture_stays_under_the_fingers(self) -> None:
+        start = FeedView(zoom=2.0, center_x=0.4, center_y=0.6)
+        before = ((250.0, 150.0), (450.0, 250.0))
+        # Spread 1.5x and moved, but not twisted: zoom and pan can't follow a rotation.
+        after = ((200.0, 125.0), (500.0, 275.0))
+        view = pinched(start, before, after, _SMALL_TILE)
+        for finger_before, finger_after in zip(before, after):
+            expected = self._source_under(start, _SMALL_TILE, *finger_before)
+            actual = self._source_under(view, _SMALL_TILE, *finger_after)
+            self.assertAlmostEqual(actual[0], expected[0], places=3)
+            self.assertAlmostEqual(actual[1], expected[1], places=3)
+
+    def test_moving_both_fingers_together_pans_without_zooming(self) -> None:
+        before = ((300.0, 225.0), (500.0, 225.0))
+        after = ((240.0, 225.0), (440.0, 225.0))
+        start = FeedView(zoom=2.0)
+        view = pinched(start, before, after, _SMALL_TILE)
+        self.assertAlmostEqual(view.zoom, 2.0)
+        self.assertGreater(view.center_x, start.center_x)  # dragged left
+        self.assertEqual(
+            picture_rect(view, _SMALL_TILE)[0] - picture_rect(start, _SMALL_TILE)[0],
+            -60,
+        )
+
+    def test_pinching_out_stops_at_the_tiles_limit(self) -> None:
+        before = ((390.0, 225.0), (410.0, 225.0))
+        after = ((0.0, 225.0), (800.0, 225.0))  # 40x
+        view = pinched(FeedView(), before, after, _SMALL_TILE)
+        self.assertEqual(view.zoom, MAX_ZOOM)
+
+    def test_pinching_in_stops_at_1x(self) -> None:
+        before = ((0.0, 225.0), (800.0, 225.0))
+        after = ((390.0, 225.0), (410.0, 225.0))
+        view = pinched(FeedView(zoom=2.0), before, after, _SMALL_TILE)
+        self.assertEqual(view, FeedView())
+
+    def test_fingers_on_the_same_spot_make_no_zoom(self) -> None:
+        # No usable distance to take a ratio of.
+        before = ((400.0, 225.0), (400.0, 225.0))
+        after = ((300.0, 225.0), (500.0, 225.0))
+        self.assertEqual(pinched(FeedView(), before, after, _SMALL_TILE).zoom, MIN_ZOOM)
 
 
 class PanTests(unittest.TestCase):
