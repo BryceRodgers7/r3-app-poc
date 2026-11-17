@@ -39,6 +39,16 @@ audio_bitrate = 128000
 # the diagnostics widget shows what actually got picked.
 hardware_acceleration = "auto"
 
+# Pixel format the NDI ingest chain gives the preview windows and the
+# recorder.
+#   "NV12" — NDI's own YUV layout (default). No RGB conversion anywhere, so
+#            each feed costs roughly 25% less CPU, and it is the format
+#            `qsvjpegenc` links to. Needs an even target_frame_width/height.
+#   "BGR"  — the previous RGB path. A fallback if NV12 misbehaves on some
+#            GPU or driver; it costs more CPU per feed.
+# The synthetic test source is not affected.
+working_pixel_format = "NV12"
+
 # Phase 11.C — per-branch queue policy. Defaults reproduce the
 # pre-11.C hardcoded behavior. Override any subset; missing keys
 # stay at default. `leaky` is the GstQueueLeaky enum:

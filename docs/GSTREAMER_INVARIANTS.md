@@ -13,20 +13,39 @@ format so a future contributor can read the original context.
 
 ## 1. Color-space pinning before `jpegenc`
 
-**Rule.** A `capsfilter` enforcing `format=I420,colorimetry=bt601` MUST sit
-between the source-side videoconvert and `jpegenc` on the recording branch.
+**Rule.** A `capsfilter` enforcing `format=NV12,colorimetry=bt601` MUST sit
+between the source-side videoconvert and the JPEG encoder (`jpegenc` or
+`qsvjpegenc`) on the recording branch.
 
 **Why.** JPEG has no standardized colorimetry tag, so every player decodes
 JPEG content assuming BT.601. NDI / production camera sources deliver
 BT.709. Without this capsfilter, `videoconvert` would forward BT.709
-straight into `jpegenc`, the file would be tagged BT.709 (or nothing),
+straight into the encoder, the file would be tagged BT.709 (or nothing),
 and downstream players would apply the BT.601 YUV→RGB matrix to BT.709
 content — colors visibly shift (skin tones turn ruddy, greens go olive).
 Pinning caps here forces `videoconvert` to do the 709→601 conversion
 *before* the encode, so the encoded JPEG content actually matches what
 decoders expect.
 
-**Code:** `pipeline_manager.py:1120-1133`.
+**The format is NV12, not I420.** The pin used to be `format=I420`, which
+`qsvjpegenc` can never link to (its sink takes NV12 / YUY2 / BGRA only), so
+the hardware encoder was silently replaced by software `jpegenc` on every
+start. `jpegenc` takes NV12 as readily as I420, so one string serves both.
+
+**Where the conversion happens.** NV12 is also the ingest working format
+(`NDIReceiver.working_caps_string`), and that capsfilter deliberately leaves
+colorimetry unset. Caps negotiation carries this pin back through the
+pass-through elements (videorate, tee, the preview `videoconvert`), so the
+single 709→601 conversion runs in the ingest `videoconvert` and the record
+branch's `videoconvert` passes frames through; the preview sinks show data
+tagged BT.601, which is correct. Do not pin colorimetry in the working
+caps, and do not put a non-pass-through element between the ingest
+`videoconvert` and the tee, or the conversion silently moves (still
+correct, but it costs ~0.05 core per feed more and runs per branch).
+`tests/test_native_yuv.py::NegotiatedChainTests` asserts this.
+
+**Code:** `pipeline_manager.py:_recording_encode_caps_string` and
+`_add_record_branch_via_splitmuxsink` (the `encode_caps` element).
 
 ---
 
@@ -358,6 +377,32 @@ preview does not show it; use an async sink.
 `connect_source` (valve), `_build_pipeline` (sets `_recording_was_disabled`),
 `_rebuild_splitmuxsink_locked` (`audio_chain_existed`). Tests:
 `tests/test_rebuild_recovery.py`. Investigation: [`NDI_OPEN_BUGS.md`](NDI_OPEN_BUGS.md) bug 1.
+
+---
+
+## 13. Hardware JPEG frames must be key frames before `splitmuxsink`
+
+**Rule.** For `qsvjpegenc`, clear `Gst.BufferFlags.DELTA_UNIT` on every
+encoded buffer before it reaches `splitmuxsink`. The encoder-src probe
+`_on_record_encoder_buffer_probe` does this for every element named in
+`encoder_factory.ENCODERS_FLAGGING_DELTA_UNITS`. A new hardware MJPEG
+encoder must be checked for the same flag (`identity silent=false` after the
+encoder prints the buffer flags) and added to that set if it sets it.
+
+**Why.** Every MJPEG frame is a key frame, but `qsvjpegenc` marks each one
+`delta-unit`. `splitmuxsink` only starts a new file at a key frame, so it never
+rotates: the segment stays open, writes 0 bytes until teardown, then holds the
+whole game (measured: 300 frames, one 10 MB file instead of three). Replay
+only reads closed segments, so nothing would ever be replayable, while every
+telemetry counter (all taken upstream of the encoder) still looked healthy. A
+delta-flagged frame is also written by `matroskamux` as a BlockGroup rather
+than a key-frame SimpleBlock, which the replay frame index
+(`read_video_frame_index`) does not parse. `jpegparse` does not set the flag.
+
+**Code:** `pipeline_manager.py:_on_record_encoder_buffer_probe`,
+`encoder_factory.py:ENCODERS_FLAGGING_DELTA_UNITS`. Tests:
+`tests/test_native_yuv.py::EncoderKeyframeFlagTests` (the real-element case
+shows one file without the fix and several with it).
 
 ---
 

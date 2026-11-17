@@ -31,6 +31,16 @@ LOGGER = logging.getLogger(__name__)
 # those senders. See docs/NDI_LOW_FPS_INVESTIGATION.md.
 DEFAULT_NDI_TIMESTAMP_MODE = "receive-time-vs-timestamp"
 
+# Pixel format of the frames the ingest chain hands to the tee (and so to
+# the preview sinks and the record branch). NV12 keeps NDI's native
+# YUV 4:2:x layout, so no frame is ever expanded to RGB: the d3d11 sinks,
+# `jpegenc` and `qsvjpegenc` all take it directly. BGR is the old
+# behaviour, kept as an escape hatch (`[media] working_pixel_format`).
+# Measured on one 1080p30 feed (2 previews + JPEG recording): 0.78 -> 0.60
+# cores with NV12, 0.43 with NV12 + qsvjpegenc. See docs/GSTREAMER_INVARIANTS.md.
+VALID_WORKING_FORMATS = ("NV12", "BGR")
+DEFAULT_WORKING_FORMAT = "NV12"
+
 
 class NDIReceiver(SourceInterface):
     """Native NDI source providing a configured `Gst.Bin` to `PipelineManager`."""
@@ -48,11 +58,25 @@ class NDIReceiver(SourceInterface):
         frame_height: int,
         target_fps: float,
         timestamp_mode: str | None = None,
+        working_format: str | None = None,
     ) -> None:
         self._source_name = source_name
         self._feed_id = feed_id
         self._ndi_name = ndi_name
         self._timestamp_mode = timestamp_mode or DEFAULT_NDI_TIMESTAMP_MODE
+        normalized_format = (working_format or DEFAULT_WORKING_FORMAT).strip().upper()
+        if normalized_format not in VALID_WORKING_FORMATS:
+            raise ValueError(
+                f"working_format={working_format!r} is not one of "
+                f"{list(VALID_WORKING_FORMATS)}"
+            )
+        if normalized_format == "NV12" and (frame_width % 2 or frame_height % 2):
+            # NV12 stores chroma for 2x2 pixel blocks.
+            raise ValueError(
+                f"working_format NV12 needs an even frame size, got "
+                f"{frame_width}x{frame_height}"
+            )
+        self._working_format = normalized_format
         self._frame_width = frame_width
         self._frame_height = frame_height
         self._target_fps = max(target_fps, 1.0)
@@ -153,6 +177,27 @@ class NDIReceiver(SourceInterface):
     def get_ingest_telemetry(self) -> IngestTelemetry | None:
         return self._ingest_telemetry
 
+    def get_working_format(self) -> str:
+        """Pixel format this receiver hands to the tee (`NV12` or `BGR`)."""
+        return self._working_format
+
+    def working_caps_string(self) -> str:
+        """Caps that end the ingest chain: working format, target size and rate.
+
+        Colorimetry is left out on purpose. The record branch pins BT.601 for
+        JPEG, and caps negotiation carries that back through the pass-through
+        elements, so the one BT.709 -> BT.601 conversion happens in this
+        chain's `videoconvert`; the preview sinks then show data tagged BT.601,
+        which is correct, and the record branch's own `videoconvert` has
+        nothing left to do.
+        """
+        fps_fraction = Fraction(str(self._target_fps)).limit_denominator(1000)
+        return (
+            f"video/x-raw,format={self._working_format},"
+            f"width={self._frame_width},height={self._frame_height},"
+            f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
+        )
+
     def build_native_chain(self, gst_module: Any) -> dict | None:
         """Construct the native NDI element chain.
 
@@ -170,8 +215,16 @@ class NDIReceiver(SourceInterface):
         `gst-launch` example)::
 
             ndisrc -> ndisrcdemux name=demux
-              demux.video -> videoconvert -> capsfilter (BGR) -> [video_src_pad]
+              demux.video -> videoscale -> videoconvert -> videorate
+                          -> capsfilter (working format, size, rate)
+                          -> [video_src_pad]
               demux.audio -> audioconvert -> [audio_src_pad]
+
+        The video chain scales first, in the sender's own format (NDI is
+        normally UYVY), and converts afterwards, so a 1080p source going to a
+        720p target is converted at 720p. Measured at 1080p -> 720p: 0.655 ->
+        0.475 cores per feed against converting first. When the sizes match,
+        `videoscale` passes frames through untouched.
 
         Earlier 3.A.2 versions wrapped these elements in a `Gst.Bin` with
         ghost pads for cleanliness. That broke buffer flow on Windows +
@@ -195,16 +248,16 @@ class NDIReceiver(SourceInterface):
             demux = Gst.ElementFactory.make(
                 "ndisrcdemux", f"ndidemux_{self._feed_id}"
             )
-            video_convert = Gst.ElementFactory.make(
-                "videoconvert", f"ndivconvert_{self._feed_id}"
-            )
             # videoscale + videorate downscale the source's native rate/size
             # to the operator-configured target. Without these, NDI Tools
-            # Screen Capture pushes 2560x1440@60 BGR (~660 MB/s) at the
-            # appsink, which drowns the Python signal handler and freezes
-            # the Qt event loop.
+            # Screen Capture pushes 2560x1440@60 raw video (~660 MB/s as
+            # BGR) at the sinks, which drowns the Python signal handler and
+            # freezes the Qt event loop.
             video_scale = Gst.ElementFactory.make(
                 "videoscale", f"ndivscale_{self._feed_id}"
+            )
+            video_convert = Gst.ElementFactory.make(
+                "videoconvert", f"ndivconvert_{self._feed_id}"
             )
             video_rate = Gst.ElementFactory.make(
                 "videorate", f"ndivrate_{self._feed_id}"
@@ -223,8 +276,8 @@ class NDIReceiver(SourceInterface):
         elements = [
             source,
             demux,
-            video_convert,
             video_scale,
+            video_convert,
             video_rate,
             video_caps,
             audio_convert,
@@ -252,24 +305,17 @@ class NDIReceiver(SourceInterface):
                 exc,
             )
 
-        fps_fraction = Fraction(str(self._target_fps)).limit_denominator(1000)
-        video_caps.set_property(
-            "caps",
-            Gst.Caps.from_string(
-                "video/x-raw,format=BGR,"
-                f"width={self._frame_width},height={self._frame_height},"
-                f"framerate={fps_fraction.numerator}/{fps_fraction.denominator}"
-            ),
-        )
+        video_caps.set_property("caps", Gst.Caps.from_string(self.working_caps_string()))
 
-        # Static-side links (ndisrc → demux, videoconvert → capsfilter). The
-        # demux→videoconvert.sink and demux→audioconvert.sink links are
-        # dynamic via pad-added. Note: source.link / videoconvert.link can
-        # only succeed AFTER all elements are added to the same parent (the
-        # parent pipeline). We therefore defer linking to the caller, who
-        # adds the elements first. Return references the caller needs.
+        # Static-side links (ndisrc → demux, videoscale → videoconvert →
+        # videorate → capsfilter). The demux→videoscale.sink and
+        # demux→audioconvert.sink links are dynamic via pad-added. Note:
+        # source.link / videoscale.link can only succeed AFTER all elements
+        # are added to the same parent (the parent pipeline). We therefore
+        # defer linking to the caller, who adds the elements first. Return
+        # references the caller needs.
         demux.connect(
-            "pad-added", self._on_ndisrcdemux_pad_added, (video_convert, audio_convert)
+            "pad-added", self._on_ndisrcdemux_pad_added, (video_scale, audio_convert)
         )
 
         video_src_pad = video_caps.get_static_pad("src")
@@ -305,11 +351,11 @@ class NDIReceiver(SourceInterface):
     def link_native_chain_static(self) -> bool:
         """Link the static-side connections after caller adds elements to pipeline.
 
-        `ndisrc → ndisrcdemux` and `videoconvert → capsfilter` can only be
-        linked once both ends share a parent (the pipeline). The caller adds
-        the elements to the pipeline, then calls this. The dynamic
-        `demux.video → videoconvert.sink` link is done by the pad-added
-        handler installed in `build_native_chain`.
+        `ndisrc → ndisrcdemux` and `videoscale → videoconvert → videorate →
+        capsfilter` can only be linked once both ends share a parent (the
+        pipeline). The caller adds the elements to the pipeline, then calls
+        this. The dynamic `demux.video → videoscale.sink` link is done by the
+        pad-added handler installed in `build_native_chain`.
         """
         if self._native_source is None or self._native_demux is None:
             return False
@@ -317,8 +363,8 @@ class NDIReceiver(SourceInterface):
             self._status_message = "Failed to link ndisrc into ndisrcdemux."
             return False
         if not (
-            self._native_video_convert.link(self._native_video_scale)
-            and self._native_video_scale.link(self._native_video_rate)
+            self._native_video_scale.link(self._native_video_convert)
+            and self._native_video_convert.link(self._native_video_rate)
             and self._native_video_rate.link(self._native_video_caps)
         ):
             self._status_message = "Failed to link the NDI video chain."
@@ -328,8 +374,8 @@ class NDIReceiver(SourceInterface):
     def _on_ndisrcdemux_pad_added(
         self, _demux: Any, pad: Any, targets: tuple[Any, Any]
     ) -> None:
-        """Link demux.video → video_convert.sink and demux.audio → audio_convert.sink."""
-        video_convert, audio_convert = targets
+        """Link demux.video → video_scale.sink and demux.audio → audio_convert.sink."""
+        video_head, audio_convert = targets
         pad_name = pad.get_name() or ""
         caps = pad.get_current_caps() or pad.query_caps(None)
         caps_name = ""
@@ -342,8 +388,8 @@ class NDIReceiver(SourceInterface):
             caps_name,
         )
         if pad_name.startswith("video") or caps_name.startswith("video/"):
-            target = video_convert
-            target_label = "video_convert.sink"
+            target = video_head
+            target_label = "video_scale.sink"
         elif pad_name.startswith("audio") or caps_name.startswith("audio/"):
             target = audio_convert
             target_label = "audio_convert.sink"
@@ -366,7 +412,7 @@ class NDIReceiver(SourceInterface):
         link_result = pad.link(sink_pad)
         # When pad-added fires after the parent pipeline is already PLAYING,
         # the freshly-linked downstream element needs to sync state with the
-        # parent before it will accept buffers. Without this, videoconvert
+        # parent before it will accept buffers. Without this, videoscale
         # can sit in NULL/READY while everything else runs.
         try:
             target.sync_state_with_parent()

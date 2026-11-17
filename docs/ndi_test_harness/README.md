@@ -113,3 +113,28 @@ them changes the app or its files.
   decoders, tiles and worker threads and a Qt event loop (no app needed): frames shown/dropped per
   feed, worker decode+scale time, and how busy the UI thread is. `busy_processes` imitates the live
   pipeline competing for cores.
+
+## NV12 / hardware JPEG tools (read-only, Windows)
+
+`nv12_bench.py` compares the ingest chains the app can run (see
+[`../IMPLEMENTATION.md`](../IMPLEMENTATION.md) section 5.1 and
+[`../GSTREAMER_INVARIANTS.md`](../GSTREAMER_INVARIANTS.md) sections 1 and 13). It starts its own
+NDI sender (`R3BENCH`) and builds `gst-launch` chains shaped like the app's (ingest, two d3d11
+preview sinks, JPEG record branch); it does not touch the app. Windows open on screen briefly.
+Set `R3_BENCH_SEGMENT` to a recorded 1080p `.mkv` to send a real picture instead of colour bars.
+
+```bash
+export PATH="/c/msys64/ucrt64/bin:$PATH"
+python nv12_bench.py bench bgr,nv12,nv12_qsv --seconds 20           # CPU cores for one feed
+python nv12_bench.py bench bgr,nv12,nv12_qsv --feeds 2              # two feeds at once
+python nv12_bench.py bench bgr,nv12,nv12_qsv --size 1280x720        # 1080p source into a 720p target
+python nv12_bench.py color bgr,nv12,nv12_qsv                        # decoded JPEG colours, real frame
+python nv12_bench.py bars  bgr,nv12,nv12_qsv                        # saturated bars expose a wrong matrix
+```
+
+Run it on a candidate production PC before trusting the numbers: `nv12_qsv` there is the check
+that `qsvjpegenc` links and that `splitmuxsink` rotates (a `record fps` of ~30 with files that
+never rotate was the failure mode, so also launch the real app once and look for several
+`segment_*.mkv` per feed). The real-app A/B used in the results is `launch_once.py`-style: a
+config in an empty folder with two `[[feeds]]` pointing at `<host> (R3BENCH)`, Begin Game, then
+read `app.log` telemetry (`enc=` shows the encoder actually chosen).

@@ -41,6 +41,7 @@ from app.core.session_clock import SessionClock
 from app.core.state_machine import StateMachine
 from app.core.telemetry import FeedMetrics
 from app.media.encoder_factory import (
+    ENCODERS_FLAGGING_DELTA_UNITS,
     EncoderSelection,
     select_encoder,
     validate_segment_duration,
@@ -239,6 +240,9 @@ class PipelineManager:
         )
         self._force_software_encoder: bool = False
         self._record_branch_encoder_selection: EncoderSelection | None = None
+        # True when the encoder in the pipeline flags intra-only frames as
+        # delta units (qsvjpegenc); the encoder-src probe then clears the flag.
+        self._record_encoder_needs_keyframe_flag = False
         # Phase 11.B follow-up: when the audio_record chain build
         # fails (qtmux refusing late audio_%u request pads is the
         # main case), this latches True and the lazy chain build is
@@ -1857,11 +1861,11 @@ class PipelineManager:
                 f"branch={branch_name}"
             )
 
-        # Phase 11.A: hwaccel encoders sometimes refuse the
-        # `video/x-raw,format=I420,colorimetry=bt601` caps that
-        # encode_caps pins (driver-specific; observed with
-        # `qsvjpegenc` on some Intel driver versions). When the link
-        # fails AND the chosen encoder is hwaccel, swap in the
+        # Phase 11.A: hwaccel encoders can refuse the caps that
+        # encode_caps pins (driver-specific). `qsvjpegenc` always
+        # refused the old `format=I420` pin because it only takes
+        # NV12 / YUY2 / BGRA; the pin is NV12 now, so it links. When the
+        # link fails AND the chosen encoder is hwaccel, swap in the
         # software fallback in-place so the pipeline can still build,
         # set the sticky software flag for the rest of the process,
         # and emit a `hwaccel_negotiation_failed` WARNING.
@@ -1963,6 +1967,12 @@ class PipelineManager:
         # splitmuxsink build.
         self._record_branch_encoder = encoder
         self._record_branch_encoder_selection = encoder_selection
+        # Read by `_on_record_encoder_buffer_probe`, which is already on
+        # the encoder's src pad; set after any in-place software fallback
+        # so it describes the encoder that is actually in the pipeline.
+        self._record_encoder_needs_keyframe_flag = (
+            encoder_selection.element_name in ENCODERS_FLAGGING_DELTA_UNITS
+        )
         self._record_branch_name = branch_name
 
         # Surface the choice: INFO log + diagnostics field. `hwaccel_fallback`
@@ -2039,11 +2049,17 @@ class PipelineManager:
 
         Each encoder accepts a different pixel-format set:
 
-        - `jpegenc` / `qsvjpegenc` (MJPEG): I420 (8-bit 4:2:0). Pinned
-          to BT.601 colorimetry because JPEG has no standardized
-          colorimetry tag — players decode assuming BT.601, so the
-          source's BT.709 must be converted upstream of the encoder
-          to keep colors stable.
+        - `jpegenc` / `qsvjpegenc` (MJPEG): NV12 (8-bit 4:2:0, the
+          ingest working format). `jpegenc` takes NV12 as readily as
+          I420 (same CPU, same output), and `qsvjpegenc` takes only
+          NV12 / YUY2 / BGRA, so one caps string serves both and
+          the hardware encoder links. Pinned to BT.601 colorimetry
+          because JPEG has no standardized colorimetry tag — players
+          decode assuming BT.601, so the source's BT.709 must be
+          converted upstream of the encoder to keep colors stable.
+          Caps negotiation moves that one conversion to the ingest
+          chain (see `NDIReceiver.working_caps_string`), so the
+          record branch's `videoconvert` normally just passes frames.
         - `avenc_prores_ks` / `avenc_prores`: I422_10LE only (10-bit
           4:2:2). 8-bit and 4:2:0 are rejected outright.
         - `avenc_dnxhd` (DNxHR LB/SQ/HQ): Y42B (8-bit 4:2:2).
@@ -2055,7 +2071,7 @@ class PipelineManager:
         videoconvert is free to pass the source's colorimetry through.
         """
         if self._recording_codec == "mjpeg":
-            return "video/x-raw,format=I420,colorimetry=bt601"
+            return "video/x-raw,format=NV12,colorimetry=bt601"
         if self._recording_codec == "prores":
             return "video/x-raw,format=I422_10LE"
         if self._recording_codec == "dnxhr":
@@ -2519,6 +2535,13 @@ class PipelineManager:
         buffer's timestamp is read. Frames are attributed to segments by
         timestamp when a segment finishes (`SegmentBookkeeper`), so when a
         buffer passes here relative to a file switch doesn't matter.
+
+        One flag is also corrected, for the encoders in
+        `ENCODERS_FLAGGING_DELTA_UNITS`: every MJPEG frame is a key frame,
+        but `qsvjpegenc` marks them all delta units, and `splitmuxsink`
+        then never starts a new file (nor does matroskamux write them as
+        key-frame SimpleBlocks, which the replay frame index expects).
+        Clearing it touches only the buffer's flags, no pixel data.
         """
         Gst = self._Gst
         if Gst is None:
@@ -2530,6 +2553,12 @@ class PipelineManager:
                 self._record_encoder_segment = event.parse_segment()
             return Gst.PadProbeReturn.OK
         buf = info.get_buffer()
+        if (
+            buf is not None
+            and getattr(self, "_record_encoder_needs_keyframe_flag", False)
+            and buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        ):
+            buf.unset_flags(Gst.BufferFlags.DELTA_UNIT)
         if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
             return Gst.PadProbeReturn.OK
         running_time = buf.pts

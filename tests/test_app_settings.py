@@ -142,6 +142,51 @@ hardware_acceleration = "intel"
             settings = AppSettings.load(config_path)
         self.assertEqual(settings.media_hardware_acceleration, "intel")
 
+    def _load_media(self, body: str, app_body: str = "") -> AppSettings:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(
+                (f"[app]\n{app_body}\n" if app_body else "") + body,
+                encoding="utf-8",
+            )
+            return AppSettings.load(config_path)
+
+    def test_working_pixel_format_defaults_to_nv12(self) -> None:
+        self.assertEqual(AppSettings().media_working_pixel_format, "NV12")
+        self.assertEqual(self._load_media("[media]\n").media_working_pixel_format, "NV12")
+
+    def test_working_pixel_format_round_trip_is_case_insensitive(self) -> None:
+        settings = self._load_media('[media]\nworking_pixel_format = "bgr"\n')
+        self.assertEqual(settings.media_working_pixel_format, "BGR")
+
+    def test_working_pixel_format_rejects_unknown_values(self) -> None:
+        with self.assertRaises(RuntimeError) as raised:
+            self._load_media('[media]\nworking_pixel_format = "I420"\n')
+        self.assertIn("working_pixel_format", str(raised.exception))
+
+    def test_nv12_with_an_odd_target_size_is_rejected_when_asked_for(self) -> None:
+        with self.assertRaises(RuntimeError) as raised:
+            self._load_media(
+                '[media]\nworking_pixel_format = "NV12"\n',
+                app_body="target_frame_width = 1281\ntarget_frame_height = 720",
+            )
+        self.assertIn("even", str(raised.exception))
+
+    def test_odd_target_size_without_the_key_falls_back_to_bgr(self) -> None:
+        # Configs that predate NV12 keep running.
+        settings = self._load_media(
+            "[media]\n",
+            app_body="target_frame_width = 641\ntarget_frame_height = 361",
+        )
+        self.assertEqual(settings.media_working_pixel_format, "BGR")
+
+    def test_bgr_accepts_an_odd_target_size(self) -> None:
+        settings = self._load_media(
+            '[media]\nworking_pixel_format = "BGR"\n',
+            app_body="target_frame_width = 641\ntarget_frame_height = 361",
+        )
+        self.assertEqual(settings.media_working_pixel_format, "BGR")
+
     def test_queue_policy_defaults_match_pre_11c_constants(self) -> None:
         # Phase 11.C regression guardrail: the defaults must match
         # what was hardcoded in `pipeline_manager.py` since Phase 3.B.

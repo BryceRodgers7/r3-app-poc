@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -21,10 +22,15 @@ from app.config.prematch_config import (
     MatchDetails,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 CONFIG_FILENAME = "app_settings.toml"
 
 _VALID_SOURCE_KINDS = {"ndi", "synthetic"}
 _VALID_HWACCEL_VALUES = {"auto", "none", "nvidia", "intel", "amd"}
+# Pixel format the NDI ingest chain hands to the preview and record
+# branches. NV12 is NDI's native YUV layout; BGR is the old RGB path.
+_VALID_WORKING_PIXEL_FORMATS = {"NV12", "BGR"}
 # Phase 11.B follow-up: live recording matrix is MJPEG+MKV only.
 # ProRes / DNxHR / MOV were trialed (Phase 11.B) but the live
 # recording path can't reliably mux audio into qtmux without
@@ -133,6 +139,23 @@ def _validate_hwaccel(value: str, *, where: str) -> None:
         f"{where}: hardware_acceleration={value!r} is not supported. "
         f"Valid values are {sorted(_VALID_HWACCEL_VALUES)}."
     )
+
+
+def _validate_working_pixel_format(
+    value: str, *, width: int, height: int, where: str
+) -> None:
+    """Reject unknown `[media] working_pixel_format` values, and NV12 at an odd size."""
+    if value not in _VALID_WORKING_PIXEL_FORMATS:
+        raise RuntimeError(
+            f"{where}: working_pixel_format={value!r} is not supported. "
+            f"Valid values are {sorted(_VALID_WORKING_PIXEL_FORMATS)}."
+        )
+    if value == "NV12" and (width % 2 or height % 2):
+        raise RuntimeError(
+            f"{where}: working_pixel_format = \"NV12\" needs an even "
+            f"target_frame_width and target_frame_height, got {width}x{height}. "
+            f"Use an even size or set working_pixel_format = \"BGR\"."
+        )
 
 
 def _validate_codec(value: str, *, where: str) -> None:
@@ -360,6 +383,12 @@ class AppSettings:
     # probe toward that vendor's elements but still fall back to
     # software when unavailable. See architecture §7.4.
     media_hardware_acceleration: str = "auto"
+    # `[media] working_pixel_format`: what the NDI ingest chain produces for
+    # everything downstream (preview sinks, JPEG recording). "NV12" keeps
+    # NDI's own YUV layout and costs ~25% less CPU per feed than "BGR",
+    # the previous RGB path, which stays available as a fallback. The
+    # synthetic test source is unaffected.
+    media_working_pixel_format: str = "NV12"
     # Phase 11.C: per-branch queue policy. Defaults match what was
     # hardcoded in `pipeline_manager.py` since Phase 3.B. Preview is
     # leaky-downstream (slow preview drops the oldest); recording is
@@ -547,6 +576,28 @@ class AppSettings:
             )
             _validate_hwaccel(raw_hwaccel, where="[media]")
             settings.media_hardware_acceleration = raw_hwaccel
+        if "working_pixel_format" in media_config:
+            settings.media_working_pixel_format = (
+                str(media_config["working_pixel_format"]).strip().upper() or "NV12"
+            )
+        elif (
+            settings.target_frame_width % 2 or settings.target_frame_height % 2
+        ):
+            # An existing config with an odd target size predates NV12 and
+            # never asked for it; keep it running on the RGB path.
+            LOGGER.warning(
+                "target size %sx%s is odd, which NV12 cannot carry; using "
+                "working_pixel_format = \"BGR\". Use an even size to get NV12.",
+                settings.target_frame_width,
+                settings.target_frame_height,
+            )
+            settings.media_working_pixel_format = "BGR"
+        _validate_working_pixel_format(
+            settings.media_working_pixel_format,
+            width=settings.target_frame_width,
+            height=settings.target_frame_height,
+            where="[media]",
+        )
         # Phase 11.C: queue-policy sub-tables. Validate, then merge
         # over the per-queue defaults so a partial config (only
         # `max_buffers = 16`, say) keeps the other keys at their

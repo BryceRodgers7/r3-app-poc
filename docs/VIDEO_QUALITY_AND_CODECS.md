@@ -105,7 +105,7 @@ _DEFAULT_VIDEO_CODEC_ARGS = (
   visually lossless. CRF ≈ 18 is generally considered near-transparent;
   23 is noticeably softer, especially on motion (i.e. sports).
 - **`-pix_fmt yuv420p`** forces 4:2:0 chroma. (MJPEG masters are
-  already 4:2:0 — see the I420 encode caps in `pipeline_manager.py
+  already 4:2:0 — see the NV12 (4:2:0) encode caps in `pipeline_manager.py
   _recording_encode_caps_string` — so for the current MJPEG path this
   is not an *additional* loss. It would matter if the master were
   4:2:2.)

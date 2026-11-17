@@ -42,6 +42,7 @@ def build_source_for_feed(settings: AppSettings, feed: FeedDefinition) -> Source
             frame_height=settings.target_frame_height,
             target_fps=settings.target_fps,
             timestamp_mode=feed.ndi_timestamp_mode,
+            working_format=settings.media_working_pixel_format,
         )
     if kind == "synthetic":
         return TestSource(

@@ -436,12 +436,13 @@ go through the same path as Qt-main-thread emissions.
 connects) builds the full graph:
 
 ```
-SOURCE  (native NDI elements OR python_push appsrc)
+SOURCE  (native NDI: ndisrc → ndisrcdemux → videoscale → videoconvert → videorate
+         → capsfilter [NV12, target size + rate]   OR   python_push appsrc [BGR])
    ↓
 videoconvert (only on python_push path)
    ↓
 source_tee  ──┬──→  preview branch (per-mode)
-              └──→  record branch (queue → valve → videoconvert → I420/bt601 capsfilter → <encoder> → splitmuxsink)
+              └──→  record branch (queue → valve → videoconvert → NV12/bt601 capsfilter → <encoder> → splitmuxsink)
 
 audio_tee  ──┬──→  live audio (queue → valve → audioconvert → audioresample → wasapisink)
              └──→  audio_record drain appsink (always built — drains the tee even when audio_record into splitmuxsink is not wired)
@@ -456,6 +457,41 @@ audio_tee  ──┬──→  live audio (queue → valve → audioconvert → 
 `jpegenc` (software fallback). The chosen element name is logged at
 pipeline-build time and surfaced on `FeedMetricsSnapshot
 .recording_encoder` for the diagnostics widget.
+
+**Working pixel format (NDI).** The native ingest chain keeps video in
+**NV12**, NDI's own YUV 4:2:x layout, instead of expanding it to BGR
+(`[media] working_pixel_format`, default `"NV12"`; `"BGR"` restores the
+old path). `d3d11videosink`, `jpegenc` and `qsvjpegenc` all take NV12
+directly, so a frame is never converted to RGB and back.
+
+- *Order.* The chain scales first, in the sender's format, then converts,
+  so a 1080p source feeding a 720p target is converted at 720p
+  (`NDIReceiver.build_native_chain`).
+- *One colour conversion.* JPEG needs BT.601 (`GSTREAMER_INVARIANTS.md` §1);
+  NDI HD is BT.709. The record branch's caps pin carries back through the
+  pass-through elements in the chain, so the single 709 → 601 conversion
+  happens in the ingest `videoconvert`; the preview sinks show data tagged
+  601 and the record branch's own `videoconvert` passes frames through.
+- *Record caps.* One string for every MJPEG encoder:
+  `video/x-raw,format=NV12,colorimetry=bt601`. `qsvjpegenc` takes only
+  NV12 / YUY2 / BGRA, so the old `format=I420` pin never linked and every
+  start fell back to software `jpegenc`.
+- *Hardware JPEG needs a flag fix.* `qsvjpegenc` marks every frame a delta
+  unit, which stops `splitmuxsink` from ever cutting a file (one segment for
+  the whole game). `_on_record_encoder_buffer_probe` clears the flag for the
+  encoders listed in `ENCODERS_FLAGGING_DELTA_UNITS` (`GSTREAMER_INVARIANTS.md` §13).
+- *Odd sizes.* NV12 needs an even target size. With the key unset, an odd
+  size falls back to BGR with a warning; with `"NV12"` set explicitly it is
+  a config error.
+- *Unchanged:* the synthetic source stays BGR through its own
+  `videoconvert`; the python-push preview branch converts to BGR itself.
+
+Measured here (i7-1165G7, idle, 1080p30): one feed with two preview sinks and
+JPEG recording used 0.78 cores with BGR, 0.60 with NV12 and 0.43 with NV12 +
+`qsvjpegenc`; two feeds 1.20 / 0.78 / 0.53 cores per feed. In the real app
+(two 1080p NDI feeds recording): 1.9–2.4 cores before, 1.55 with NV12 and
+software `jpegenc`, 1.15 with NV12 and `qsvjpegenc`. Decoded colours match
+the BGR path within about 2/255 on average (saturated colour bars within 3).
 
 Preview branch shape depends on `source.pipeline_mode`:
 

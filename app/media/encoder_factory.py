@@ -24,6 +24,12 @@ from typing import Any
 
 VALID_HWACCEL_VALUES = ("auto", "none", "nvidia", "intel", "amd")
 SOFTWARE_MJPEG_ELEMENT = "jpegenc"
+# Encoders that flag every output frame as a delta unit even though MJPEG is
+# intra-only. `splitmuxsink` only cuts a new file at a key frame, so without
+# the flag fixed (see `PipelineManager._on_record_encoder_buffer_probe`) it
+# never rotates: one file grows for the whole game and no segment is ever
+# closed for replay. Measured with `qsvjpegenc`: 300 frames, one 10 MB file.
+ENCODERS_FLAGGING_DELTA_UNITS = frozenset({"qsvjpegenc"})
 # avenc_prores_ks ("Kostya" implementation) is meaningfully faster than
 # avenc_prores at the same target quality; probe it first.
 SOFTWARE_PRORES_PRIORITY = ("avenc_prores_ks", "avenc_prores")

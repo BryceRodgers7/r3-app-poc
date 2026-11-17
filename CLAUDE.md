@@ -107,6 +107,11 @@ is ignored and at least one feed must have `enabled = true`. See
   camera-less environments — don't remove it as part of unrelated work.
 - **`MediaFrame` payloads are `numpy` BGR images** (OpenCV ordering
   convention). When adding overlays, use `app/media/frame_overlay.py`.
+- **The NDI ingest chain's working format is NV12, not BGR** (`[media]
+  working_pixel_format`). Frames stay YUV from `ndisrc` to the d3d11 sinks
+  and the JPEG encoder; don't add a BGR/RGB stage to that path. The
+  record branch's caps and the `qsvjpegenc` key-frame fix are explained in
+  `docs/GSTREAMER_INVARIANTS.md` §1 and §13.
 - **For UI changes, run `python main.py`** and exercise the relevant
   transport (start/stop recording, rewind 10s, slow 1/2x, slow 1/4x,
   jump to live, Replay Play). Type checks won't catch playback
