@@ -281,6 +281,7 @@ def _validate_replay(config: dict[str, Any], *, where: str) -> None:
         "jog_wheel_resume_after_release",
         "step_button_resume_after_click",
         "hold_paused_at_clip_start",
+        "direct_jpeg_decode",
     ):
         if bool_key in config and not isinstance(config[bool_key], bool):
             raise RuntimeError(
@@ -446,6 +447,13 @@ class AppSettings:
     replay_jog_wheel_resume_after_release: bool = True
     replay_step_button_resume_after_click: bool = False
     replay_hold_paused_at_clip_start: bool = True
+    # Replay reads each frame straight from its own JPEG bytes in the
+    # recorded segment (about 8 ms at 1080p for any frame) instead of making
+    # OpenCV seek and decode its way there (~125 ms). Files that can't be
+    # read that way, and frames that fail to decode, use OpenCV regardless.
+    # False forces OpenCV everywhere (`[replay] direct_jpeg_decode = false`).
+    # See docs/REPLAY_RANDOM_ACCESS_DESIGN.md.
+    replay_direct_jpeg_decode: bool = True
     # Phase 14.F: render the legacy diagnostic chrome — the
     # `StatusBarWidget` strip above the Qt status bar, and the
     # referee window's `DiagnosticsWidget` telemetry panel. Off by
@@ -665,6 +673,10 @@ class AppSettings:
             if "hold_paused_at_clip_start" in replay_config:
                 settings.replay_hold_paused_at_clip_start = bool(
                     replay_config["hold_paused_at_clip_start"]
+                )
+            if "direct_jpeg_decode" in replay_config:
+                settings.replay_direct_jpeg_decode = bool(
+                    replay_config["direct_jpeg_decode"]
                 )
 
         if "feed_id" in source_config:

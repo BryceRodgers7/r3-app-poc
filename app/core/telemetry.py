@@ -40,6 +40,27 @@ DROPPED_BUFFERS_DEGRADED_THRESHOLD = 1.0  # buffers/sec sustained → DEGRADED
 # default 5s disk-tick interval ≈ 15 s of sustained overrun.
 DISK_SLOW_STREAK_THRESHOLD = 3
 
+# Recording backlog (how much video is waiting in the recording queue for the
+# encoder and the disk). The queue is deliberately non-leaky and holds at most
+# one segment (§4.4); when it fills, the shared tee blocks, and with it the
+# ingest and the preview. These thresholds surface that BEFORE it happens, and
+# keep a full queue from being mistaken for a lost source.
+#
+# `RECORD_BEHIND_WARN_SECONDS` / `_CLEAR_SECONDS` are the operator-warning
+# thresholds (with hysteresis); `RECORD_BEHIND_STREAK` is how many consecutive
+# samples (1 s each) must agree before the warning opens or clears.
+RECORD_BEHIND_WARN_SECONDS = 1.0
+RECORD_BEHIND_CLEAR_SECONDS = 0.5
+RECORD_BEHIND_STREAK = 2
+# A queue this full (of its time window or its buffer count) is holding the
+# live pipeline: the ingest stalls because it is blocked, not because the
+# source went away.
+RECORD_BACKPRESSURE_FRACTION = 0.9
+# Back-pressured AND recording nothing for this many consecutive samples (1 s
+# each) means the recording branch is wedged, not just slow; only then is the
+# feed treated as lost (and rebuilt) while its queue is full.
+RECORD_STUCK_SAMPLES = 15
+
 
 class RateCounter:
     """Rolling-window event-rate counter using monotonic time.
@@ -121,6 +142,11 @@ class FeedMetricsSnapshot:
     queue_depth_recording: int = 0
     queue_max_preview: int = 0
     queue_max_recording: int = 0
+    # The recording queue by time: how much video is waiting in it, and the
+    # window it is allowed to hold before it blocks. The window (one segment)
+    # is what fills first, long before the buffer count does.
+    queue_time_recording_ms: float = 0.0
+    queue_max_time_recording_ms: float = 0.0
     # Ingest `videorate` drop / duplicate rates (native sources only).
     # Sustained duplicates with a healthy `source_fps` mean the sender's
     # PTS are uneven — see docs/NDI_LOW_FPS_INVESTIGATION.md.
@@ -141,6 +167,26 @@ class FeedMetricsSnapshot:
             100.0,
             (self.queue_depth_recording / self.queue_max_recording) * 100.0,
         )
+
+    @property
+    def record_backlog_seconds(self) -> float:
+        """Seconds of video waiting in the recording queue (how far recording lags live)."""
+        return max(0.0, self.queue_time_recording_ms) / 1000.0
+
+    @property
+    def record_backlog_fraction(self) -> float:
+        """How full the recording queue is by whichever limit it reaches first (0.0-1.0).
+
+        The time window (one segment) binds long before the buffer count does,
+        so `record_queue_saturation_pct` (buffers only) stays low while the
+        queue is already blocking the pipeline.
+        """
+        fractions = []
+        if self.queue_max_time_recording_ms > 0:
+            fractions.append(self.queue_time_recording_ms / self.queue_max_time_recording_ms)
+        if self.queue_max_recording > 0:
+            fractions.append(self.queue_depth_recording / self.queue_max_recording)
+        return min(1.0, max(fractions, default=0.0))
 
     @property
     def preview_queue_saturation_pct(self) -> float:
@@ -185,6 +231,8 @@ class FeedMetrics:
         "_queue_depth_recording",
         "_queue_max_preview",
         "_queue_max_recording",
+        "_queue_time_recording_ms",
+        "_queue_max_time_recording_ms",
         "_clock",
         "_rate_totals",
         "_rate_dropped_per_sec",
@@ -216,6 +264,8 @@ class FeedMetrics:
         self._queue_depth_recording = 0
         self._queue_max_preview = 0
         self._queue_max_recording = 0
+        self._queue_time_recording_ms = 0.0
+        self._queue_max_time_recording_ms = 0.0
         self._clock = clock or time.monotonic
         # (sample time, dropped total, duplicated total) from the last
         # `set_rate_conversion_totals` call; None until the first sample.
@@ -265,6 +315,11 @@ class FeedMetrics:
         self._queue_max_preview = max(0, int(preview_max_buffers))
         self._queue_max_recording = max(0, int(recording_max_buffers))
 
+    def set_queue_time(self, *, recording_ms: float = 0.0, recording_max_ms: float = 0.0) -> None:
+        """Update the recording queue's time level and window (milliseconds)."""
+        self._queue_time_recording_ms = max(0.0, float(recording_ms))
+        self._queue_max_time_recording_ms = max(0.0, float(recording_max_ms))
+
     def set_rate_conversion_totals(self, *, dropped: int, duplicated: int) -> None:
         """Update drop / duplicate rates from `videorate`'s cumulative counters.
 
@@ -303,6 +358,8 @@ class FeedMetrics:
             queue_depth_recording=self._queue_depth_recording,
             queue_max_preview=self._queue_max_preview,
             queue_max_recording=self._queue_max_recording,
+            queue_time_recording_ms=self._queue_time_recording_ms,
+            queue_max_time_recording_ms=self._queue_max_time_recording_ms,
             rate_dropped_per_sec=self._rate_dropped_per_sec,
             rate_duplicated_per_sec=self._rate_duplicated_per_sec,
         )
@@ -571,6 +628,16 @@ class TelemetryHub:
         # Streak counters for the §4.4 saturation health rules.
         self._record_saturated_streak: dict[str, int] = {}
         self._preview_saturated_streak: dict[str, int] = {}
+        # Recording-backlog warning state, per feed: consecutive samples at /
+        # above the warn level and below the clear level, and consecutive
+        # samples at the back-pressure level.
+        self._record_behind_streak: dict[str, int] = {}
+        self._record_clear_streak: dict[str, int] = {}
+        self._record_backpressure_streak: dict[str, int] = {}
+        # Feeds whose zero-ingest stall is being held as back-pressure rather
+        # than declared lost: feed_id -> consecutive samples in which the
+        # recording branch also produced nothing.
+        self._backpressure_hold: dict[str, int] = {}
         self._recording_state: StateMachine[Any] | None = None
         # Phase 10.D: aggregate disk-write budget (MB/s) the
         # `_evaluate_disk_throughput` rule compares against. None
@@ -714,7 +781,8 @@ class TelemetryHub:
         for snap in self.snapshot():
             LOGGER.info(
                 "telemetry feed_id=%s source_fps=%.2f preview_fps=%.2f recording_fps=%.2f "
-                "vrate_drop_per_s=%.2f vrate_dup_per_s=%.2f qprv=%d/%d qrec=%d/%d",
+                "vrate_drop_per_s=%.2f vrate_dup_per_s=%.2f qprv=%d/%d qrec=%d/%d "
+                "qrec_s=%.1f",
                 snap.feed_id,
                 snap.source_fps,
                 snap.preview_fps,
@@ -725,9 +793,11 @@ class TelemetryHub:
                 snap.queue_max_preview,
                 snap.queue_depth_recording,
                 snap.queue_max_recording,
+                snap.record_backlog_seconds,
             )
             self._evaluate_feed_health(snap)
             self._evaluate_queue_saturation(snap)
+            self._evaluate_recording_backlog(snap)
         for lat in latency_snapshots():
             if lat.count == 0:
                 continue
@@ -765,6 +835,10 @@ class TelemetryHub:
             metrics.set_queue_capacity(
                 preview_max_buffers=int(preview.get("max_buffers", 0) or 0),
                 recording_max_buffers=int(record.get("max_buffers", 0) or 0),
+            )
+            metrics.set_queue_time(
+                recording_ms=float(record.get("time_ns", 0) or 0) / 1_000_000.0,
+                recording_max_ms=float(record.get("max_time_ns", 0) or 0) / 1_000_000.0,
             )
 
     def _refresh_rate_conversion(self) -> None:
@@ -883,30 +957,15 @@ class TelemetryHub:
         if snap.source_fps == 0.0:
             streak = self._zero_fps_streak.get(snap.feed_id, 0) + 1
             self._zero_fps_streak[snap.feed_id] = streak
-            if streak == FEED_LOST_ZERO_SAMPLES:
-                if feed_state is not None:
-                    if feed_state.state in {FeedState.LIVE, FeedState.DEGRADED}:
-                        feed_state.transition_to(FeedState.DISCONNECTED)
-                elif not self._health_log.has_open_event(
-                    category="feed_lost", feed_id=snap.feed_id
-                ):
-                    # Legacy path for hubs without a registered state machine
-                    # (kept for tests and tooling that exercise the hub
-                    # directly).
-                    self._health_log.record(
-                        severity=HealthSeverity.WARNING,
-                        category="feed_lost",
-                        message=(
-                            f"No frames observed from {snap.display_name} "
-                            f"for {streak}s."
-                        ),
-                        feed_id=snap.feed_id,
-                    )
+            holding = snap.feed_id in self._backpressure_hold
+            if streak == FEED_LOST_ZERO_SAMPLES or holding:
+                self._decide_zero_ingest(snap, feed_state, streak, holding)
             return
 
         # source_fps > 0
         if self._zero_fps_streak.get(snap.feed_id):
             self._zero_fps_streak[snap.feed_id] = 0
+        self._backpressure_hold.pop(snap.feed_id, None)
 
         if feed_state is None:
             # Legacy recovery path (no state machine registered).
@@ -931,6 +990,159 @@ class TelemetryHub:
         else:
             if feed_state.state == FeedState.DEGRADED:
                 feed_state.transition_to(FeedState.LIVE)
+
+    def _decide_zero_ingest(
+        self,
+        snap: FeedMetricsSnapshot,
+        feed_state: StateMachine[FeedState] | None,
+        streak: int,
+        holding: bool,
+    ) -> None:
+        """No ingest frames for `FEED_LOST_ZERO_SAMPLES` samples: lost source, or back-pressure?
+
+        A full recording queue blocks the shared tee, and the ingest probe
+        sits in the path that blocks, so a backed-up recording branch makes
+        the ingest read zero too. Rebuilding the feed then fixes nothing (the
+        machine is just behind) and adds work, which is how one hiccup used to
+        snowball. So while the recording queue is full and the recording
+        branch is still producing frames, the stall is held as back-pressure
+        (`recording_backpressure` is the operator-visible event) and the feed
+        stays as it is. The feed is declared lost only when
+
+        - the queue is NOT full (nothing is holding the pipeline, so the
+          source really has stopped), or
+        - the queue is full but the recording branch has produced nothing for
+          `RECORD_STUCK_SAMPLES` samples (it is wedged, not slow).
+        """
+        feed_id = snap.feed_id
+        backpressured = snap.record_backlog_fraction >= RECORD_BACKPRESSURE_FRACTION
+        if backpressured:
+            if not holding:
+                LOGGER.warning(
+                    "telemetry: %s has had no ingest frames for %ds but its recording "
+                    "queue is full (%.1f s behind); treating it as back-pressure, not a "
+                    "lost source",
+                    snap.display_name,
+                    streak,
+                    snap.record_backlog_seconds,
+                )
+                self._backpressure_hold[feed_id] = 0
+            stuck = self._backpressure_hold[feed_id]
+            stuck = stuck + 1 if snap.recording_fps == 0.0 else 0
+            self._backpressure_hold[feed_id] = stuck
+            if stuck < RECORD_STUCK_SAMPLES:
+                return
+            LOGGER.warning(
+                "telemetry: %s recording queue is full and nothing has been recorded "
+                "for %d s; the recording branch looks wedged, declaring the feed lost",
+                snap.display_name,
+                stuck,
+            )
+        elif holding:
+            LOGGER.warning(
+                "telemetry: %s recording queue has drained but no ingest frames have "
+                "resumed; declaring the feed lost",
+                snap.display_name,
+            )
+        self._backpressure_hold.pop(feed_id, None)
+        self._declare_feed_lost(snap, feed_state, streak)
+
+    def _declare_feed_lost(
+        self,
+        snap: FeedMetricsSnapshot,
+        feed_state: StateMachine[FeedState] | None,
+        streak: int,
+    ) -> None:
+        if feed_state is not None:
+            if feed_state.state in {FeedState.LIVE, FeedState.DEGRADED}:
+                feed_state.transition_to(FeedState.DISCONNECTED)
+        elif not self._health_log.has_open_event(category="feed_lost", feed_id=snap.feed_id):
+            # Legacy path for hubs without a registered state machine
+            # (kept for tests and tooling that exercise the hub
+            # directly).
+            self._health_log.record(
+                severity=HealthSeverity.WARNING,
+                category="feed_lost",
+                message=f"No frames observed from {snap.display_name} for {streak}s.",
+                feed_id=snap.feed_id,
+            )
+
+    def _evaluate_recording_backlog(self, snap: FeedMetricsSnapshot) -> None:
+        """Warn the operator while recording falls behind live, before the pipeline stalls.
+
+        `recording_behind` (WARNING) opens after `RECORD_BEHIND_STREAK` samples
+        with at least `RECORD_BEHIND_WARN_SECONDS` of video waiting in the
+        recording queue; `recording_backpressure` (ERROR) opens when the queue
+        is full enough that it is holding the live pipeline. Both clear after
+        `RECORD_BEHIND_STREAK` samples below `RECORD_BEHIND_CLEAR_SECONDS`, so
+        the banner doesn't flap. Neither changes any state machine: a recording
+        that is merely behind is still a recording (the §4.4 saturation rule,
+        which does end the recording state, is separate and unchanged).
+        """
+        feed_id = snap.feed_id
+        backlog = snap.record_backlog_seconds
+        has_time_data = snap.queue_max_time_recording_ms > 0
+
+        recording_state = self._recording_state
+        if recording_state is not None:
+            from app.core.recording_state import RecordingState  # see `_evaluate_queue_saturation`
+
+            if recording_state.state != RecordingState.RECORDING:
+                # Not recording: a queue that fills at startup or around Stop
+                # is not a recording problem. Drop any warning left over.
+                self._record_behind_streak[feed_id] = 0
+                self._record_clear_streak[feed_id] = 0
+                self._record_backpressure_streak[feed_id] = 0
+                self._health_log.clear_open_event(category="recording_behind", feed_id=feed_id)
+                self._health_log.clear_open_event(
+                    category="recording_backpressure", feed_id=feed_id
+                )
+                return
+
+        if has_time_data and backlog >= RECORD_BEHIND_WARN_SECONDS:
+            self._record_behind_streak[feed_id] = self._record_behind_streak.get(feed_id, 0) + 1
+            self._record_clear_streak[feed_id] = 0
+        elif not has_time_data or backlog < RECORD_BEHIND_CLEAR_SECONDS:
+            self._record_clear_streak[feed_id] = self._record_clear_streak.get(feed_id, 0) + 1
+            self._record_behind_streak[feed_id] = 0
+        else:  # between the two levels: neither opening nor clearing
+            self._record_behind_streak[feed_id] = 0
+            self._record_clear_streak[feed_id] = 0
+
+        if has_time_data and snap.record_backlog_fraction >= RECORD_BACKPRESSURE_FRACTION:
+            self._record_backpressure_streak[feed_id] = (
+                self._record_backpressure_streak.get(feed_id, 0) + 1
+            )
+        else:
+            self._record_backpressure_streak[feed_id] = 0
+
+        if self._record_behind_streak.get(feed_id, 0) >= RECORD_BEHIND_STREAK and not (
+            self._health_log.has_open_event(category="recording_behind", feed_id=feed_id)
+        ):
+            self._health_log.record(
+                severity=HealthSeverity.WARNING,
+                category="recording_behind",
+                message=(
+                    f"Recording is {backlog:.1f} s behind live on {snap.display_name} "
+                    f"(this machine can't keep up with the video)."
+                ),
+                feed_id=feed_id,
+            )
+        if self._record_backpressure_streak.get(feed_id, 0) >= RECORD_BEHIND_STREAK and not (
+            self._health_log.has_open_event(category="recording_backpressure", feed_id=feed_id)
+        ):
+            self._health_log.record(
+                severity=HealthSeverity.ERROR,
+                category="recording_backpressure",
+                message=(
+                    f"Recording queue full on {snap.display_name} ({backlog:.1f} s behind): "
+                    f"live video may stall until it catches up."
+                ),
+                feed_id=feed_id,
+            )
+        if self._record_clear_streak.get(feed_id, 0) >= RECORD_BEHIND_STREAK:
+            self._health_log.clear_open_event(category="recording_behind", feed_id=feed_id)
+            self._health_log.clear_open_event(category="recording_backpressure", feed_id=feed_id)
 
     def _log_disk_snapshot(self) -> None:
         """Sample disk usage and emit one INFO log line."""

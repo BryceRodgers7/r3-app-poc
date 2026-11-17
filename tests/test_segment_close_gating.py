@@ -370,27 +370,66 @@ class SplitmuxsinkBoundsContractTests(unittest.TestCase):
         from app.media.segment_decoder import SegmentDecoder
         from app.storage.segment_replay_store import SegmentReplayLocation
 
+        import numpy as np
+
+        from app.media.mkv_timestamps import read_video_frame_index
+
         capture = cv2.VideoCapture(path)
         truth = []
+        opencv_images = []
         while True:
             ok, image = capture.read()
             if not ok:
                 break
             truth.append(hashlib.md5(image.tobytes()).hexdigest())
+            opencv_images.append(image)
         capture.release()
         order = list(range(len(truth) - 1, -1, -1)) + random.Random(7).sample(range(len(truth)), len(truth))
-        decoder = SegmentDecoder("ndi_1", "ndi_1")
         segment = SimpleNamespace(file_path=path)
+
+        def decode(decoder: SegmentDecoder, k: int):
+            return decoder.decode(
+                SegmentReplayLocation(segment=segment, offset_in_segment_ns=0, frame_index=k)
+            )
+
+        # Read through OpenCV (seeks and skips), the picture is bit-for-bit what
+        # a plain sequential read gives.
+        decoder = SegmentDecoder("ndi_1", "ndi_1", direct_decode=False)
         try:
             wrong = [
                 k for k in order
-                if (frame := decoder.decode(
-                    SegmentReplayLocation(segment=segment, offset_in_segment_ns=0, frame_index=k)
-                )) is None or hashlib.md5(frame.image.tobytes()).hexdigest() != truth[k]
+                if (frame := decode(decoder, k)) is None
+                or hashlib.md5(frame.image.tobytes()).hexdigest() != truth[k]
             ]
         finally:
             decoder.close()
-        self.assertEqual(wrong, [], "frames the decoder got wrong")
+        self.assertEqual(wrong, [], "frames the decoder got wrong (OpenCV path)")
+
+        # Read straight from the frames' own JPEG bytes (the default), each frame
+        # is exactly that frame's JPEG decoded, and close to what OpenCV shows
+        # (the two JPEG decoders differ slightly in rounding).
+        index = read_video_frame_index(path)
+        assert index is not None
+        data = Path(path).read_bytes()
+        decoder = SegmentDecoder("ndi_1", "ndi_1")
+        try:
+            wrong = []
+            for k in order:
+                frame = decode(decoder, k)
+                expected = cv2.imdecode(
+                    np.frombuffer(data[index.offsets[k]:index.offsets[k] + index.sizes[k]], dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+                if frame is None or not np.array_equal(frame.image, expected):
+                    wrong.append(k)
+                    continue
+                difference = np.abs(frame.image.astype(np.int16) - opencv_images[k].astype(np.int16))
+                if float(difference.mean()) > 2.0:
+                    wrong.append(k)
+            assert decoder._open is not None and decoder._open.direct is not None, "not read directly"
+        finally:
+            decoder.close()
+        self.assertEqual(wrong, [], "frames the decoder got wrong (direct path)")
 
 
 if __name__ == "__main__":

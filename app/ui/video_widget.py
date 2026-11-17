@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import cv2
+import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QEventPoint,
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.models import MediaFrame
+from app.core.models import FittedImage, MediaFrame
 from app.ui.feed_view import (
     CROP_LEVELS,
     FeedView,
@@ -48,6 +49,16 @@ _TOUCH_EVENT_TYPES = frozenset(
         QEvent.Type.TouchCancel,
     }
 )
+
+
+def fit_size(
+    source_width: int, source_height: int, box_width: int, box_height: int
+) -> tuple[int, int]:
+    """The largest size with the source's aspect ratio that fits the box."""
+    fitted = QSize(source_width, source_height).scaled(
+        QSize(box_width, box_height), Qt.AspectRatioMode.KeepAspectRatio
+    )
+    return fitted.width(), fitted.height()
 
 
 class VideoWidget(QWidget):
@@ -111,6 +122,12 @@ class VideoWidget(QWidget):
         # every new frame.
         self._current_bgr: Any = None
         self._current_image: QImage | None = None
+        # Size of the label the picture is fitted into, as last seen on the
+        # UI thread. A worker thread reads it to scale replay frames ahead of
+        # time (`prepare_for_display`); the UI thread re-checks it against the
+        # real label size before using the result, so a stale value only
+        # costs a re-scale, never a wrongly sized picture.
+        self._fit_box: tuple[int, int] | None = None
         self._showing_video_surface = False
         # `qimage` (legacy / python_push sources) renders frames into the
         # QLabel via QImage. `native` (3.A.3+ native sources) lets a
@@ -431,16 +448,77 @@ class VideoWidget(QWidget):
         """
         if self._render_mode == "native" and self._showing_video_surface:
             self._surface_stack.setCurrentWidget(self._frame_label)
-        # Replay runs this once per feed per tick on the UI thread, so it
-        # is the hot path: no full-resolution RGB conversion, QImage copy or
-        # Qt smooth-scale here (see `_fit_pixmap`).
+        # Replay runs this once per feed per frame on the UI thread, so it
+        # is the hot path: no full-resolution QImage copy or Qt smooth-scale
+        # here. A frame that a worker thread already scaled to this tile
+        # (`prepare_for_display`) only needs handing to Qt; anything else is
+        # scaled here (see `_fit_pixmap`).
         self._current_bgr = frame.image_bgr
         self._current_image = None
+        self._fit_box = self._label_box()
+        if frame.fitted is not None and self._show_fitted(frame.fitted):
+            return
         self._refresh_pixmap()
+
+    def prepare_for_display(self, frame: MediaFrame) -> MediaFrame:
+        """Scale `frame` to this tile ahead of `display_frame`; safe off the UI thread.
+
+        Sets `frame.fitted` when the tile is showing the whole picture. A
+        zoomed tile, or one that has not been sized yet, is left for
+        `display_frame` to handle on the UI thread.
+        """
+        box = self._fit_box
+        if box is None or box[0] <= 0 or box[1] <= 0 or self._view.is_zoomed:
+            return frame
+        bgr = frame.image_bgr
+        source_height, source_width = bgr.shape[:2]
+        width, height = fit_size(source_width, source_height, box[0], box[1])
+        if width <= 0 or height <= 0:
+            return frame
+        if (width, height) != (source_width, source_height):
+            shrinking = width < source_width or height < source_height
+            bgr = cv2.resize(
+                bgr,
+                (width, height),
+                interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
+            )
+        frame.fitted = FittedImage(width, height, np.ascontiguousarray(bgr))
+        return frame
+
+    def _label_box(self) -> tuple[int, int]:
+        size = self._frame_label.size()
+        return size.width(), size.height()
+
+    def _show_fitted(self, fitted: FittedImage) -> bool:
+        """Show a frame a worker already scaled, if it still fits this tile."""
+        if self._view.is_zoomed:
+            return False
+        box_width, box_height = self._label_box()
+        source_height, source_width = self._current_bgr.shape[:2]
+        if fit_size(source_width, source_height, box_width, box_height) != (
+            fitted.width,
+            fitted.height,
+        ):
+            return False
+        self._frame_label.setText("")
+        self._frame_label.setPixmap(self._pixmap_from_bgr(fitted.bgr, fitted.width, fitted.height))
+        return True
+
+    @staticmethod
+    def _pixmap_from_bgr(bgr: Any, width: int, height: int) -> QPixmap:
+        """A pixmap from BGR pixels, with no colour conversion step.
+
+        Qt can read BGR directly, so there is no cv2.cvtColor pass over the
+        frame. The pixmap copies the pixels, so `bgr` is free afterwards.
+        """
+        return QPixmap.fromImage(
+            QImage(bgr.data, width, height, 3 * width, QImage.Format.Format_BGR888)
+        )
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         """Keep the rendered frame scaled to the current widget size."""
         super().resizeEvent(event)
+        self._fit_box = self._label_box()
         self._refresh_pixmap()
         self._push_native_render_rect()
         if self._zoom_pan_aspect_ratio is not None and self._has_area():
@@ -451,31 +529,29 @@ class VideoWidget(QWidget):
     def _full_image(self) -> QImage | None:
         """The current frame as a full-resolution QImage (zoom path only)."""
         if self._current_image is None and self._current_bgr is not None:
-            rgb_image = cv2.cvtColor(self._current_bgr, cv2.COLOR_BGR2RGB)
-            height, width, channels = rgb_image.shape
+            bgr = np.ascontiguousarray(self._current_bgr)
+            height, width, channels = bgr.shape
             self._current_image = QImage(
-                rgb_image.data,
+                bgr.data,
                 width,
                 height,
                 channels * width,
-                QImage.Format.Format_RGB888,
+                QImage.Format.Format_BGR888,
             ).copy()
         return self._current_image
 
     def _fit_pixmap(self) -> QPixmap:
         """The current frame scaled to fit the tile, aspect ratio kept.
 
-        Scaled with cv2 before it becomes a QImage/QPixmap, so the colour
-        conversion and pixmap upload work on tile-sized data. INTER_AREA is
-        the quality choice for shrinking, which is almost always the case
-        (720p footage in a tile smaller than the window).
+        Scaled with cv2 before it becomes a QImage/QPixmap, so the pixmap
+        upload works on tile-sized data. INTER_AREA is the quality choice
+        for shrinking, which is almost always the case (720p footage in a
+        tile smaller than the window). Qt reads the BGR pixels as they are.
         """
         bgr = self._current_bgr
         source_height, source_width = bgr.shape[:2]
-        fitted = QSize(source_width, source_height).scaled(
-            self._frame_label.size(), Qt.AspectRatioMode.KeepAspectRatio
-        )
-        width, height = fitted.width(), fitted.height()
+        box_width, box_height = self._label_box()
+        width, height = fit_size(source_width, source_height, box_width, box_height)
         if width <= 0 or height <= 0:
             return QPixmap()  # nothing to draw into (a zero-size tile)
         if (width, height) != (source_width, source_height):
@@ -485,10 +561,7 @@ class VideoWidget(QWidget):
                 (width, height),
                 interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
             )
-        rgb_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return QPixmap.fromImage(
-            QImage(rgb_image.data, width, height, 3 * width, QImage.Format.Format_RGB888)
-        )
+        return self._pixmap_from_bgr(np.ascontiguousarray(bgr), width, height)
 
     def _scaled_display_pixmap(self) -> QPixmap | None:
         if self._current_bgr is None:

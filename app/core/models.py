@@ -45,6 +45,20 @@ class IngestTelemetry:
         return f"Raw {raw_part} → target {target_part}"
 
 
+@dataclass(slots=True, frozen=True)
+class FittedImage:
+    """A frame already scaled to the size of the tile that will show it.
+
+    Replay builds this on a worker thread (`VideoWidget.prepare_for_display`)
+    so the UI thread only has to hand the pixels to Qt. `bgr` is
+    `width` x `height` pixels, in the same OpenCV BGR order as the frame.
+    """
+
+    width: int
+    height: int
+    bgr: FrameArray
+
+
 @dataclass(slots=True)
 class MediaFrame:
     """A single timestamped frame delivered through the temporary media layer.
@@ -52,6 +66,10 @@ class MediaFrame:
     The OpenCV-backed `image` payload is temporary for this milestone. Later
     GStreamer tee/fan-out and NDI integration can plug in behind the same
     lightweight frame contract.
+
+    `fitted` is set only on replay frames, by the renderer, when a worker
+    thread has already scaled the picture to its tile; the widget checks it
+    still fits before using it.
     """
 
     frame_id: int
@@ -59,6 +77,7 @@ class MediaFrame:
     image: FrameArray
     source_name: str
     feed_id: str = "default"
+    fitted: FittedImage | None = None
 
     @property
     def image_bgr(self) -> FrameArray:

@@ -45,23 +45,38 @@ Design choices (per the §4.C.tail trade-offs in
   (`CAP_PROP_POS_MSEC`) and reads forward to k. Without them (other
   containers, unreadable files, test stubs) the frame-rate arithmetic
   above is used.
+- **Direct JPEG decode when the file allows it.** Every recorded frame is a
+  standalone JPEG, so there is no need to make OpenCV decode its way to
+  frame k. When the mkv's block index says where each frame's bytes are (and
+  they are JPEG), the decoder reads just those bytes and decodes them: about
+  8 ms at 1080p for ANY frame, with no seek and no skipped-frame decodes.
+  OpenCV's seek costs ~125 ms at 1080p (it steps back ~16 frames), and skipping
+  decodes every skipped frame, which made replay collapse once a tick ran
+  longer than ~8 frames. See docs/REPLAY_RANDOM_ACCESS_DESIGN.md. Files that
+  don't qualify, and any frame that fails to decode, use the OpenCV path
+  described above, which stays as the fallback.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
+import threading
 import time
-from typing import Any
+from typing import Any, BinaryIO
 
 import bisect
 
 import numpy as np
 
 from app.core.models import MediaFrame
-from app.media.mkv_timestamps import read_video_timestamps_ms
+from app.media.mkv_timestamps import (
+    MkvFrameIndex,
+    read_video_frame_index,
+    read_video_timestamps_ms,
+)
 from app.storage.segment_replay_store import SegmentReplayLocation
 
 LOGGER = logging.getLogger(__name__)
@@ -80,18 +95,109 @@ _MAX_READ_FROM_START_FRAMES = 300
 # rows by two or three (docs/REPLAY_SEAM_GLITCH.md §2.3).
 _MAX_END_BACKTRACK_FRAMES = 3
 
+# Decoded frames kept per open segment, so stepping back and forth over a few
+# frames (or two requests landing on one frame) decodes nothing twice.
+_DIRECT_CACHE_FRAMES = 3
+
+_JPEG_SOI = b"\xff\xd8\xff"
+
+
+class _DirectJpegFrames:
+    """Decodes single frames of a segment straight from their JPEG bytes.
+
+    Holds the segment file open and the block index that says where each
+    frame lives. `read(k)` costs one small file read plus one JPEG decode,
+    whichever frame k is.
+    """
+
+    def __init__(self, file_path: str, index: MkvFrameIndex) -> None:
+        self._index = index
+        self._fh: BinaryIO | None = open(file_path, "rb")
+        self.decodes = 0  # frames actually decoded (cache hits not counted)
+        self._cache: dict[int, Any] = {}
+
+    @classmethod
+    def open_if_usable(cls, file_path: str, index: MkvFrameIndex | None) -> "_DirectJpegFrames | None":
+        """The reader for this file, or None when it can't be read frame by frame."""
+        if index is None or index.laced or not index.offsets:
+            return None
+        if len(index.offsets) != len(index.timestamps_ms) or len(index.sizes) != len(index.offsets):
+            return None
+        reader: _DirectJpegFrames | None = None
+        try:
+            reader = cls(file_path, index)
+            # Only MJPEG files qualify; anything else (or a damaged first
+            # frame) goes to OpenCV.
+            if reader._raw(0)[:3] != _JPEG_SOI:
+                reader.close()
+                return None
+            return reader
+        except Exception:
+            LOGGER.debug("SegmentDecoder: direct JPEG access unavailable for %s", file_path, exc_info=True)
+            if reader is not None:
+                reader.close()
+            return None
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._index.offsets)
+
+    def _raw(self, k: int) -> bytes:
+        fh = self._fh
+        if fh is None:
+            raise ValueError("reader is closed")
+        size = self._index.sizes[k]
+        fh.seek(self._index.offsets[k])
+        data = fh.read(size)
+        if size <= 0 or len(data) != size:
+            raise ValueError(f"frame {k} is cut short")
+        return data
+
+    def read(self, k: int) -> Any | None:
+        """BGR image of frame `k`, or None if its bytes are missing or won't decode."""
+        cached = self._cache.get(k)
+        if cached is not None:
+            return cached
+        import cv2  # noqa: WPS433 — local import keeps cv2 optional for stub-driven tests.
+
+        try:
+            data = self._raw(k)
+            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        except Exception:
+            LOGGER.debug("SegmentDecoder: direct decode of frame %d failed", k, exc_info=True)
+            return None
+        if image is None:
+            return None
+        self.decodes += 1
+        if len(self._cache) >= _DIRECT_CACHE_FRAMES:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[k] = image
+        return image
+
+    def close(self) -> None:
+        fh, self._fh = self._fh, None
+        self._cache.clear()
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                LOGGER.debug("SegmentDecoder: closing segment file raised", exc_info=True)
+
 
 @dataclass(slots=True)
 class _OpenSegment:
-    """A `cv2.VideoCapture` paired with the segment file path it points at.
+    """A segment file the decoder is reading: direct JPEG access, an OpenCV capture, or both.
 
-    `fps` and the index fields let `decode` read sequentially instead of
-    seeking. They stay `None` when the backend can't report a frame rate (as
-    with the test stubs), which keeps the original seek-every-time behaviour.
+    `capture` is a `cv2.VideoCapture`, opened lazily when the file is read
+    through OpenCV (a file read directly never needs one). `fps` and the index
+    fields let `decode` read sequentially instead of seeking. They stay `None`
+    when the backend can't report a frame rate (as with the test stubs), which
+    keeps the original seek-every-time behaviour.
     """
 
     file_path: str
-    capture: Any  # cv2.VideoCapture; typed loosely so cv2 stays an optional import.
+    capture: Any  # cv2.VideoCapture or None; typed loosely so cv2 stays an optional import.
+    direct: _DirectJpegFrames | None = field(default=None)
     fps: float | None = None
     next_index: int | None = None  # index the next read() returns
     last_index: int | None = None  # index of `last_image`
@@ -130,13 +236,25 @@ class SegmentDecoder:
         *,
         capture_factory: Callable[[str], Any] | None = None,
         timestamp_reader: Callable[[str], list[float] | None] | None = None,
+        frame_index_reader: Callable[[str], MkvFrameIndex | None] | None = None,
+        direct_decode: bool = True,
     ) -> None:
         self._feed_id = feed_id
         self._source_name = source_name
         self._capture_factory = capture_factory or _default_capture_factory
         self._timestamp_reader = timestamp_reader or read_video_timestamps_ms
+        self._frame_index_reader = frame_index_reader or read_video_frame_index
+        # False keeps every file on the OpenCV path (a way back if direct
+        # decoding ever misbehaves on some footage).
+        self._direct_decode = direct_decode
         self._open: _OpenSegment | None = None
         self._failed_paths: set[str] = set()
+        # Replay decodes on worker threads while a transport click (step,
+        # pause, jump) decodes on the UI thread, and `close()` can arrive from
+        # either. One decoder serves one feed, so serializing its calls costs
+        # nothing and keeps a close from landing in the middle of a read (which
+        # would mark a good file as failed).
+        self._lock = threading.RLock()
 
     def decode(self, location: SegmentReplayLocation) -> MediaFrame | None:
         """Decode the frame at `location.offset_in_segment_ns` of `location.segment.file_path`.
@@ -145,16 +263,20 @@ class SegmentDecoder:
         caller (the replay clock) should fall back to its previous
         behavior — typically "keep the last shown frame".
         """
+        with self._lock:
+            return self._decode_locked(location)
+
+    def _decode_locked(self, location: SegmentReplayLocation) -> MediaFrame | None:
         file_path = location.segment.file_path
         if file_path in self._failed_paths:
             return None
-        capture = self._ensure_open(file_path)
-        if capture is None:
+        seg = self._ensure_open(file_path)
+        if seg is None:
             return None
         offset_ms = max(0.0, location.offset_in_segment_ns / 1_000_000.0)
         frame_index = getattr(location, "frame_index", None)
         try:
-            frame_bgr = self._read_frame(self._open, offset_ms, frame_index)
+            frame_bgr = self._read_frame(seg, offset_ms, frame_index)
         except Exception:
             LOGGER.exception("SegmentDecoder.read failed for %s", file_path)
             self._failed_paths.add(file_path)
@@ -179,11 +301,12 @@ class SegmentDecoder:
 
         Idempotent. `decode()` will reopen on the next call.
         """
-        self._close_locked()
+        with self._lock:
+            self._close_locked()
 
-    def _ensure_open(self, file_path: str) -> Any | None:
+    def _ensure_open(self, file_path: str) -> _OpenSegment | None:
         if self._open is not None and self._open.file_path == file_path:
-            return self._open.capture
+            return self._open
         # Different file (or first call) — close any existing handle and
         # open the new one.
         self._close_locked()
@@ -191,31 +314,88 @@ class SegmentDecoder:
             LOGGER.warning("SegmentDecoder: file does not exist: %s", file_path)
             self._failed_paths.add(file_path)
             return None
+        seg = self._open_direct(file_path) if self._direct_decode else None
+        if seg is None:
+            seg = self._open_with_capture(file_path)
+        self._open = seg
+        return seg
+
+    def _open_direct(self, file_path: str) -> _OpenSegment | None:
+        """An open segment read straight from its JPEG bytes, or None if the file can't be."""
         try:
-            capture = self._capture_factory(file_path)
+            index = self._frame_index_reader(file_path)
         except Exception:
-            LOGGER.exception("SegmentDecoder: capture_factory raised for %s", file_path)
-            self._failed_paths.add(file_path)
+            LOGGER.debug("SegmentDecoder: frame index read failed for %s", file_path, exc_info=True)
             return None
-        if capture is None or not _is_capture_open(capture):
-            LOGGER.warning("SegmentDecoder: failed to open %s", file_path)
-            self._failed_paths.add(file_path)
+        direct = _DirectJpegFrames.open_if_usable(file_path, index)
+        if direct is None:
             return None
-        fps = _capture_fps(capture)
-        timestamps_ms: list[float] | None = None
+        assert index is not None
+        return _OpenSegment(
+            file_path=file_path,
+            capture=None,  # opened only if direct reading fails (`_leave_direct`)
+            direct=direct,
+            frame_total=direct.frame_count,
+            timestamps_ms=index.timestamps_ms,
+        )
+
+    def _open_with_capture(self, file_path: str) -> _OpenSegment | None:
+        seg = _OpenSegment(file_path=file_path, capture=None)
         try:
-            timestamps_ms = self._timestamp_reader(file_path)
+            seg.timestamps_ms = self._timestamp_reader(file_path) or None
         except Exception:
             LOGGER.debug("SegmentDecoder: timestamp read failed for %s", file_path, exc_info=True)
-        self._open = _OpenSegment(
-            file_path=file_path,
-            capture=capture,
-            fps=fps,
-            next_index=0 if (fps or timestamps_ms) else None,
-            frame_total=len(timestamps_ms) if timestamps_ms else None,
-            timestamps_ms=timestamps_ms or None,
+        if not self._attach_capture(seg):
+            self._failed_paths.add(file_path)
+            return None
+        return seg
+
+    def _attach_capture(self, seg: _OpenSegment) -> bool:
+        """Open the OpenCV capture for `seg` and set up its read-position tracking."""
+        try:
+            capture = self._capture_factory(seg.file_path)
+        except Exception:
+            LOGGER.exception("SegmentDecoder: capture_factory raised for %s", seg.file_path)
+            return False
+        if capture is None or not _is_capture_open(capture):
+            LOGGER.warning("SegmentDecoder: failed to open %s", seg.file_path)
+            return False
+        seg.capture = capture
+        seg.fps = _capture_fps(capture)
+        seg.next_index = 0 if (seg.fps or seg.timestamps_ms) else None
+        seg.frame_total = len(seg.timestamps_ms) if seg.timestamps_ms else None
+        seg.primed = False
+        return True
+
+    def _leave_direct(self, seg: _OpenSegment) -> bool:
+        """Stop reading `seg` from its JPEG bytes; read it through OpenCV from here on."""
+        LOGGER.warning(
+            "SegmentDecoder: direct JPEG decode failed for %s; using OpenCV for this file",
+            seg.file_path,
         )
-        return capture
+        if seg.direct is not None:
+            seg.direct.close()
+            seg.direct = None
+        return self._attach_capture(seg)
+
+    def _read_frame_direct(
+        self, seg: _OpenSegment, offset_ms: float, frame_index: int | None
+    ) -> Any | None:
+        """Frame `frame_index` (or the one nearest `offset_ms`), decoded from its own bytes."""
+        stamps = seg.timestamps_ms
+        direct = seg.direct
+        assert stamps is not None and direct is not None
+        last = len(stamps) - 1
+        if frame_index is not None:
+            target = min(max(0, int(frame_index)), last)  # past the end -> the last frame
+        else:
+            target = _nearest_index(stamps, offset_ms)
+        if seg.last_image is not None and target == seg.last_index:
+            return seg.last_image  # paused, or two ticks inside one frame
+        frame = direct.read(target)
+        if frame is not None:
+            seg.last_index, seg.last_image = target, frame
+        return frame
 
     def _read_frame(
         self, seg: _OpenSegment, offset_ms: float, frame_index: int | None = None
@@ -226,6 +406,13 @@ class SegmentDecoder:
         `None` only when the capture has nothing to give (corrupt file, or
         a target far beyond the end).
         """
+        if seg.direct is not None:
+            frame = self._read_frame_direct(seg, offset_ms, frame_index)
+            if frame is not None:
+                return frame
+            if not self._leave_direct(seg):
+                self._failed_paths.add(seg.file_path)
+                return None
         if seg.timestamps_ms is not None:
             return self._read_frame_by_timestamps(seg, offset_ms, frame_index)
         if not seg.fps:
@@ -418,10 +605,13 @@ class SegmentDecoder:
     def _close_locked(self) -> None:
         if self._open is None:
             return
-        try:
-            self._open.capture.release()
-        except Exception:
-            LOGGER.debug("SegmentDecoder: capture.release raised", exc_info=True)
+        if self._open.direct is not None:
+            self._open.direct.close()
+        if self._open.capture is not None:
+            try:
+                self._open.capture.release()
+            except Exception:
+                LOGGER.debug("SegmentDecoder: capture.release raised", exc_info=True)
         self._open = None
 
 

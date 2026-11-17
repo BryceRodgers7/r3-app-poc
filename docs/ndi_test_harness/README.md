@@ -92,3 +92,24 @@ R3_REPO="$PWD/base" $python <harness>/cycle.py > run.log 2>&1
 
 Runs leave files in `%TEMP%/r3-app-unrouted-segments`. Delete `base_data_dir` and
 that folder afterwards.
+
+## Replay performance tools (read-only)
+
+Used to measure replay and live-pipeline cost (see
+[`../REPLAY_RANDOM_ACCESS_DESIGN.md`](../REPLAY_RANDOM_ACCESS_DESIGN.md)). None of
+them changes the app or its files.
+
+- `sample_app.ps1 -AppPid N -VlcPid N -Seconds 30` samples a running app: process and
+  per-thread CPU, system CPU, GPU engine use, and the last telemetry lines.
+- `replay_accept_check.py [--seconds 60] [--end HH:MM:SS]` reads `app.log` and prints
+  PASS/FAIL for the replay acceptance test: replay shows >= 20 frames/s per feed (from
+  the app's `replay frames ... shown_fps=` lines; older logs: tick interval <= 50 ms),
+  recording queue < 20/256, `source_fps` >= 29.5 on every feed, replay actually
+  playing, 2 feeds present.
+- `decoder_gap_bench.py SEGMENT.mkv` times `SegmentDecoder.decode()` against a real
+  segment as the frame gap per call grows (flat ~9.5 ms at 1080p with direct JPEG decode).
+- `replay_tick_sim.py A.mkv B.mkv` simulates two-feed replay ticks, OpenCV path vs direct.
+- `replay_workers_sim.py A.mkv B.mkv [seconds] [busy_processes]` runs free-running replay with real
+  decoders, tiles and worker threads and a Qt event loop (no app needed): frames shown/dropped per
+  feed, worker decode+scale time, and how busy the UI thread is. `busy_processes` imitates the live
+  pipeline competing for cores.

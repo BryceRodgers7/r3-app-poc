@@ -118,6 +118,12 @@ disk_budget_mb_s = 200.0
 # jog_wheel_resume_after_release = true
 # step_button_resume_after_click = false
 # hold_paused_at_clip_start = true
+#
+# direct_jpeg_decode (default true) — replay reads each frame straight from
+# its own JPEG bytes in the recorded segment (about 8 ms at 1080p for ANY
+# frame) instead of having OpenCV seek and decode its way there (~125 ms).
+# Set false to force the OpenCV path everywhere if some footage misbehaves.
+# direct_jpeg_decode = true
 
 # Phase 14.F — diagnostic chrome toggle. Off by default so the
 # production windows match `docs/window-layouts.pdf` (just the

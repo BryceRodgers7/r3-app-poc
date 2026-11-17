@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import logging
-import math
-import statistics
 import threading
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 
 from app.core.app_state import UiState
 from app.core.models import FrameOverlayInfo, MediaFrame, PlaybackMode, PlaybackOverlayInfo
@@ -24,6 +21,7 @@ from app.core.signals import AppSignals
 from app.media.feed_runtime import FeedRuntime
 from app.media.output_renderer import MultiFeedOutputRenderer, OutputRenderer
 from app.media.recording_manager import RecordingManager
+from app.media.replay_frame_worker import ReplayFrameWorker
 from app.media.segment_decoder import SegmentDecoder
 from app.storage.segment_replay_store import RecordingSegmentReplayStore
 
@@ -43,23 +41,51 @@ _DEFAULT_REWIND_SECONDS = 5
 # configure it fall back to the 30 fps assumption.
 _DEFAULT_FRAME_PERIOD_NS = 33_333_333
 
-# Replay pacing. Each tick decodes every feed and draws it on the Qt thread,
-# so the tick rate has to follow what that costs on this machine and feed
-# count. The interval moves in whole frames of 60 fps footage (16.7 ms
-# steps), which keeps the cadence even (2 frames per tick at 33 ms, never
-# 1-2-1-2), and is re-aimed so a tick takes ~60% of its interval. A fixed
-# 40 ms timer capped replay at 25 ticks/s and, with a ~118 ms two-feed tick,
-# really delivered ~8.
-_REPLAY_FRAME_MS = 1000.0 / 60.0
-_REPLAY_START_INTERVAL_MS = 33
-_REPLAY_TARGET_DUTY = 0.6   # aim for a tick to fill this much of its interval
-_REPLAY_BUSY_DUTY = 0.8     # slow the timer down above this
-_REPLAY_IDLE_DUTY = 0.4     # speed it up below this
-# The tick cost is the median of the last few ticks, so one slow tick (the
-# ~85 ms file open at each 4 s segment boundary) can't move the interval but
-# a real change in cost is followed within a few ticks.
-_REPLAY_COST_WINDOW = 15
-_REPLAY_COST_MIN_SAMPLES = 8
+# Replay pacing. The timer ticks once per frame of the footage (the recording
+# runs at `target_fps`), clamped to a sane range. A tick only works out which
+# frame each feed should show and hands that to the feed's worker thread
+# (`ReplayFrameWorker`); the worker decodes and scales it, and the UI thread
+# just gives the finished picture to Qt. A tick therefore costs next to
+# nothing whatever the footage or the machine, so the interval does not need
+# to adapt: when the workers can't keep up, frames are dropped (the newest
+# request wins), not the clock slowed. (Before this, ticks decoded on the UI
+# thread and a timer that slowed itself down: at 1080p with two feeds it settled
+# at 500-800 ms per tick.)
+_REPLAY_MIN_INTERVAL_MS = 16
+_REPLAY_MAX_INTERVAL_MS = 50
+# How often the replay stats line (frames shown / dropped per feed) is logged
+# while the replay clock runs.
+_REPLAY_STATS_LOG_SECONDS = 5.0
+
+
+def _replay_interval_ms(frame_period_ns: int) -> int:
+    """Timer interval for footage with this frame period: one tick per frame."""
+    return int(
+        min(
+            _REPLAY_MAX_INTERVAL_MS,
+            max(_REPLAY_MIN_INTERVAL_MS, round(frame_period_ns / 1_000_000)),
+        )
+    )
+
+
+class _FramesReadyBridge(QObject):
+    """Wakes the UI thread when a replay worker has a finished frame.
+
+    A worker thread emits `frames_ready`; Qt queues the call to `_on_ready`
+    onto the thread this object lives in (the UI thread), so the owner's
+    `deliver` always runs there.
+    """
+
+    frames_ready = Signal()
+
+    def __init__(self, deliver: Callable[[], None]) -> None:
+        super().__init__()
+        self._deliver = deliver
+        self.frames_ready.connect(self._on_ready)
+
+    @Slot()
+    def _on_ready(self) -> None:
+        self._deliver()
 
 
 class PlaybackController:
@@ -179,11 +205,20 @@ class PlaybackController:
         # Precise: Windows coarse timers quantize to ~15.6 ms, which would
         # make a 17 or 33 ms interval uneven.
         self._replay_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._replay_interval_ms = _REPLAY_START_INTERVAL_MS
-        self._replay_tick_costs: deque[float] = deque(maxlen=_REPLAY_COST_WINDOW)
+        self._replay_interval_ms = _replay_interval_ms(self._frame_period_ns)
         self._replay_timer.setInterval(self._replay_interval_ms)
         # Created on first multi-feed render; see `_decode_jobs`.
         self._decode_pool: ThreadPoolExecutor | None = None
+        # Free-running replay hands each feed's wanted frame to a worker thread
+        # (see `_submit_replay_frames`); transport clicks (step, pause, jump)
+        # still decode in `_render_at_session_time_ns`. `_replay_epoch` changes
+        # whenever the picture on screen is decided some other way (a click,
+        # the clock stopping), so a frame a worker finishes afterwards is
+        # recognised as stale and dropped. Workers start on first use.
+        self._replay_workers: dict[str, ReplayFrameWorker] = {}
+        self._replay_epoch = 0
+        self._frames_bridge = _FramesReadyBridge(self._deliver_replay_frames)
+        self._replay_stats_logged_at = time.monotonic()
         self._replay_timer.timeout.connect(self._on_replay_timer_tick)
         self._overlay_timer = QTimer(self.signals)
         self._overlay_timer.setInterval(250)
@@ -903,10 +938,14 @@ class PlaybackController:
         self._overlay_timer.stop()
         pool = getattr(self, "_decode_pool", None)
         if pool is not None:
-            # Ticks run on the Qt thread and wait for their decodes, so none
-            # can be in flight here.
+            # Click-path decodes run on the Qt thread and wait for their
+            # results, so none can be in flight here.
             pool.shutdown(wait=False)
             self._decode_pool = None
+        # Free-running replay's workers may be mid-decode: stop them (and wait
+        # for them) before the decoders they use are closed.
+        for worker in getattr(self, "_replay_workers", {}).values():
+            worker.stop()
         for decoder in self._segment_decoders.values():
             decoder.close()
 
@@ -1128,6 +1167,11 @@ class PlaybackController:
         if self._replay_timer.isActive():
             self._replay_timer.stop()
             LOGGER.info("Replay clock stopped")
+            # Frames a worker is still finishing belong to a clock that has
+            # stopped; whatever is shown next is decided by the caller.
+            self._replay_epoch += 1
+            for worker in self._replay_workers.values():
+                worker.cancel()
 
     def _on_replay_timer_tick(self) -> None:
         with self._lock:
@@ -1167,9 +1211,12 @@ class PlaybackController:
                 self._state.current_playback_mode = PlaybackMode.PAUSED
                 self._stop_replay_clock_locked()
             self._update_state_timestamps_locked()
-        render_started = time.perf_counter()
-        self._render_at_session_time_ns(target_session_time_ns)
-        self._adapt_replay_interval((time.perf_counter() - render_started) * 1000.0)
+        if fence_high:
+            # The clock just stopped at the fence; show its end frame the way
+            # a click would (decoded now, and nothing stale lands after it).
+            self._render_at_session_time_ns(target_session_time_ns)
+        else:
+            self._submit_replay_frames(target_session_time_ns)
         if fence_high:
             self._emit_state("Held at end of play (challenge)")
         else:
@@ -1182,53 +1229,88 @@ class PlaybackController:
             self._update_state_timestamps_locked()
         self._emit_state()
 
-    def _render_at_session_time_ns(self, target_session_time_ns: int) -> None:
-        """Decode and display the nearest-available frame on EVERY feed (slice 5.C).
+    def _replay_jobs(
+        self, target_session_time_ns: int
+    ) -> tuple[list[tuple[str, SegmentDecoder, object]], list[str]]:
+        """Which frame each feed should show at `target`: `(feed_id, decoder, location)`.
 
-        Per §8.6.1, every operator tile renders something on every
-        tick during replay. For each enabled feed:
+        Per §8.6.1, every operator tile renders something on every tick
+        during replay. For each enabled feed:
 
         - Ask the replay store for `nearest_frame_location(t)` —
           returns an exact match when in coverage, the feed's earliest
           frame as a freeze when before any coverage, or the latest
           frame ending at-or-before `t` as a freeze when in a gap or
           after coverage.
-        - Decode via the per-feed `SegmentDecoder` and push the frame
-          into the renderer (which routes by `frame.feed_id`).
 
         Feeds that have no replayable segment yet (the `nearest_frame_location`
-        returns `None`) keep showing whatever frame they last received.
-        That's the only blank-tile state during replay — it only happens
-        before any segment for that feed has finalized.
+        returns `None`) are left out: they keep showing whatever frame they
+        last received. That's the only blank-tile state during replay — it
+        only happens before any segment for that feed has finalized.
 
-        No-op for `live_only` outputs.
+        Also returns the feeds that are in freeze-frame mode.
         """
-        if not self._segment_decoders:
-            return
         recording_state = self._recording_manager.recording_state.state
         feeds_in_freeze: list[str] = []
-        jobs: list[tuple[SegmentDecoder, object]] = []
+        jobs: list[tuple[str, SegmentDecoder, object]] = []
         for runtime in self._feed_runtimes:
-            decoder = self._segment_decoders.get(runtime.feed.feed_id)
+            feed_id = runtime.feed.feed_id
+            decoder = self._segment_decoders.get(feed_id)
             if decoder is None:
                 continue
             location = self._replay_store.nearest_frame_location(
-                feed_id=runtime.feed.feed_id,
+                feed_id=feed_id,
                 session_time_ns=target_session_time_ns,
                 recording_state=recording_state,
             )
             if location is None:
                 continue
             if location.is_freeze:
-                feeds_in_freeze.append(runtime.feed.feed_id)
-            jobs.append((decoder, location))
-        for frame in self._decode_jobs(jobs):
+                feeds_in_freeze.append(feed_id)
+            jobs.append((feed_id, decoder, location))
+        return jobs, feeds_in_freeze
+
+    def _render_at_session_time_ns(self, target_session_time_ns: int) -> None:
+        """Decode and display the nearest-available frame on EVERY feed (slice 5.C).
+
+        The click path: pause, step, jump, rewind and scrub call this and
+        have the frames on screen when it returns, decoded (and scaled to
+        their tiles) side by side on the pool but shown here, on the calling
+        thread, in feed order. Free-running replay uses
+        `_submit_replay_frames` instead and never waits for a decode.
+
+        Starts a new epoch first, so a frame a worker is still finishing for
+        an earlier tick can't land on top of this one.
+
+        No-op for `live_only` outputs.
+        """
+        if not self._segment_decoders:
+            return
+        self._begin_replay_epoch()
+        jobs, feeds_in_freeze = self._replay_jobs(target_session_time_ns)
+        for frame in self._decode_jobs([(decoder, location) for _, decoder, location in jobs]):
             if frame is None:
                 continue
             self._output_renderer.show_frame(frame)
         # Phase 6: surface per-tile freeze state for the operator UI.
         with self._lock:
             self._state.feeds_in_freeze_frame = tuple(feeds_in_freeze)
+
+    def _decode_for_display(self, decoder: SegmentDecoder, location: object) -> MediaFrame | None:
+        """Decode a frame and scale it to its tile; runs on a worker thread."""
+        frame = decoder.decode(location)
+        if frame is None:
+            return None
+        prepare = getattr(getattr(self, "_output_renderer", None), "prepare_frame", None)
+        if prepare is None:
+            return frame
+        try:
+            return prepare(frame)
+        except Exception:
+            # Scaling is an optimisation: the UI thread scales an unprepared
+            # frame itself.
+            LOGGER.debug("Preparing a replay frame for display failed", exc_info=True)
+            return frame
 
     def _decode_jobs(
         self, jobs: list[tuple[SegmentDecoder, object]]
@@ -1237,52 +1319,117 @@ class PlaybackController:
 
         Each feed has its own decoder and cv2 releases the GIL while it
         decodes, so with more than one feed they run side by side and the
-        tick pays for the slowest decode rather than the sum. The frames
+        call pays for the slowest decode rather than the sum. The frames
         are still drawn one by one, in feed order, on the calling (Qt)
         thread.
         """
         if len(jobs) < 2:
-            return [decoder.decode(location) for decoder, location in jobs]
+            return [self._decode_for_display(decoder, location) for decoder, location in jobs]
         pool = self._decode_pool
         if pool is None:
             pool = self._decode_pool = ThreadPoolExecutor(
                 max_workers=max(2, len(self._segment_decoders)),
                 thread_name_prefix="replay-decode",
             )
-        futures = [pool.submit(decoder.decode, location) for decoder, location in jobs]
+        futures = [
+            pool.submit(self._decode_for_display, decoder, location) for decoder, location in jobs
+        ]
         return [future.result() for future in futures]
 
-    def _adapt_replay_interval(self, tick_cost_ms: float) -> None:
-        """Re-aim the replay timer so a tick fills ~60% of its interval.
+    # --- free-running replay: frames come from worker threads ------------
 
-        Slows down (rather than starving the UI) when ticks get expensive,
-        and speeds back up when there's headroom. It acts on the median of
-        recent ticks, and the gap between the busy and idle thresholds stops
-        it flapping.
+    def _begin_replay_epoch(self) -> int:
+        """Start a new epoch and drop work for the old one; returns the new epoch.
+
+        Frames that workers prepared under an earlier epoch are discarded when
+        they reach the UI thread (`_deliver_replay_frames`).
         """
-        self._replay_tick_costs.append(tick_cost_ms)
-        if len(self._replay_tick_costs) < _REPLAY_COST_MIN_SAMPLES:
+        with self._lock:
+            self._replay_epoch += 1
+            epoch = self._replay_epoch
+        for worker in self._replay_workers.values():
+            worker.cancel()
+        return epoch
+
+    def _replay_worker(self, feed_id: str, decoder: SegmentDecoder) -> ReplayFrameWorker:
+        worker = self._replay_workers.get(feed_id)
+        if worker is None:
+            worker = ReplayFrameWorker(
+                name=f"replay-frames-{feed_id}",
+                work=lambda location, _decoder=decoder: self._decode_for_display(
+                    _decoder, location
+                ),
+                on_ready=self._frames_bridge.frames_ready.emit,
+            )
+            self._replay_workers[feed_id] = worker
+        return worker
+
+    def _submit_replay_frames(self, target_session_time_ns: int) -> None:
+        """Ask each feed's worker for the frame at `target`, and return at once.
+
+        The UI thread's whole share of a free-running tick: look up the frame
+        location per feed and hand it over. Decoding and scaling happen on the
+        workers; a request still waiting when the next tick arrives is replaced
+        (a dropped frame), so a slow worker skips ahead instead of falling
+        behind.
+        """
+        if not self._segment_decoders:
             return
-        cost = statistics.median(self._replay_tick_costs)
-        interval = self._replay_interval_ms
-        too_busy = cost > interval * _REPLAY_BUSY_DUTY
-        has_headroom = cost < interval * _REPLAY_IDLE_DUTY and interval > _REPLAY_FRAME_MS
-        if not (too_busy or has_headroom):
+        with self._lock:
+            epoch = self._replay_epoch
+        jobs, feeds_in_freeze = self._replay_jobs(target_session_time_ns)
+        for feed_id, decoder, location in jobs:
+            self._replay_worker(feed_id, decoder).submit(location, epoch)
+        with self._lock:
+            self._state.feeds_in_freeze_frame = tuple(feeds_in_freeze)
+        self._log_replay_stats_if_due()
+
+    def _deliver_replay_frames(self) -> None:
+        """Give the finished frames to Qt; runs on the UI thread, woken by a worker."""
+        if getattr(self, "_shutting_down", False):
             return
-        steps = max(1, math.ceil(cost / _REPLAY_TARGET_DUTY / _REPLAY_FRAME_MS))
-        new_interval = round(steps * _REPLAY_FRAME_MS)
-        if new_interval == interval:
+        for worker in list(self._replay_workers.values()):
+            item = worker.take()
+            if item is None:
+                continue
+            epoch, frame = item
+            with self._lock:
+                current = (
+                    epoch == self._replay_epoch
+                    and self._state.current_playback_mode == PlaybackMode.REPLAY
+                )
+            if current:
+                self._output_renderer.show_frame(frame)
+
+    def replay_stats(self) -> dict[str, dict[str, float]]:
+        """Per-feed counters for the frames replay has asked for, decoded and shown."""
+        return {feed_id: worker.stats() for feed_id, worker in self._replay_workers.items()}
+
+    def _log_replay_stats_if_due(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._replay_stats_logged_at
+        if elapsed < _REPLAY_STATS_LOG_SECONDS:
             return
-        self._replay_interval_ms = new_interval
-        self._replay_timer.setInterval(new_interval)
-        # The old costs were measured at the old interval; start a fresh window.
-        self._replay_tick_costs.clear()
-        LOGGER.info(
-            "replay tick interval %d -> %d ms (tick cost %.1f ms)",
-            interval,
-            new_interval,
-            cost,
-        )
+        previous = getattr(self, "_replay_stats_previous", {})
+        current = self.replay_stats()
+        for feed_id, stats in current.items():
+            before = previous.get(feed_id, {})
+            shown = stats["shown"] - before.get("shown", 0)
+            dropped = (
+                stats["dropped_before_decode"] - before.get("dropped_before_decode", 0)
+                + stats["dropped_before_show"] - before.get("dropped_before_show", 0)
+            )
+            decoded = stats["decoded"] - before.get("decoded", 0)
+            work = stats["work_seconds"] - before.get("work_seconds", 0.0)
+            LOGGER.info(
+                "replay frames feed=%s shown_fps=%.1f dropped_fps=%.1f decode_ms=%.1f",
+                feed_id,
+                shown / elapsed,
+                dropped / elapsed,
+                (work / decoded * 1000.0) if decoded else 0.0,
+            )
+        self._replay_stats_previous = current
+        self._replay_stats_logged_at = now
 
     def _update_state_timestamps_locked(self) -> None:
         self._state.last_frame_timestamp = self._latest_live_timestamp

@@ -38,6 +38,8 @@ _OPERATOR_VISIBLE_CATEGORIES: dict[str, str] = {
     "disk_full_during_record": "Recording stopped — disk full",
     "disk_slow": "Disk write rate over budget",
     "recording_branch_saturated": "Disk too slow — recording degraded",
+    "recording_behind": "Recording behind live",
+    "recording_backpressure": "Recording can't keep up — live video may stall",
     "recording_error": "Encoder failure",
     "segment_quarantined_runtime": "Corrupt segment quarantined",
     "session_dirty": "Session not safely recording",

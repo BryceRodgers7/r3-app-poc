@@ -13,13 +13,20 @@ milliseconds per file. It understands what `matroskamux` writes (Segment,
 Info/TimestampScale, Tracks, Clusters of SimpleBlocks or BlockGroups) and
 returns None for anything it can't follow, in which case the decoder
 falls back to its frame-rate arithmetic.
+
+The same walk also records where each frame's bytes sit in the file
+(`read_video_frame_index`). The recordings are MJPEG, so every frame is a
+standalone JPEG: a replay can read just the bytes of the frame it wants and
+decode them, instead of making OpenCV seek and decode its way there
+(docs/REPLAY_RANDOM_ACCESS_DESIGN.md).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,6 +56,39 @@ class _Malformed(Exception):
     pass
 
 
+class _Block(NamedTuple):
+    """One (Simple)Block: where it is, and the frame bytes inside it."""
+
+    track: int
+    timestamp: int  # in TimestampScale units
+    data_offset: int  # file offset of the frame's first byte
+    data_size: int
+    laced: bool  # several frames packed in one block, not a single frame
+
+
+class _VideoBlock(NamedTuple):
+    timestamp_ns: int
+    data_offset: int
+    data_size: int
+    laced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MkvFrameIndex:
+    """Every video frame of a segment: its timestamp and where its bytes are.
+
+    `timestamps_ms[k]` (ms from the first frame), `offsets[k]` and `sizes[k]`
+    describe frame k, in file order. `laced` is True when any block packs
+    several frames, in which case `offsets` / `sizes` don't describe single
+    frames and must not be used to read them.
+    """
+
+    timestamps_ms: list[float]
+    offsets: list[int]
+    sizes: list[int]
+    laced: bool
+
+
 def read_video_timestamps_ms(path: str | Path) -> list[float] | None:
     """Timestamps (ms, relative to the first frame) of the video frames, in file order.
 
@@ -56,21 +96,36 @@ def read_video_timestamps_ms(path: str | Path) -> list[float] | None:
     video frames, or its timestamps aren't increasing (the decoder then
     keeps its frame-rate arithmetic).
     """
+    index = read_video_frame_index(path)
+    return None if index is None else index.timestamps_ms
+
+
+def read_video_frame_index(path: str | Path) -> MkvFrameIndex | None:
+    """Timestamps and byte positions of the video frames, in file order.
+
+    Returns None under the same conditions as `read_video_timestamps_ms`.
+    The frame data itself is never read.
+    """
     try:
         with open(path, "rb") as fh:
-            stamps_ns = _read(fh)
+            blocks = _read(fh)
     except (OSError, _Malformed, ValueError, IndexError):
         return None
     except Exception:
         LOGGER.debug("mkv timestamp read failed for %s", path, exc_info=True)
         return None
-    if not stamps_ns or any(b <= a for a, b in zip(stamps_ns, stamps_ns[1:])):
+    if not blocks or any(b.timestamp_ns <= a.timestamp_ns for a, b in zip(blocks, blocks[1:])):
         return None
-    first = stamps_ns[0]
-    return [(ns - first) / 1_000_000.0 for ns in stamps_ns]
+    first = blocks[0].timestamp_ns
+    return MkvFrameIndex(
+        timestamps_ms=[(block.timestamp_ns - first) / 1_000_000.0 for block in blocks],
+        offsets=[block.data_offset for block in blocks],
+        sizes=[block.data_size for block in blocks],
+        laced=any(block.laced for block in blocks),
+    )
 
 
-def _read(fh: BinaryIO) -> list[int]:
+def _read(fh: BinaryIO) -> list[_VideoBlock]:
     fh.seek(0, 2)
     file_end = fh.tell()
     fh.seek(0)
@@ -85,7 +140,7 @@ def _read(fh: BinaryIO) -> list[int]:
 
     scale_ns = _DEFAULT_TIMESTAMP_SCALE_NS
     video_track: int | None = None
-    pending: list[tuple[int, int]] = []  # (track, timestamp in scale units)
+    pending: list[_Block] = []
     count = 0
     while fh.tell() < segment_end:
         count += 1
@@ -108,7 +163,11 @@ def _read(fh: BinaryIO) -> list[int]:
             _skip(fh, size)
     if video_track is None:
         raise _Malformed("no video track")
-    return [ts * scale_ns for track, ts in pending if track == video_track]
+    return [
+        _VideoBlock(block.timestamp * scale_ns, block.data_offset, block.data_size, block.laced)
+        for block in pending
+        if block.track == video_track
+    ]
 
 
 def _read_info(fh: BinaryIO, end: int) -> int | None:
@@ -144,9 +203,7 @@ def _read_tracks(fh: BinaryIO, end: int) -> int | None:
     return video
 
 
-def _read_cluster(
-    fh: BinaryIO, end: int, out: list[tuple[int, int]], unknown_size: bool
-) -> None:
+def _read_cluster(fh: BinaryIO, end: int, out: list[_Block], unknown_size: bool) -> None:
     cluster_ts = 0
     while fh.tell() < end:
         start = fh.tell()
@@ -170,16 +227,23 @@ def _read_cluster(
             _skip(fh, size)
 
 
-def _read_block_header(fh: BinaryIO, size: int, cluster_ts: int) -> tuple[int, int]:
-    """(track number, timestamp) of a (Simple)Block; skips its frame data."""
+def _read_block_header(fh: BinaryIO, size: int, cluster_ts: int) -> _Block:
+    """Track, timestamp and frame-byte position of a (Simple)Block; skips its frame data.
+
+    Layout: track number (variable-length integer), 2-byte signed timestamp
+    offset from the cluster, 1 flags byte (bits 0x06 = lacing), then the
+    frame bytes.
+    """
     start = fh.tell()
     track, _ = _read_vint(fh, keep_marker=False)
-    raw = fh.read(2)
-    if len(raw) != 2:
+    raw = fh.read(3)
+    if len(raw) != 3:
         raise _Malformed("truncated block")
-    relative = int.from_bytes(raw, "big", signed=True)
+    relative = int.from_bytes(raw[:2], "big", signed=True)
+    laced = bool(raw[2] & 0x06)
+    data_offset = fh.tell()
     fh.seek(start + size)
-    return track, cluster_ts + relative
+    return _Block(track, cluster_ts + relative, data_offset, start + size - data_offset, laced)
 
 
 def _read_header(fh: BinaryIO) -> tuple[int, int]:

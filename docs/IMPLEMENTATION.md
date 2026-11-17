@@ -922,32 +922,66 @@ feed. The clamp keeps replay tracking the live edge naturally.
 `_render_at_session_time_ns(target)` iterates **every enabled feed**:
 
 1. Look up `nearest_frame_location(feed_id, target, recording_state)`.
-2. Decode via the per-feed `SegmentDecoder` (one
-   `cv2.VideoCapture` per feed). With more than one feed the decodes run
-   in parallel on a small thread pool (`_decode_jobs`; cv2 releases the
-   GIL) and the results come back in feed order. The decoder reads
-   `location.frame_index` when present. On open it reads every frame's
-   timestamp from the mkv block headers (`app/media/mkv_timestamps.py`,
-   a few ms, no decoding), so a seek lands on the k-th frame even when
-   frames aren't evenly spaced: it aims just before frame k's timestamp,
-   checks `CAP_PROP_POS_MSEC` and reads forward. A request past the
-   file's real end returns its last frame instead of `None`.
+2. Decode via the per-feed `SegmentDecoder`. With more than one feed the
+   decodes run in parallel on a small thread pool (`_decode_jobs`; cv2
+   releases the GIL) and the results come back in feed order. The decoder
+   reads `location.frame_index` when present. On open it reads the mkv block
+   headers (`app/media/mkv_timestamps.py`, a few ms, no decoding): every
+   frame's timestamp and where its bytes sit in the file
+   (`read_video_frame_index`). The segments are MJPEG, so each frame is a
+   standalone JPEG: **when the index is usable (JPEG frames, no lacing) the
+   decoder reads just the wanted frame's bytes and decodes them with
+   `cv2.imdecode`**, about 8 ms at 1080p for any frame, with no seek and no
+   skipped-frame decodes (a small cache keeps the last 3 frames). Files that
+   don't qualify, and a frame that fails to decode (the file then stays on
+   OpenCV), use the OpenCV path: one `cv2.VideoCapture` per feed, opened
+   lazily; a seek aims just before frame k's timestamp, checks
+   `CAP_PROP_POS_MSEC` and reads forward. A request past the file's real end
+   returns its last frame instead of `None`. `[replay] direct_jpeg_decode =
+   false` forces OpenCV everywhere. See `docs/REPLAY_RANDOM_ACCESS_DESIGN.md`.
 3. Push the frames into `OutputRenderer.show_frame` (which routes by
-   `frame.feed_id`), in feed order, on the Qt thread.
+   `frame.feed_id`), on the Qt thread. Two paths get frames there:
+   **clicks** (pause, step, jump, rewind, scrub) call
+   `_render_at_session_time_ns`, which decodes and scales the feeds side by
+   side and shows them in feed order before returning; **free-running replay**
+   (the timer tick) calls `_submit_replay_frames`, which only looks up each
+   feed's frame location and hands it to that feed's `ReplayFrameWorker`
+   (`app/media/replay_frame_worker.py`) and returns. The worker thread decodes
+   the frame and scales it to the tile (`OutputRenderer.prepare_frame` ->
+   `VideoWidget.prepare_for_display`, which sets `MediaFrame.fitted`), and a
+   queued signal wakes the UI thread, which takes the newest finished frame
+   (`_deliver_replay_frames`) and shows it; `display_frame` hands the already
+   scaled BGR pixels straight to Qt (`Format_BGR888`, no colour-conversion
+   pass). **Latest wins:** a worker holds at most one waiting request, so a
+   slow decode makes the replay skip frames, not queue them or slow the
+   clock. Anything that decides the picture another way (a click, the clock
+   stopping) starts a new `_replay_epoch`; frames finished under an older epoch
+   are discarded when they reach the UI thread, as are frames that arrive after
+   leaving REPLAY mode. A tile that is zoomed, or whose size changed since the
+   frame was prepared, is scaled on the UI thread as before.
 4. Track `is_freeze=True` results into `feeds_in_freeze_frame`.
 
-**Cost, and why it matters.** The whole loop runs on the Qt thread, so
-its cost bounds the replay frame rate. `SegmentDecoder` reads (or skips up
-to 8 frames) forward instead of seeking — an OpenCV seek steps back ~16
-frames and re-decodes forward, ~49 ms per feed per tick on 720p60 MJPEG
-against ~4.5 ms for a read — and `VideoWidget.display_frame` scales with
-cv2 to the tile before building a pixmap. The timer interval follows the
-measured tick cost (`_adapt_replay_interval`): the median of the last 15
-ticks, in whole 60 fps frame steps, aiming for ~60% duty, with hysteresis.
-Measured on two 720p60 feeds: ~118 ms/tick before, ~17–26 ms after
-(≈30 replay frames/s). One feed can run at 60 Hz. Opening the next
-segment's file (~85 ms) still happens inside the tick at each 4 s segment
-boundary; prefetching it is not done.
+**Cost, and why it matters.** On the click path the call runs on the Qt thread,
+so its cost is how long the click takes. Free-running replay no longer pays
+for decoding on the Qt thread: a tick costs the frame-location lookups plus
+`show_frame` for whatever the workers finished (about 1 ms per feed at 960x540
+for the pixmap), so the timer does not adapt. It ticks once per frame of
+footage (`_replay_interval_ms(frame_period_ns)`: 33 ms at 29.97 fps, clamped
+to 16-50 ms), and `replay frames feed=... shown_fps=... dropped_fps=...
+decode_ms=...` is logged every 5 s while the clock runs. (The earlier design
+decoded on the Qt thread and had `_adapt_replay_interval` slow the timer when
+ticks got expensive; at 1080p with two feeds it settled at 500-800 ms per tick.)
+
+On the OpenCV decode path `SegmentDecoder` reads (or skips up to 8 frames)
+forward instead of seeking — an OpenCV seek steps back ~16 frames and
+re-decodes forward, ~49 ms per feed per tick on 720p60 MJPEG and ~125 ms on
+1080p, against ~4.5 / ~9 ms for a read, so once a tick ran past ~8 frames of
+footage every tick sought. The direct JPEG path has no such cliff (flat ~9.5 ms
+per call at 1080p for gaps of 1 to 30 frames). `SegmentDecoder` serializes its
+`decode` / `close` calls with a lock, since a worker thread and a click can
+reach the same decoder. Opening the next segment's file (~85 ms on the OpenCV
+path; the direct path opens the mkv index and file instead) still happens on
+the worker at each 4 s segment boundary; prefetching it is not done.
 
 Every operator tile renders something on every tick during replay.
 Feeds with no replayable segment yet are the only blank-tile state —
@@ -1293,10 +1327,33 @@ process-wide and thread-safe. Categories in active use:
 - `disk_low` / `disk_recovered`
 - `recording_started` / `recording_stopped` / `recording_error`
 - `recording_branch_saturated` / `preview_branch_saturated`
+- `recording_behind` / `recording_backpressure` (see "Recording backlog" below)
 - `audio_missing`
 - `disk_budget_warn` / `disk_budget_over`
 - `session_dirty` / `session_finalized`
 - `invalid_transition` (state-machine consistency check)
+
+**Recording backlog (`telemetry.py`).** The recording queue is non-leaky and holds
+at most one segment (4 s by default, its *time* limit; 256 buffers is never
+reached at 30 fps). When it fills, the shared tee blocks, and the ingest probe
+(in the same blocked path) reads zero, which used to look like a lost source and
+got the feed rebuilt (the rebuild adds load, so one hiccup could snowball).
+Each telemetry sample now also carries the queue's time level
+(`FeedMetricsSnapshot.record_backlog_seconds`, `record_backlog_fraction`; logged
+as `qrec_s=`), and:
+
+- `recording_behind` (WARNING, banner "Recording behind live") opens after 2
+  samples with >= 1.0 s of video waiting in the queue and clears after 2 samples
+  under 0.5 s; `recording_backpressure` (ERROR, banner "Recording can't keep up
+  - live video may stall") opens when the queue is >= 90% of its window. Neither
+  touches any state machine (the older `recording_branch_saturated` rule, which
+  counts buffers and cannot trip at 4 s / 30 fps, is unchanged). Both are only
+  raised while `RecordingState` is `RECORDING`.
+- A zero-ingest stall of 3 samples is **held, not declared lost,** while the
+  recording queue is >= 90% full and the recording branch is still producing
+  frames (`_decide_zero_ingest`). The feed is declared lost only if the queue is
+  not full (nothing is blocking, so the source really stopped), or the queue is
+  full and nothing has been recorded for 15 samples (the branch is wedged).
 
 **De-duplication via `has_open_event` / `clear_open_event`.** The
 `record_health_event(...)` API does NOT auto-deduplicate; producers
@@ -1718,7 +1775,12 @@ current behavior; on the architecture-doc "Still open" list.
   - `output_renderer.py` — `OutputRenderer`,
     `MultiFeedOutputRenderer`, routes by `frame.feed_id`.
   - `preview_output.py` — per-feed preview-side ingest sink.
-  - `segment_decoder.py` — `cv2.VideoCapture` wrapper for replay.
+  - `replay_frame_worker.py` — per-feed latest-wins worker thread for
+    free-running replay frames.
+  - `segment_decoder.py` — replay frame decoder: direct JPEG decode via the
+    mkv block index, `cv2.VideoCapture` as the fallback.
+  - `mkv_timestamps.py` — mkv block-header walker: frame timestamps and
+    byte positions (`read_video_frame_index`).
   - `frame_overlay.py` — overlay drawing for python_push frames.
   - `gst_bus_log.py` / `gst_ingest_telemetry.py` — observability
     helpers.

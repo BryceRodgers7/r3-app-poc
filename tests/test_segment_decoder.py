@@ -14,6 +14,7 @@ from app.core.models import (
 )
 from app.media.segment_decoder import SegmentDecoder
 from app.storage.segment_replay_store import SegmentReplayLocation
+from tests.mkv_builder import build_mkv
 
 
 def _seg(file_path: Path, *, fragment_index: int = 0) -> Segment:
@@ -372,16 +373,243 @@ class SegmentDecoderRealCv2Tests(unittest.TestCase):
             assert frame is not None, f"no frame for index {index}"
             return float(frame.image.mean())
 
-        decoder = SegmentDecoder("ndi_main", "Camera A")
+        # Both ways of getting a frame (straight from its JPEG bytes, and through
+        # OpenCV's reads and seeks) have to land on the same frames.
+        for direct in (True, False):
+            with self.subTest(direct_decode=direct):
+                decoder = SegmentDecoder("ndi_main", "Camera A", direct_decode=direct)
+                try:
+                    # forward one by one, then skipping two, then a repeat, then back, then a jump
+                    for index in (0, 1, 2, 3, 6, 9, 9, 4, 20, 21):
+                        self.assertAlmostEqual(
+                            mean_value(decoder, index), index * 8, delta=4,
+                            msg=f"frame {index} (sequence drifted)",
+                        )
+                finally:
+                    decoder.close()
+
+    def test_direct_decode_gives_the_same_picture_as_opencv(self) -> None:
+        def decode_all(direct: bool) -> list[np.ndarray]:
+            decoder = SegmentDecoder("ndi_main", "Camera A", direct_decode=direct)
+            try:
+                frames = []
+                for index in range(30):
+                    location = SegmentReplayLocation(
+                        segment=_seg(self.seg_path),
+                        offset_in_segment_ns=int(index * 1_000_000_000 / 15.0),
+                        frame_index=index,
+                    )
+                    frame = decoder.decode(location)
+                    assert frame is not None, f"no frame for index {index}"
+                    frames.append(frame.image.astype(np.int16))
+                return frames
+            finally:
+                decoder.close()
+
+        direct_frames = decode_all(True)
+        opencv_frames = decode_all(False)
+        for index, (a, b) in enumerate(zip(direct_frames, opencv_frames)):
+            self.assertEqual(a.shape, b.shape)
+            self.assertLess(float(np.abs(a - b).mean()), 2.0, msg=f"frame {index} differs")
+
+
+class SegmentDecoderDirectJpegTests(unittest.TestCase):
+    """Frames are decoded straight from their JPEG bytes, whichever one is asked for.
+
+    The OpenCV stub counts every capture opened: a file read directly must
+    never need one, and a file that can't be read directly must fall back to
+    it (docs/REPLAY_RANDOM_ACCESS_DESIGN.md).
+    """
+
+    FRAME_COUNT = 30
+    FPS = 15.0
+
+    @classmethod
+    def setUpClass(cls) -> None:
         try:
-            # forward one by one, then skipping two, then a repeat, then back, then a jump
-            for index in (0, 1, 2, 3, 6, 9, 9, 4, 20, 21):
-                self.assertAlmostEqual(
-                    mean_value(decoder, index), index * 8, delta=4,
-                    msg=f"frame {index} (sequence drifted)",
-                )
+            import cv2  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("cv2 not available")
+
+    def setUp(self) -> None:
+        import cv2
+
+        self._temp_dir = TemporaryDirectory()
+        self.tmp = Path(self._temp_dir.name)
+        # Frame i is a flat picture of value i * 8, so its mean says which frame came back.
+        self.jpegs = [
+            cv2.imencode(".jpg", np.full((24, 32, 3), i * 8 % 255, dtype=np.uint8))[1].tobytes()
+            for i in range(self.FRAME_COUNT)
+        ]
+        self.path = self._write("segment_00000.mkv", self.jpegs)
+        self.captures: list[_PositionedCapture] = []
+
+        def factory(path: str) -> _PositionedCapture:
+            cap = _PositionedCapture(path, fps=self.FPS, frames=self.FRAME_COUNT)
+            self.captures.append(cap)
+            return cap
+
+        self.factory = factory
+        self.decoder = SegmentDecoder("ndi_main", "Camera A", capture_factory=factory)
+
+    def tearDown(self) -> None:
+        self.decoder.close()
+        self._temp_dir.cleanup()
+
+    def _write(self, name: str, jpegs: list[bytes], **build_options) -> Path:
+        path = self.tmp / name
+        path.write_bytes(build_mkv(jpegs, fps=self.FPS, **build_options))
+        return path
+
+    def _location(self, path: Path, index: int | None, *, offset_ms: float | None = None, fragment: int = 0):
+        if offset_ms is None:
+            offset_ms = (index or 0) * 1000.0 / self.FPS
+        return SegmentReplayLocation(
+            segment=_seg(path, fragment_index=fragment),
+            offset_in_segment_ns=int(offset_ms * 1_000_000),
+            frame_index=index,
+        )
+
+    def _value(self, decoder: SegmentDecoder, path: Path, index: int) -> float:
+        frame = decoder.decode(self._location(path, index))
+        assert frame is not None, f"no frame for index {index}"
+        return float(frame.image.mean()) / 8.0
+
+    def test_frames_come_back_right_in_any_order_without_opencv(self) -> None:
+        for index in (0, 29, 7, 8, 20, 3, 3, 15, 1, 28, 2):
+            self.assertAlmostEqual(self._value(self.decoder, self.path, index), index, delta=0.5)
+        self.assertEqual(self.captures, [])  # no capture was ever opened
+
+    def test_the_work_does_not_depend_on_how_far_apart_requests_are(self) -> None:
+        for gap in (1, 5, 8, 9, 10, 20):
+            decoder = SegmentDecoder("ndi_main", "Camera A", capture_factory=self.factory)
+            try:
+                self._value(decoder, self.path, 0)
+                self._value(decoder, self.path, gap)
+                assert decoder._open is not None and decoder._open.direct is not None
+                self.assertEqual(decoder._open.direct.decodes, 2, msg=f"gap {gap}")
+            finally:
+                decoder.close()
+        self.assertEqual(self.captures, [])  # never seeked, never skipped a frame
+
+    def test_the_frame_index_from_the_store_wins_over_the_offset(self) -> None:
+        location = self._location(self.path, 10, offset_ms=3 * 1000.0 / self.FPS)
+        frame = self.decoder.decode(location)
+        assert frame is not None
+        self.assertAlmostEqual(float(frame.image.mean()) / 8.0, 10, delta=0.5)
+
+    def test_without_a_frame_index_the_nearest_timestamp_is_used(self) -> None:
+        location = self._location(self.path, None, offset_ms=12 * 1000.0 / self.FPS + 5.0)
+        frame = self.decoder.decode(location)
+        assert frame is not None
+        self.assertAlmostEqual(float(frame.image.mean()) / 8.0, 12, delta=0.5)
+
+    def test_a_request_past_the_end_returns_the_last_frame(self) -> None:
+        self.assertAlmostEqual(self._value(self.decoder, self.path, 99), 29, delta=0.5)
+        frame = self.decoder.decode(self._location(self.path, None, offset_ms=60_000.0))
+        assert frame is not None
+        self.assertAlmostEqual(float(frame.image.mean()) / 8.0, 29, delta=0.5)
+
+    def test_a_negative_offset_gives_the_first_frame(self) -> None:
+        frame = self.decoder.decode(self._location(self.path, None, offset_ms=-500.0))
+        assert frame is not None
+        self.assertAlmostEqual(float(frame.image.mean()) / 8.0, 0, delta=0.5)
+
+    def test_repeating_the_frame_on_screen_decodes_nothing(self) -> None:
+        self._value(self.decoder, self.path, 11)
+        self._value(self.decoder, self.path, 11)
+        assert self.decoder._open is not None and self.decoder._open.direct is not None
+        self.assertEqual(self.decoder._open.direct.decodes, 1)
+
+    def test_stepping_back_and_forth_over_a_few_frames_decodes_each_once(self) -> None:
+        for index in (5, 6, 7, 6, 5, 6, 7):
+            self._value(self.decoder, self.path, index)
+        assert self.decoder._open is not None and self.decoder._open.direct is not None
+        self.assertEqual(self.decoder._open.direct.decodes, 3)
+
+    def test_moving_to_another_segment_closes_the_previous_file(self) -> None:
+        other = self._write("segment_00001.mkv", self.jpegs)
+        self._value(self.decoder, self.path, 4)
+        assert self.decoder._open is not None and self.decoder._open.direct is not None
+        first = self.decoder._open.direct
+        frame = self.decoder.decode(self._location(other, 9, fragment=1))
+        assert frame is not None
+        self.assertAlmostEqual(float(frame.image.mean()) / 8.0, 9, delta=0.5)
+        self.assertIsNone(first._fh)  # the old file handle was released
+        self.assertEqual(self.captures, [])
+
+    def test_close_releases_the_file_and_decoding_reopens_it(self) -> None:
+        self._value(self.decoder, self.path, 4)
+        assert self.decoder._open is not None and self.decoder._open.direct is not None
+        first = self.decoder._open.direct
+        self.decoder.close()
+        self.assertIsNone(first._fh)
+        self.assertAlmostEqual(self._value(self.decoder, self.path, 6), 6, delta=0.5)
+
+    def test_a_laced_file_is_read_with_opencv(self) -> None:
+        laced = self._write("laced.mkv", self.jpegs, lacing_flag=0x02)
+        frame = self.decoder.decode(self._location(laced, 5))
+        self.assertIsNotNone(frame)
+        self.assertEqual(len(self.captures), 1)
+        assert self.decoder._open is not None
+        self.assertIsNone(self.decoder._open.direct)
+
+    def test_a_file_that_is_not_jpeg_is_read_with_opencv(self) -> None:
+        not_jpeg = self._write("h264ish.mkv", [b"\x00\x00\x00\x01" + bytes([i]) * 20 for i in range(30)])
+        frame = self.decoder.decode(self._location(not_jpeg, 5))
+        self.assertIsNotNone(frame)
+        self.assertEqual(len(self.captures), 1)
+        assert self.decoder._open is not None
+        self.assertIsNone(self.decoder._open.direct)
+
+    def test_a_file_that_is_not_matroska_is_read_with_opencv(self) -> None:
+        plain = self.tmp / "plain.mkv"
+        plain.write_bytes(bytes(64))
+        self.assertIsNotNone(self.decoder.decode(self._location(plain, 0)))
+        self.assertEqual(len(self.captures), 1)
+
+    def test_direct_decode_can_be_switched_off(self) -> None:
+        decoder = SegmentDecoder(
+            "ndi_main", "Camera A", capture_factory=self.factory, direct_decode=False
+        )
+        try:
+            self.assertIsNotNone(decoder.decode(self._location(self.path, 5)))
+            self.assertEqual(len(self.captures), 1)
+            assert decoder._open is not None
+            self.assertIsNone(decoder._open.direct)
         finally:
             decoder.close()
+
+    def test_a_frame_that_will_not_decode_moves_the_file_to_opencv(self) -> None:
+        damaged = list(self.jpegs)
+        damaged[5] = bytes([0xFF, 0xD8, 0xFF]) + b"this is not a jpeg body"
+        path = self._write("damaged.mkv", damaged)
+        self.assertAlmostEqual(self._value(self.decoder, path, 2), 2, delta=0.5)
+        self.assertEqual(self.captures, [])  # frame 2 was fine, read directly
+        with self.assertLogs("app.media.segment_decoder", level="WARNING"):
+            frame = self.decoder.decode(self._location(path, 5))
+        self.assertIsNotNone(frame)  # OpenCV (the stub here) supplied it
+        self.assertEqual(len(self.captures), 1)
+        assert self.decoder._open is not None
+        self.assertIsNone(self.decoder._open.direct)
+        # The file stays on OpenCV from here on.
+        self.assertIsNotNone(self.decoder.decode(self._location(path, 6)))
+        self.assertEqual(len(self.captures), 1)
+
+    def test_a_file_cut_short_is_read_directly_up_to_the_cut(self) -> None:
+        data = build_mkv(self.jpegs, fps=self.FPS)
+        cut = self.tmp / "cut.mkv"
+        cut.write_bytes(data[: len(data) - 40])  # the last frame's bytes are cut
+        self.assertAlmostEqual(self._value(self.decoder, cut, 28), 28, delta=0.5)
+        self.assertEqual(self.captures, [])
+        with self.assertLogs("app.media.segment_decoder", level="WARNING"):
+            frame = self.decoder.decode(self._location(cut, 29))
+        self.assertIsNotNone(frame)  # the cut frame comes from OpenCV (the stub)
+        self.assertGreaterEqual(len(self.captures), 1)
+
+    def test_a_missing_file_still_returns_none(self) -> None:
+        self.assertIsNone(self.decoder.decode(self._location(self.tmp / "gone.mkv", 0)))
+        self.assertEqual(self.captures, [])
 
 
 if __name__ == "__main__":

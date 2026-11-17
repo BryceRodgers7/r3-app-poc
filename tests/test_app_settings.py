@@ -652,5 +652,28 @@ jog_wheel_resume_after_release = "yes"
         self.assertIn("jog_wheel_resume_after_release", str(ctx.exception))
 
 
+class ReplayDirectJpegDecodeFlagTests(unittest.TestCase):
+    """`[replay] direct_jpeg_decode`: read replay frames straight from their JPEG bytes."""
+
+    def _load(self, body: str) -> AppSettings:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_settings.toml"
+            config_path.write_text(body.strip(), encoding="utf-8")
+            return AppSettings.load(config_path)
+
+    def test_on_by_default(self) -> None:
+        self.assertTrue(AppSettings().replay_direct_jpeg_decode)
+        self.assertTrue(self._load("[replay]\nrewind_seconds = 5").replay_direct_jpeg_decode)
+
+    def test_can_be_turned_off(self) -> None:
+        settings = self._load("[replay]\ndirect_jpeg_decode = false")
+        self.assertFalse(settings.replay_direct_jpeg_decode)
+
+    def test_rejects_a_non_bool(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load('[replay]\ndirect_jpeg_decode = "off"')
+        self.assertIn("direct_jpeg_decode", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

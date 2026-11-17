@@ -85,6 +85,7 @@ from app.media.output_renderer import MultiFeedOutputRenderer
 from app.media.pipeline_manager import PipelineManager
 from app.media.preview_output import PreviewOutput
 from app.media.recording_manager import RecordingManager
+from app.media.segment_decoder import SegmentDecoder
 from app.media.source_factory import build_source_for_feed
 from app.storage.session_manager import SessionManager
 from app.storage.session_recovery import (
@@ -184,6 +185,11 @@ class ApplicationCoordinator:
             ),
             hold_paused_at_clip_start=bool(
                 settings.replay_hold_paused_at_clip_start
+            ),
+            decoder_factory=lambda feed_id, source_name: SegmentDecoder(
+                feed_id,
+                source_name,
+                direct_decode=bool(settings.replay_direct_jpeg_decode),
             ),
         )
         self.operator_controller = PlaybackController(

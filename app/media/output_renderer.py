@@ -35,6 +35,15 @@ class MultiFeedOutputRenderer(QObject):
         if renderer is not None:
             renderer.show_frame(frame)
 
+    def prepare_frame(self, frame: MediaFrame) -> MediaFrame:
+        """Do a frame's display work for its tile ahead of `show_frame`.
+
+        Safe to call from a worker thread. Returns the frame, with its
+        picture already scaled to the tile when the tile allows it.
+        """
+        renderer = self._per_feed.get(frame.feed_id)
+        return frame if renderer is None else renderer.prepare_frame(frame)
+
     def show_placeholder_message(self, message: str) -> None:
         """Set the same placeholder text on every bound tile."""
         for renderer in self._per_feed.values():
@@ -79,6 +88,12 @@ class OutputRenderer(QObject):
     def show_frame(self, frame: MediaFrame) -> None:
         """Display a rendered frame on the bound widget."""
         self.frame_ready.emit(frame)
+
+    def prepare_frame(self, frame: MediaFrame) -> MediaFrame:
+        """Let the bound widget scale `frame` to its tile; safe off the UI thread."""
+        widget = self._video_widget
+        prepare = getattr(widget, "prepare_for_display", None)
+        return frame if prepare is None else prepare(frame)
 
     def detach_widget(self) -> None:
         """Release the current widget binding, if any."""
