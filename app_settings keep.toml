@@ -1,0 +1,62 @@
+# Optional runtime configuration for source selection and app defaults.
+# The app loads this file automatically from the workspace root when present.
+
+[app]
+app_name = "Sports Replay POC"
+operator_window_title = "Sports Replay Operator"
+program_window_title = "Sports Replay Program"
+base_data_dir = "C:\\SportsReplay"
+target_frame_width = 1920
+target_frame_height = 1080
+target_fps = 29.97
+replay_buffer_seconds = 120
+live_audio_monitor_enabled = false
+force_python_push_preview = false
+
+[recording]
+enabled = true
+segment_duration_seconds = 4.0
+codec = "mjpeg"
+container = "mkv"
+audio_enabled = true
+
+
+# Multi-feed: when any [[feeds]] table exists, the [source] section below is ignored for ingest.
+# USB cameras: kind = "auto" and camera_index 0, 1, 2, … (Windows device order).
+
+# [[feeds]]
+# feed_id = "ndi_1"
+# display_name = "NDI-47800"
+# kind = "ndi"
+# ndi_name = "POVZOOM-47800 (POVZoom-47800)"
+           
+
+# [[feeds]]
+# feed_id = "ndi_2"
+# display_name = "NDI-55014"
+# kind = "ndi"
+# ndi_name = "POVZOOM-55014 (POVZoom-55014)"
+
+[[feeds]]
+feed_id = "ndi_3"
+display_name = "NDI3"
+kind = "ndi"
+ndi_name = "DAVIDI7 (VLC)"
+
+# [[feeds]]
+# feed_id = "ndi_1"
+# display_name = "David VLC Game"
+# kind = "ndi"
+# ndi_name = "DAVIDI7 (VLC)"
+
+# [[feeds]]
+# feed_id = "ndi_2"
+# display_name = "David ndi pattern"
+# kind = "ndi"
+# ndi_name = "DAVIDI7 (Test Pattern)"
+
+# [[feeds]]
+# feed_id = "ndi_3"
+# display_name = "David ndi pattern 2"
+# kind = "ndi"
+# ndi_name = "DAVIDI7 (Test Pattern 2)"
