@@ -282,6 +282,18 @@ transition writes `<session>/session.json` atomically (`tmp + replace`).
 The absence of `finalized_at` in that JSON is the marker the §11.4
 recovery scan reads on next launch to detect crashed sessions.
 
+`session.json` fields (`SESSION_MANIFEST_SCHEMA_VERSION = 2`):
+`schema_version`, `session_id`, `state`, `created_at`, `finalized_at`,
+`match` and `cameras`. `match` is the pre-match snapshot (`date`,
+`scheduled_start_time`, `venue`, `team_a`, `team_b`, `referee_1/2`,
+`line_judge_1/2`; unset fields are null) and `cameras` is a list of
+`{feed_id, short_name, viewport_order}` for the enabled feeds. Both are
+taken once when the session is created and rewritten unchanged on every
+transition; Resume keeps the values already on disk. They are null when
+the session was created without the pre-match dialog. Files written
+before version 2 have no `schema_version` (treat as 1) and no `match` or
+`cameras`, so readers must treat both as optional.
+
 Producers:
 - `SessionManager.start_new_session` → `CREATED`.
 - `ApplicationCoordinator.toggle_long_session_recording` → `RECORDING` /

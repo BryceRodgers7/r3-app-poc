@@ -95,6 +95,21 @@ class MatchDetails:
                 errors.append(f"{label} is longer than {limit} characters.")
         return errors
 
+    def to_manifest_dict(self) -> dict[str, str | None]:
+        """The match as stored in `session.json` under `match`.
+
+        Every key is always present (unset optional fields are null) so
+        readers see one stable shape. The date is ISO `YYYY-MM-DD` and the
+        start time is `HH:MM`, the same forms `match_details.toml` uses.
+        """
+        payload: dict[str, str | None] = {
+            "date": self.match_date.isoformat(),
+            "scheduled_start_time": format_time(self.scheduled_start),
+        }
+        for attribute in TEXT_FIELDS:
+            payload[attribute] = getattr(self, attribute)
+        return payload
+
     def blank_field_labels(self) -> list[str]:
         """Labels of the optional fields that were left blank, in form order."""
         return [

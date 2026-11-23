@@ -836,6 +836,26 @@ class ApplicationCoordinator:
             self._emit_clip_status(f"Clip {status}.")
         self._refresh_clip_state()
 
+    def _manifest_match(self) -> dict[str, str | None] | None:
+        """The pre-match details for `session.json`, or None without a dialog."""
+        match = getattr(self._settings, "match_details", None)
+        return match.to_manifest_dict() if match is not None else None
+
+    def _manifest_cameras(self) -> list[dict[str, object]]:
+        """The enabled cameras for `session.json`, in viewport order.
+
+        `short_name` is the feed's display name, which the pre-match
+        layout has already replaced with the operator's short name.
+        """
+        return [
+            {
+                "feed_id": feed.feed_id,
+                "short_name": feed.display_name,
+                "viewport_order": position,
+            }
+            for position, feed in enumerate(self.feed_registry.get_enabled_feeds(), start=1)
+        ]
+
     def initialize(self, *, resume_session_id: str | None = None) -> None:
         """Start storage, ingest, and playback sessions.
 
@@ -856,7 +876,11 @@ class ApplicationCoordinator:
         if self._session_started:
             return
         if resume_session_id is not None:
-            session_paths = self._session_manager.adopt_session(resume_session_id)
+            session_paths = self._session_manager.adopt_session(
+                resume_session_id,
+                match=self._manifest_match(),
+                cameras=self._manifest_cameras(),
+            )
             self._populate_segment_index_from_resume(session_paths.session_id)
             # Phase 7.D: detect the crashed game and rebase the new
             # SessionClock past its latest session_time so the first
@@ -866,7 +890,9 @@ class ApplicationCoordinator:
             self._setup_resume_continuation(session_paths)
         else:
             session_paths = self._session_manager.start_new_session(
-                self.feed_registry.build_session_label()
+                self.feed_registry.build_session_label(),
+                match=self._manifest_match(),
+                cameras=self._manifest_cameras(),
             )
         assert session_paths.logs_dir is not None  # set by SessionPaths.__post_init__
         default_health_log().open(

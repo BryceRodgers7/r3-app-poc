@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from app.core.models import SessionPaths
 from app.core.session_state import (
@@ -25,8 +27,19 @@ class SessionManager:
         self._active_session_paths: SessionPaths | None = None
         self._active_session_state: StateMachine[SessionState] | None = None
 
-    def start_new_session(self, source_name: str) -> SessionPaths:
-        """Create a new session folder layout, manifest, and database record."""
+    def start_new_session(
+        self,
+        source_name: str,
+        *,
+        match: Mapping[str, Any] | None = None,
+        cameras: Sequence[Mapping[str, Any]] | None = None,
+    ) -> SessionPaths:
+        """Create a new session folder layout, manifest, and database record.
+
+        `match` and `cameras` are the pre-match snapshot stored in
+        `session.json` (see `SESSION_MANIFEST_SCHEMA_VERSION`); both are
+        optional for callers that run without the pre-match dialog.
+        """
         session_id = self._file_manager.get_next_session_id()
         session_paths = self._file_manager.create_session_paths(session_id)
         self._metadata_db.create_session(
@@ -39,10 +52,18 @@ class SessionManager:
         self._active_session_state = make_session_state_machine(
             session_id=session_id,
             manifest=manifest,
+            match=match,
+            cameras=cameras,
         )
         return session_paths
 
-    def adopt_session(self, session_id: str) -> SessionPaths:
+    def adopt_session(
+        self,
+        session_id: str,
+        *,
+        match: Mapping[str, Any] | None = None,
+        cameras: Sequence[Mapping[str, Any]] | None = None,
+    ) -> SessionPaths:
         """Adopt an existing on-disk session as the active one (§11.4 Resume).
 
         Used when the operator picks **Resume** in the recovery prompt.
@@ -57,6 +78,10 @@ class SessionManager:
           left by `mark_dirty_sessions`) and immediately transitions to
           `CREATED` so the operator can hit Start Game Recording and
           drive `CREATED → RECORDING` like a fresh session.
+
+        The `match` and `cameras` already in the manifest are kept: they
+        describe the match that was set up before the crash. The values
+        passed in are used only to fill what an older manifest lacks.
 
         Returns the same `SessionPaths` shape as `start_new_session`,
         pointing at the existing directory tree.
@@ -73,6 +98,8 @@ class SessionManager:
             manifest=manifest,
             created_at=str(created_at),
             initial_state=SessionState.DIRTY,
+            match=existing.get("match") or match,
+            cameras=existing.get("cameras") or cameras,
         )
         # DIRTY → CREATED so the rest of the app (which expects to drive
         # CREATED → RECORDING via toggle_long_session_recording) sees a

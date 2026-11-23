@@ -8,12 +8,14 @@ is not part of slice 2.B. This slice only ensures the data is durable.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 import json
 import logging
 from pathlib import Path
 import threading
+from typing import Any
 
 from app.core.health_events import HealthSeverity, default_log, record_health_event
 from app.core.state_machine import StateMachine
@@ -21,6 +23,13 @@ from app.core.state_machine import StateMachine
 LOGGER = logging.getLogger(__name__)
 
 SESSION_MANIFEST_FILENAME = "session.json"
+
+# Shape of `session.json`. Files written before this field existed have no
+# `schema_version` and are version 1 (session_id, state, created_at,
+# finalized_at only). Version 2 adds `schema_version`, `match` and `cameras`.
+# Readers must treat `match` and `cameras` as optional: older sessions lack
+# them, and they are null for a session created without a pre-match dialog.
+SESSION_MANIFEST_SCHEMA_VERSION = 2
 
 
 class SessionState(str, Enum):
@@ -82,12 +91,19 @@ class SessionManifest:
         state: SessionState,
         created_at: str,
         finalized_at: str | None,
+        match: Mapping[str, Any] | None = None,
+        cameras: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         payload = {
+            "schema_version": SESSION_MANIFEST_SCHEMA_VERSION,
             "session_id": session_id,
             "state": state.value,
             "created_at": created_at,
             "finalized_at": finalized_at,
+            # Null when the session was created without a pre-match
+            # dialog (scripted callers) or predates these fields.
+            "match": dict(match) if match is not None else None,
+            "cameras": [dict(camera) for camera in cameras] if cameras is not None else None,
         }
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +130,8 @@ def make_session_state_machine(
     manifest: SessionManifest,
     created_at: str | None = None,
     initial_state: SessionState = SessionState.CREATED,
+    match: Mapping[str, Any] | None = None,
+    cameras: Sequence[Mapping[str, Any]] | None = None,
 ) -> StateMachine[SessionState]:
     """Build a `StateMachine[SessionState]` that persists on every transition.
 
@@ -121,6 +139,10 @@ def make_session_state_machine(
     The §11.4 Resume action passes `DIRTY` so the machine starts at the
     on-disk state and the operator can drive `DIRTY → CREATED → RECORDING`
     through the normal transition table.
+
+    `match` and `cameras` are the pre-match snapshot. The manifest is
+    rewritten whole on every transition, so they are held here and written
+    each time; they never change after the session is created.
     """
 
     state_created_at = created_at or datetime.now(timezone.utc).isoformat()
@@ -135,6 +157,8 @@ def make_session_state_machine(
             state=state,
             created_at=state_created_at,
             finalized_at=finalized_holder["value"],
+            match=match,
+            cameras=cameras,
         )
 
     def on_enter(old: SessionState, new: SessionState) -> None:

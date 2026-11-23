@@ -316,6 +316,25 @@ viewport_order = 5
         self.assertIsNotNone(validate_short_name("   "))
 
 
+class ManifestDictTests(unittest.TestCase):
+    def test_all_keys_present_with_nulls_for_unset_fields(self) -> None:
+        payload = _details(venue="Gym", team_a="16R").to_manifest_dict()
+        self.assertEqual(
+            payload,
+            {
+                "date": "2026-11-01",
+                "scheduled_start_time": "20:30",
+                "venue": "Gym",
+                "team_a": "16R",
+                "team_b": None,
+                "referee_1": None,
+                "referee_2": None,
+                "line_judge_1": None,
+                "line_judge_2": None,
+            },
+        )
+
+
 class ViewportOrderTests(unittest.TestCase):
     def test_without_saved_settings_orders_follow_the_feed_list(self) -> None:
         self.assertEqual(

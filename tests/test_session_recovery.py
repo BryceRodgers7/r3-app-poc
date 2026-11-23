@@ -39,14 +39,20 @@ def _write_manifest(
     state: str,
     finalized_at: str | None,
     created_at: str = "2026-04-28T00:00:00+00:00",
+    extra: dict | None = None,
 ) -> Path:
-    """Write a `session.json` matching the format `SessionManifest` produces."""
+    """Write a `session.json` matching the format `SessionManifest` produces.
+
+    Without `extra` this is the version-1 shape (no `schema_version`,
+    `match` or `cameras`), i.e. what older sessions have on disk.
+    """
     payload = {
         "session_id": session_id,
         "state": state,
         "created_at": created_at,
         "finalized_at": finalized_at,
     }
+    payload.update(extra or {})
     manifest_path = session_dir / SESSION_MANIFEST_FILENAME
     session_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -679,6 +685,71 @@ class SessionManagerAdoptTests(unittest.TestCase):
             self.assertEqual(manifest["state"], "created")
         finally:
             db.close()
+
+    def _adopt(self, extra: dict | None, **adopt_kwargs) -> dict:
+        from app.config.settings import AppSettings
+        from app.storage.file_manager import FileManager
+        from app.storage.session_manager import SessionManager
+
+        settings = AppSettings(base_data_dir=self.tmp)
+        session_dir = settings.sessions_root / "session_001"
+        _write_manifest(
+            session_dir,
+            session_id="session_001",
+            state="dirty",
+            finalized_at=None,
+            extra=extra,
+        )
+        (session_dir / "recording").mkdir(parents=True, exist_ok=True)
+        db = MetadataDb(settings.metadata_db_path)
+        try:
+            db.create_session(
+                session_id="session_001",
+                source_name="Resume Test",
+                started_at="2026-04-28T00:00:00+00:00",
+            )
+            SessionManager(FileManager(settings), db).adopt_session(
+                "session_001", **adopt_kwargs
+            )
+        finally:
+            db.close()
+        return _read_manifest(session_dir)
+
+    def test_adopt_keeps_match_and_cameras_already_in_manifest(self) -> None:
+        original_match = {"date": "2026-11-09", "team_a": "16R"}
+        original_cameras = [{"feed_id": "ndi_1", "short_name": "Baseline A", "viewport_order": 1}]
+        manifest = self._adopt(
+            {"schema_version": 2, "match": original_match, "cameras": original_cameras},
+            match={"date": "2026-12-01", "team_a": "Other"},
+            cameras=[{"feed_id": "ndi_9", "short_name": "X", "viewport_order": 1}],
+        )
+        self.assertEqual(manifest["match"], original_match)
+        self.assertEqual(manifest["cameras"], original_cameras)
+        self.assertEqual(manifest["schema_version"], 2)
+
+    def test_adopt_fills_match_and_cameras_missing_from_old_manifest(self) -> None:
+        match = {"date": "2026-11-09", "team_a": "16R"}
+        cameras = [{"feed_id": "ndi_1", "short_name": "Baseline A", "viewport_order": 1}]
+        manifest = self._adopt(None, match=match, cameras=cameras)
+        self.assertEqual(manifest["match"], match)
+        self.assertEqual(manifest["cameras"], cameras)
+        self.assertEqual(manifest["state"], "created")
+
+    def test_mark_dirty_sessions_preserves_match_and_cameras(self) -> None:
+        sessions_root = self.tmp / "sessions"
+        extra = {"schema_version": 2, "match": {"team_a": "16R"}, "cameras": []}
+        _write_manifest(
+            sessions_root / "session_001",
+            session_id="session_001",
+            state="recording",
+            finalized_at=None,
+            extra=extra,
+        )
+        mark_dirty_sessions(sessions_root)
+        manifest = _read_manifest(sessions_root / "session_001")
+        self.assertEqual(manifest["state"], "dirty")
+        self.assertEqual(manifest["match"], {"team_a": "16R"})
+        self.assertEqual(manifest["cameras"], [])
 
 
 class FindNextGameIndexTests(unittest.TestCase):

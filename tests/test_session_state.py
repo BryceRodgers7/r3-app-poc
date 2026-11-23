@@ -11,6 +11,7 @@ from app.core import health_events
 from app.core.health_events import HealthEventLog
 from app.core.session_state import (
     SESSION_MANIFEST_FILENAME,
+    SESSION_MANIFEST_SCHEMA_VERSION,
     SessionManifest,
     SessionState,
     make_session_state_machine,
@@ -120,6 +121,44 @@ class SessionManifestTests(unittest.TestCase):
             self.assertEqual(payload["state"], "recording")
             # No leftover .tmp file.
             self.assertFalse((Path(tmp) / (SESSION_MANIFEST_FILENAME + ".tmp")).exists())
+
+    def test_write_includes_schema_version_and_null_match_and_cameras(self) -> None:
+        with TemporaryDirectory() as tmp:
+            manifest = SessionManifest(Path(tmp) / SESSION_MANIFEST_FILENAME)
+            manifest.write(
+                session_id="s1",
+                state=SessionState.CREATED,
+                created_at="2026-04-26T18:00:00+00:00",
+                finalized_at=None,
+            )
+            payload = manifest.read()
+            self.assertEqual(payload["schema_version"], SESSION_MANIFEST_SCHEMA_VERSION)
+            self.assertIsNone(payload["match"])
+            self.assertIsNone(payload["cameras"])
+
+    def test_match_and_cameras_survive_every_transition(self) -> None:
+        match = {"date": "2026-11-09", "team_a": "16R", "team_b": "Opponent"}
+        cameras = [{"feed_id": "ndi_1", "short_name": "Baseline A", "viewport_order": 1}]
+        orig_log = health_events._DEFAULT_LOG
+        health_events._DEFAULT_LOG = HealthEventLog()
+        try:
+            with TemporaryDirectory() as tmp:
+                manifest = SessionManifest(Path(tmp) / SESSION_MANIFEST_FILENAME)
+                sm = make_session_state_machine(
+                    session_id="s1", manifest=manifest, match=match, cameras=cameras
+                )
+                for state in (
+                    SessionState.RECORDING,
+                    SessionState.STOPPED,
+                    SessionState.FINALIZED,
+                ):
+                    sm.transition_to(state)
+                    payload = manifest.read()
+                    self.assertEqual(payload["state"], state.value)
+                    self.assertEqual(payload["match"], match)
+                    self.assertEqual(payload["cameras"], cameras)
+        finally:
+            health_events._DEFAULT_LOG = orig_log
 
     def test_read_returns_none_for_missing_file(self) -> None:
         with TemporaryDirectory() as tmp:
