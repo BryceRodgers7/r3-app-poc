@@ -12,6 +12,7 @@ never modified. Re-running skips MP4s that already exist.
 
     python tools/make_mp4.py session_038
     python tools/make_mp4.py --all --root D:/SportsReplay
+    python tools/make_mp4.py session_038 --gpu     # NVENC, CPU fallback
 """
 
 from __future__ import annotations
@@ -34,18 +35,55 @@ DEFAULT_ROOT = Path("C:/SportsReplay")
 # is skipped unless --force: it may be live, or empty, or already shipped.
 PROCESSABLE_STATES = {"finalized", "dirty"}
 
+GPU_ENCODER = "h264_nvenc"   # NVIDIA (A1000)
+GPU_DECODER = "mjpeg_qsv"    # Intel Quick Sync iGPU
+
 # No -s / -r: resolution and frame rate stay as they are in the input.
-ENCODE_ARGS = [
-    "-map", "0:v:0", "-map", "0:a:0?",
-    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-    "-maxrate", "5000k", "-bufsize", "10000k",
-    "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
-    # The MJPEG source is full-range; without this the H.264 would carry the
-    # full-range flag (ffprobe shows yuvj420p) and some players look washed out.
-    "-vf", "scale=out_range=tv", "-color_range", "tv",
-    "-c:a", "aac", "-b:a", "128k",
-    "-movflags", "+faststart",
-]
+CPU_VIDEO_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+# p3 matches the decode-bound speed; p5 + -tune hq was ~40% slower for no real gain here.
+GPU_VIDEO_ARGS = ["-c:v", GPU_ENCODER, "-preset", "p3", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+
+# The MJPEG source is full-range; without out_range=tv the H.264 would carry the
+# full-range flag (ffprobe shows yuvj420p) and some players look washed out.
+CPU_FILTER = "scale=out_range=tv"
+# mjpeg_qsv hands back the full-range data labelled as limited range, so the
+# input range must be stated or the output is not compressed to 16-235.
+QSV_FILTER = "scale=in_range=pc:out_range=tv"
+
+# name -> (input options placed before -i, video encoder args, video filter)
+PROFILES: dict[str, tuple[list[str], list[str], str]] = {
+    "qsv+nvenc": (["-c:v", GPU_DECODER], GPU_VIDEO_ARGS, QSV_FILTER),  # Intel decode, NVIDIA encode
+    "nvenc": ([], GPU_VIDEO_ARGS, CPU_FILTER),                         # CPU decode, NVIDIA encode
+    "cpu": ([], CPU_VIDEO_ARGS, CPU_FILTER),                           # CPU decode, x264
+}
+
+
+def encode_args(profile: str) -> list[str]:
+    _, video_args, video_filter = PROFILES[profile]
+    return [
+        "-map", "0:v:0", "-map", "0:a:0?",
+        *video_args,
+        "-maxrate", "5000k", "-bufsize", "10000k",
+        "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
+        "-vf", video_filter, "-color_range", "tv",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+    ]
+
+
+def _lists_codec(ffmpeg: str, flag: str, name: str) -> bool:
+    result = subprocess.run([ffmpeg, "-hide_banner", flag], capture_output=True, text=True)
+    return re.search(rf"\s{re.escape(name)}\s", result.stdout) is not None
+
+
+def has_encoder(ffmpeg: str, name: str) -> bool:
+    """True when this ffmpeg build lists the encoder (not proof a GPU is present)."""
+    return _lists_codec(ffmpeg, "-encoders", name)
+
+
+def has_decoder(ffmpeg: str, name: str) -> bool:
+    """True when this ffmpeg build lists the decoder (not proof a GPU is present)."""
+    return _lists_codec(ffmpeg, "-decoders", name)
 
 
 def read_manifest(session_dir: Path) -> dict | None:
@@ -134,7 +172,19 @@ def probe_duration(ffprobe: str, path: Path) -> float | None:
         return None
 
 
-def encode(ffmpeg: str, ffprobe: str, segments: list[Path], out: Path) -> bool:
+def run_ffmpeg(ffmpeg: str, list_file: Path, partial: Path, profile: str) -> subprocess.CompletedProcess:
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        *PROFILES[profile][0],
+        "-f", "concat", "-safe", "0", "-i", str(list_file),
+        *encode_args(profile), str(partial),
+    ]
+    # Below-normal priority so a running app is not starved.
+    flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0
+    return subprocess.run(command, capture_output=True, text=True, creationflags=flags)
+
+
+def encode(ffmpeg: str, ffprobe: str, segments: list[Path], out: Path, chain: tuple[str, ...] = ("cpu",)) -> bool:
     # ffmpeg's concat demuxer silently skips a segment it cannot open, which
     # would cut that stretch out of the game. Refuse instead.
     durations = [probe_duration(ffprobe, p) for p in segments]
@@ -149,14 +199,16 @@ def encode(ffmpeg: str, ffprobe: str, segments: list[Path], out: Path) -> bool:
     with tempfile.TemporaryDirectory() as tmp:
         list_file = Path(tmp) / "segments.txt"
         list_file.write_text("".join(concat_line(p) for p in segments), encoding="utf-8")
-        command = [
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(list_file),
-            *ENCODE_ARGS, str(partial),
-        ]
-        # Below-normal priority so a running app is not starved.
-        flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0
-        result = subprocess.run(command, capture_output=True, text=True, creationflags=flags)
+        for index, profile in enumerate(chain):
+            result = run_ffmpeg(ffmpeg, list_file, partial, profile)
+            failed = result.returncode != 0 or not partial.exists() or partial.stat().st_size == 0
+            if not failed or index == len(chain) - 1:
+                break
+            # No usable GPU (missing, driver problem, sessions exhausted): the
+            # segments were already probed as readable, so try the next profile.
+            LOGGER.warning("%s: %s encode failed (exit %s): %s; retrying with %s",
+                           out.name, profile, result.returncode, result.stderr.strip()[-300:], chain[index + 1])
+            partial.unlink(missing_ok=True)
     if result.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
         LOGGER.error("ffmpeg failed for %s (exit %s): %s", out.name, result.returncode, result.stderr.strip()[-500:])
         partial.unlink(missing_ok=True)
@@ -170,7 +222,7 @@ def encode(ffmpeg: str, ffprobe: str, segments: list[Path], out: Path) -> bool:
     return True
 
 
-def process_session(ffmpeg: str, ffprobe: str, session_dir: Path, force: bool) -> bool:
+def process_session(ffmpeg: str, ffprobe: str, session_dir: Path, force: bool, chain: tuple[str, ...] = ("cpu",)) -> bool:
     """Encode every game/camera of one session; finalize it when all succeed."""
     manifest = read_manifest(session_dir)
     if manifest is None:
@@ -191,7 +243,7 @@ def process_session(ffmpeg: str, ffprobe: str, session_dir: Path, force: bool) -
             LOGGER.info("%s: already done, skipping", out.name)
             continue
         LOGGER.info("%s: encoding %d segments", out.name, len(segments))
-        ok = encode(ffmpeg, ffprobe, segments, out) and ok
+        ok = encode(ffmpeg, ffprobe, segments, out, chain) and ok
     if not ok:
         LOGGER.error("%s: not all outputs succeeded; session.json left unchanged", session_dir.name)
         return False
@@ -210,6 +262,9 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help=f"data folder (default {DEFAULT_ROOT})")
     parser.add_argument("--ffmpeg", default=None, help="path to ffmpeg (default: found on PATH)")
     parser.add_argument("--force", action="store_true", help="also process sessions in other states")
+    parser.add_argument("--gpu", action="store_true",
+                        help=f"decode on the Intel GPU ({GPU_DECODER}) and encode on the NVIDIA GPU "
+                             f"({GPU_ENCODER}); falls back to the CPU per file if that fails")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -217,6 +272,19 @@ def main() -> int:
     if not ffmpeg:
         LOGGER.error("ffmpeg not found; install it or pass --ffmpeg")
         return 2
+    # Tried in order per file; "cpu" is always the last resort.
+    chain: list[str] = []
+    if args.gpu:
+        if has_encoder(ffmpeg, GPU_ENCODER):
+            if has_decoder(ffmpeg, GPU_DECODER):
+                chain.append("qsv+nvenc")
+            else:
+                LOGGER.warning("this ffmpeg has no %s decoder; decoding on the CPU", GPU_DECODER)
+            chain.append("nvenc")
+        else:
+            LOGGER.warning("this ffmpeg has no %s encoder; using the CPU", GPU_ENCODER)
+    chain.append("cpu")
+    LOGGER.info("encode profiles, in order: %s", ", ".join(chain))
     ffprobe = shutil.which("ffprobe", path=str(Path(ffmpeg).parent)) or shutil.which("ffprobe")
     if not ffprobe:
         LOGGER.error("ffprobe not found next to ffmpeg or on PATH")
@@ -229,7 +297,7 @@ def main() -> int:
     if not names:
         parser.error("name at least one session, or use --all")
 
-    results = [process_session(ffmpeg, ffprobe, sessions_root / name, args.force) for name in names]
+    results = [process_session(ffmpeg, ffprobe, sessions_root / name, args.force, tuple(chain)) for name in names]
     return 0 if all(results) else 1
 
 
